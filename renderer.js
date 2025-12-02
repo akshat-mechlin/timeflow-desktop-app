@@ -1568,7 +1568,7 @@ function getOSInstructions() {
         'Open Windows Settings (Win + I)',
         'Go to Privacy → Camera',
         'Make sure "Allow apps to access your camera" is ON',
-        'Scroll down and ensure "Time Tracker" or "Electron" is allowed',
+        'Scroll down and ensure "Time Flow" or "Electron" is allowed',
         'Restart the application after enabling'
       ],
       screenshot: [
@@ -1585,14 +1585,14 @@ function getOSInstructions() {
         'Open System Preferences → Security & Privacy',
         'Go to the Privacy tab',
         'Select Camera from the left sidebar',
-        'Check the box next to "Time Tracker" or "Electron"',
+        'Check the box next to "Time Flow" or "Electron"',
         'Restart the application after enabling'
       ],
       screenshot: [
         'Open System Preferences → Security & Privacy',
         'Go to the Privacy tab',
         'Select Screen Recording from the left sidebar',
-        'Check the box next to "Time Tracker" or "Electron"',
+        'Check the box next to "Time Flow" or "Electron"',
         'Restart the application after enabling'
       ]
     };
