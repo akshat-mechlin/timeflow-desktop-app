@@ -126,7 +126,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Time Tracker"
+      "shortcutName": "Time Flow"
     },
     "dmg": {
       "contents": [
