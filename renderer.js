@@ -147,6 +147,7 @@ let baseDurationAtSessionStart = 0; // Base duration when current session starte
 let sessionStartTime = null; // Start time of current session
 let pausedDuration = 0; // Track paused time in current session
 let pauseStartTime = null; // When tracking was paused
+let isStoppingTracking = false; // Flag to prevent race conditions during stop
 let timerInterval = null;
 let captureInterval = null;
 let dailyResetCheckInterval = null;
@@ -258,6 +259,7 @@ async function syncDurationToSupabase(timeEntryId, duration) {
         .from('time_entries')
         .update({
           duration: maxDuration,
+          end_time: null, // Always NULL during active tracking
           updated_at: new Date().toISOString()
         })
         .eq('id', timeEntryId);
@@ -298,7 +300,7 @@ async function syncPendingUpdates() {
         .from('time_entries')
         .update({
           duration: maxDuration,
-          end_time: update.endTime || null,
+          end_time: null, // Always NULL
           updated_at: new Date().toISOString()
         })
         .eq('id', update.timeEntryId);
@@ -426,6 +428,33 @@ if (document.readyState === 'loading') {
   initializeDOMElements();
   checkAuth();
 }
+
+// Handle window beforeunload to save duration if tracking is active
+window.addEventListener('beforeunload', async (e) => {
+  if (isTracking) {
+    console.log('Window closing - stopping tracking and saving duration...');
+    // Use synchronous-like approach - we can't use async/await in beforeunload
+    // So we'll use sendBeacon or a synchronous approach
+    // For Electron, we can use a blocking approach
+    e.preventDefault();
+    
+    // Create a promise that resolves when stopTracking completes
+    const stopPromise = stopTracking();
+    
+    // Wait for it to complete (with timeout)
+    try {
+      await Promise.race([
+        stopPromise,
+        new Promise(resolve => setTimeout(resolve, 2000)) // 2 second timeout
+      ]);
+    } catch (error) {
+      console.error('Error in beforeunload stopTracking:', error);
+    }
+    
+    // Small delay to ensure database write completes
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+});
 // Permission check button removed from UI - permissions checked automatically
 
 // Track mouse movements and keystrokes for statistics and reset idle timer
@@ -833,7 +862,20 @@ function handleMinimize() {
   ipcRenderer.invoke('minimize-window');
 }
 
-function handleClose() {
+async function handleClose() {
+  // If tracking is active, stop tracking and save duration before closing
+  if (isTracking) {
+    console.log('Stopping tracking before closing application...');
+    try {
+      await stopTracking();
+      // Give a small delay to ensure the database update completes
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      console.error('Error stopping tracking before close:', error);
+      // Still close even if there's an error, but log it
+    }
+  }
+  
   // Request main process to close the window
   ipcRenderer.invoke('close-window');
 }
@@ -1833,11 +1875,23 @@ async function startTracking() {
 
 async function stopTracking() {
   if (!isTracking) return;
+  if (isStoppingTracking) {
+    console.warn('stopTracking already in progress, ignoring duplicate call');
+    return;
+  }
 
+  // Set flag to prevent race conditions
+  isStoppingTracking = true;
+
+  // IMPORTANT: Set isTracking to false FIRST to prevent real-time updates from interfering
   isTracking = false;
   await ipcRenderer.invoke('set-is-tracking', false);
 
-  // Clear intervals
+  // Clear intervals IMMEDIATELY to prevent any race conditions
+  if (realTimeUpdateInterval) {
+    clearInterval(realTimeUpdateInterval);
+    realTimeUpdateInterval = null;
+  }
   if (timerInterval) {
     clearInterval(timerInterval);
     timerInterval = null;
@@ -1854,14 +1908,13 @@ async function stopTracking() {
     clearInterval(captureInterval);
     captureInterval = null;
   }
-  if (realTimeUpdateInterval) {
-    clearInterval(realTimeUpdateInterval);
-    realTimeUpdateInterval = null;
-  }
   if (systemActivitySyncInterval) {
     clearInterval(systemActivitySyncInterval);
     systemActivitySyncInterval = null;
   }
+  
+  // Wait a brief moment to ensure any pending async operations complete
+  await new Promise(resolve => setTimeout(resolve, 100));
 
   // Calculate session duration (subtract paused time)
   const endTime = new Date();
@@ -1878,18 +1931,48 @@ async function stopTracking() {
     }
     
     // Calculate total session time and subtract paused time
-    sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000); // in seconds
-    sessionDuration -= Math.floor(pausedDuration / 1000); // Subtract paused time
+    const totalSessionTime = Math.floor((now - sessionStartTime.getTime()) / 1000); // in seconds
+    const pausedTimeSeconds = Math.floor(pausedDuration / 1000);
+    sessionDuration = totalSessionTime - pausedTimeSeconds;
     if (sessionDuration < 0) sessionDuration = 0;
+    
+    console.log(`Stop tracking - Session duration calculation:`, {
+      totalSessionTime,
+      pausedTimeSeconds,
+      sessionDuration,
+      baseDurationAtSessionStart,
+      sessionStartTime: sessionStartTime.toISOString(),
+      endTime: endTime.toISOString()
+    });
+  } else {
+    console.warn('Stop tracking called but sessionStartTime is null - duration may be incorrect');
   }
 
   // Calculate cumulative duration using baseDurationAtSessionStart to prevent double-counting
   const cumulativeDuration = baseDurationAtSessionStart + sessionDuration;
+  
+  console.log(`Stop tracking - Cumulative duration: ${cumulativeDuration} seconds (base: ${baseDurationAtSessionStart}, session: ${sessionDuration})`);
 
   // Ensure duration never decreases - get current max from local/remote
   const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
   const currentMax = localData ? Math.max(localData.duration || 0, baseDuration) : baseDuration;
-  const finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
+  let finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
+  
+  // Safety check: If tracking was active but duration is 0, something went wrong
+  // Use the currentMax as a fallback to prevent losing existing duration
+  if (finalDuration === 0 && currentMax > 0) {
+    console.warn('Warning: Calculated duration is 0 but currentMax is', currentMax, '- using currentMax as fallback');
+    finalDuration = currentMax;
+  }
+  
+  // Additional safety: If we have a sessionStartTime but duration is 0, calculate minimum 1 second
+  if (finalDuration === 0 && sessionStartTime && sessionDuration === 0) {
+    const minDuration = Math.max(1, Math.floor((Date.now() - sessionStartTime.getTime()) / 1000));
+    if (minDuration > 0) {
+      console.warn('Warning: Session duration calculated as 0, using minimum duration:', minDuration);
+      finalDuration = baseDurationAtSessionStart + minDuration;
+    }
+  }
 
   // Save to local storage first (works offline)
   saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
@@ -1903,34 +1986,153 @@ async function stopTracking() {
     if (isOnline) {
       try {
         // First, fetch current duration from Supabase to ensure we don't reduce it
-        const { data: currentEntry } = await supabase
+        const { data: currentEntry, error: fetchError } = await supabase
           .from('time_entries')
-          .select('duration')
+          .select('duration, updated_at')
           .eq('id', timeEntryId)
           .single();
 
+        if (fetchError) {
+          console.error('Error fetching current duration before update:', fetchError);
+          // Still try to update with our calculated duration
+        }
+
         const remoteDuration = currentEntry?.duration || 0;
+        console.log(`📊 Current state in database before update: duration=${remoteDuration}s, updated_at=${currentEntry?.updated_at || 'N/A'}`);
+        
         const maxDuration = ensureMaxDuration(remoteDuration, finalDuration);
+        
+        // If remote duration is suspiciously low (like 15 seconds) but we calculated much more, log a warning
+        if (remoteDuration < 60 && finalDuration > 300) {
+          console.warn(`⚠️ SUSPICIOUS: Database has ${remoteDuration}s but we calculated ${finalDuration}s. This might indicate another process is overwriting values.`);
+        }
+        
+        console.log(`Stop tracking - Updating Supabase:`, {
+          timeEntryId,
+          remoteDuration,
+          finalDuration,
+          maxDuration,
+          formatted: formatDurationFromSeconds(maxDuration)
+        });
 
-        const { error } = await supabase
-          .from('time_entries')
-          .update({
-            end_time: endTime.toISOString(),
-            duration: maxDuration,
-            updated_at: endTime.toISOString()
-          })
-          .eq('id', timeEntryId);
+        // CRITICAL: Verify isTracking is still false before updating (prevent race condition)
+        if (isTracking) {
+          console.warn('WARNING: isTracking became true during stopTracking - aborting update to prevent race condition');
+          isStoppingTracking = false; // Reset flag before returning
+          return;
+        }
 
-        if (error) {
-          console.error('Error updating time entry on stop:', error);
-          // Queue for retry when online
-          pendingUpdates.push({
-            timeEntryId: timeEntryId,
-            duration: finalDuration,
-            endTime: endTime.toISOString()
-          });
-          isOnline = false;
-        } else {
+        // CRITICAL: Ensure we're saving the correct duration - log all values for debugging
+        console.log('🔵 About to save to Supabase:', {
+          timeEntryId,
+          calculatedFinalDuration: finalDuration,
+          remoteDurationFromDB: remoteDuration,
+          maxDurationToSave: maxDuration,
+          sessionDuration,
+          baseDurationAtSessionStart,
+          cumulativeDuration,
+          formatted: formatDurationFromSeconds(maxDuration)
+        });
+
+        // Retry mechanism to ensure the duration is saved correctly
+        let updateSuccess = false;
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        while (!updateSuccess && retryCount < maxRetries) {
+          retryCount++;
+          console.log(`Attempting to save duration (attempt ${retryCount}/${maxRetries}): ${maxDuration} seconds`);
+          
+          // Use a timestamp to ensure we're the latest update
+          const updateTimestamp = new Date().toISOString();
+          
+          const { data: updateData, error } = await supabase
+            .from('time_entries')
+            .update({
+              end_time: null, // Always NULL, even when stopping
+              duration: maxDuration,
+              updated_at: updateTimestamp
+            })
+            .eq('id', timeEntryId)
+            .select('duration, updated_at'); // Request the updated data back
+          
+          if (updateData && updateData.length > 0) {
+            console.log(`Update response data:`, updateData[0]);
+            if (updateData[0].duration !== maxDuration) {
+              console.error(`⚠️ Update returned wrong duration! Expected ${maxDuration}, got ${updateData[0].duration}`);
+            }
+          }
+          
+          if (error) {
+            console.error(`Error updating time entry on stop (attempt ${retryCount}):`, error);
+            if (retryCount >= maxRetries) {
+              // Queue for retry when online
+              pendingUpdates.push({
+                timeEntryId: timeEntryId,
+                duration: finalDuration,
+                endTime: null // Always NULL
+              });
+              isOnline = false;
+              break;
+            }
+            // Wait before retry
+            await new Promise(resolve => setTimeout(resolve, 500));
+            continue;
+          }
+          
+          // Wait a moment for the update to propagate
+          await new Promise(resolve => setTimeout(resolve, 300));
+          
+          // Verify the update was successful by fetching the updated record
+          const { data: verifyEntry, error: verifyError } = await supabase
+            .from('time_entries')
+            .select('duration, end_time, updated_at')
+            .eq('id', timeEntryId)
+            .single();
+          
+          if (verifyError) {
+            console.error(`Error verifying time entry update (attempt ${retryCount}):`, verifyError);
+            if (retryCount >= maxRetries) {
+              break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+            continue;
+          }
+          
+          console.log(`✓ Verification (attempt ${retryCount}): Duration in DB = ${verifyEntry.duration} seconds, Expected = ${maxDuration} seconds`);
+          
+          if (verifyEntry.duration === maxDuration) {
+            console.log(`✅ SUCCESS: Duration correctly saved to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
+            updateSuccess = true;
+          } else {
+            console.error(`⚠️ WARNING: Duration mismatch on attempt ${retryCount}! Expected ${maxDuration}, got ${verifyEntry.duration}`);
+            if (retryCount < maxRetries) {
+              console.log(`Retrying update...`);
+              await new Promise(resolve => setTimeout(resolve, 500));
+            } else {
+              console.error(`❌ FAILED: Could not save correct duration after ${maxRetries} attempts. Final value in DB: ${verifyEntry.duration} seconds`);
+              // Try one more time with a more aggressive approach
+              console.log('Attempting final aggressive update...');
+              const { error: finalError } = await supabase
+                .from('time_entries')
+                .update({
+                  duration: maxDuration,
+                  end_time: null, // Always NULL, even when stopping
+                  updated_at: new Date().toISOString()
+                })
+                .eq('id', timeEntryId);
+              
+              if (finalError) {
+                console.error('Final update attempt also failed:', finalError);
+              } else {
+                console.log('Final update attempt completed - please verify manually');
+              }
+            }
+          }
+        }
+        
+        if (updateSuccess) {
+          
           // Update base duration for next session
           baseDuration = maxDuration;
           // Mark as synced in local storage
@@ -1941,14 +2143,14 @@ async function stopTracking() {
             taskId: selectedTaskId,
             synced: true
           });
-          console.log(`Final duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)}`);
+          console.log(`✓ Final duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
         }
       } catch (error) {
         console.error('Error syncing duration on stop:', error);
         pendingUpdates.push({
           timeEntryId: timeEntryId,
           duration: finalDuration,
-          endTime: endTime.toISOString()
+          endTime: null // Always NULL
         });
         isOnline = false;
       }
@@ -1957,7 +2159,7 @@ async function stopTracking() {
       pendingUpdates.push({
         timeEntryId: timeEntryId,
         duration: finalDuration,
-        endTime: endTime.toISOString()
+        endTime: null // Always NULL
       });
       baseDuration = finalDuration;
     }
@@ -1980,6 +2182,9 @@ async function stopTracking() {
   baseDurationAtSessionStart = 0;
   pausedDuration = 0;
   pauseStartTime = null;
+  
+  // Clear the stopping flag
+  isStoppingTracking = false;
 }
 
 function formatDurationFromSeconds(totalSeconds) {
@@ -2649,7 +2854,13 @@ function startRealTimeUpdates() {
   // Update duration in database every 1 minute (60 seconds)
   // Use baseDurationAtSessionStart to prevent double-counting
   realTimeUpdateInterval = setInterval(async () => {
-    if (!isTracking || !timeEntryId || !sessionStartTime) return;
+    // Double-check isTracking and isStoppingTracking to prevent race conditions
+    if (!isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime) {
+      if (isStoppingTracking) {
+        console.log('Real-time update skipped: stopTracking in progress');
+      }
+      return;
+    }
     
     // Skip if paused (but we'll sync when pause happens)
     if (pauseStartTime) return;
@@ -2688,16 +2899,25 @@ function startRealTimeUpdates() {
 
         const savedDuration = currentEntry?.duration || 0;
         
+        // CRITICAL: Skip real-time update if stopTracking is in progress
+        if (isStoppingTracking) {
+          console.log('Real-time update skipped: stopTracking in progress, not overwriting final duration');
+          return;
+        }
+        
         // Use the maximum of saved duration and calculated duration
         // This ensures we never reduce time and handle any edge cases
         const maxDuration = Math.max(savedDuration, totalDuration);
 
         // Only update if there's a meaningful change (more than 1 second)
-        if (Math.abs(maxDuration - savedDuration) > 1) {
+        // AND if the calculated duration is greater than saved (never reduce)
+        if (Math.abs(maxDuration - savedDuration) > 1 && totalDuration > savedDuration) {
+          console.log(`Real-time update: Updating duration from ${savedDuration}s to ${maxDuration}s`);
           const { error: updateError } = await supabase
             .from('time_entries')
             .update({
               duration: maxDuration,
+              end_time: null, // Always NULL during active tracking
               updated_at: new Date().toISOString()
             })
             .eq('id', timeEntryId);

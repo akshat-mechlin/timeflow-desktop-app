@@ -32,16 +32,35 @@ This will create:
 
 ### Build for macOS
 
-Build macOS DMG and ZIP:
+**⚠️ Important:** macOS builds can ONLY be created on a macOS machine (MacBook, iMac, etc.). You cannot build macOS applications on Windows or Linux.
+
+**Prerequisites:**
+1. Must be running on macOS
+2. Xcode Command Line Tools installed: `xcode-select --install`
+3. macOS icon file: `build/icon.icns` (see below)
+
+**Prepare the icon:**
+```bash
+# First, create PNG icon if not exists
+npm run convert-icon
+
+# Then convert to .icns (macOS only)
+chmod +x scripts/convert-icon-mac.sh
+./scripts/convert-icon-mac.sh
+```
+
+**Build macOS DMG and ZIP:**
 ```bash
 npm run build:mac
 ```
 
-**Note**: macOS builds can only be created on macOS due to code signing requirements.
-
 This will create:
-- `dist/Time Tracker-x.x.x.dmg` - DMG installer (x64 and arm64)
-- `dist/Time Tracker-x.x.x-mac.zip` - ZIP archive (x64 and arm64)
+- `release/Mechlin TimeFlow-1.2.0-x64.dmg` - DMG installer for Intel Macs
+- `release/Mechlin TimeFlow-1.2.0-arm64.dmg` - DMG installer for Apple Silicon Macs
+- `release/Mechlin TimeFlow-1.2.0-x64-mac.zip` - ZIP archive for Intel Macs
+- `release/Mechlin TimeFlow-1.2.0-arm64-mac.zip` - ZIP archive for Apple Silicon Macs
+
+**For detailed macOS build instructions, see [MACOS_BUILD_GUIDE.md](./MACOS_BUILD_GUIDE.md)**
 
 ### Build for All Platforms
 
