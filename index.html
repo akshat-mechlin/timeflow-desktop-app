@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mechlin TimeFlow</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Loading State -->
+        <div id="loading-container" class="container">
+            <div class="loading-box">
+                <div class="loading-spinner"></div>
+                <h2>Loading...</h2>
+            </div>
+        </div>
+
+        <div id="login-container" class="container hidden">
+            <div class="login-header">
+                <button id="minimize-btn-login" class="window-control-btn minimize-btn" title="Minimize">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                        <path d="M2 6h8"/>
+                    </svg>
+                </button>
+                <button id="close-btn-login" class="window-control-btn close-btn" title="Close">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                        <path d="M9 3L3 9M3 3l6 6"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="login-box">
+                <div class="logo-container">
+                    <img src="assets/mechlin-logo.svg" alt="Mechlin TimeFlow" class="logo-image">
+                </div>
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">Password</label>
+                        <input type="password" id="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Login</button>
+                    <div class="divider">
+                        <span>OR</span>
+                    </div>
+                    <button type="button" id="azure-sso-btn" class="btn btn-azure">
+                        <svg width="20" height="20" viewBox="0 0 23 23" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M0 0H10.4V10.4H0V0Z" fill="#F25022"/>
+                            <path d="M12.6 0H23V10.4H12.6V0Z" fill="#7FBA00"/>
+                            <path d="M0 12.6H10.4V23H0V12.6Z" fill="#00A4EF"/>
+                            <path d="M12.6 12.6H23V23H12.6V12.6Z" fill="#FFB900"/>
+                        </svg>
+                        Login with Azure SSO
+                    </button>
+                    <div id="error-message" class="error-message"></div>
+                </form>
+            </div>
+        </div>
+
+        <div id="dashboard-container" class="container hidden">
+            <!-- Header -->
+            <header class="app-header">
+                <div class="header-left">
+                    <img src="assets/mechlin-logo.svg" alt="Mechlin TimeFlow" class="header-logo">
+                </div>
+                <div class="header-right">
+                    <div class="user-menu">
+                        <span id="user-name" class="user-name">User</span>
+                        <button id="logout-btn" class="btn-logout" title="Logout">Logout</button>
+                    </div>
+                    <button id="minimize-btn" class="window-control-btn minimize-btn" title="Minimize">
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                            <path d="M2 6h8"/>
+                        </svg>
+                    </button>
+                    <button id="close-btn" class="window-control-btn close-btn" title="Close">
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                            <path d="M9 3L3 9M3 3l6 6"/>
+                        </svg>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Main Content -->
+            <div class="main-content">
+                <!-- Project and Task Selection -->
+                <div class="selection-card">
+                    <div class="form-group">
+                        <label for="project-select">Project</label>
+                        <select id="project-select" class="form-select" required>
+                            <option value="">Select a project...</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="task-select">Task</label>
+                        <select id="task-select" class="form-select" required disabled>
+                            <option value="">Select a task...</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Current Task Section -->
+                <div class="current-task-card">
+                    <div class="task-prompt">What are you working on?</div>
+                    <div class="task-entry">
+                        <div class="task-info">
+                            <div class="task-indicator"></div>
+                            <div class="task-details">
+                                <div id="task-name" class="task-name">Select a project and task</div>
+                                <div id="task-tag" class="task-tag">No project selected</div>
+                            </div>
+                        </div>
+                        <div class="timer-section">
+                            <div id="timer" class="timer-display">00:00:00</div>
+                            <button id="start-btn" class="play-button" title="Start Tracking" disabled>
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M8 5v14l11-7z"/>
+                                </svg>
+                            </button>
+                            <button id="stop-btn" class="stop-button hidden" title="Stop Tracking">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                                    <rect x="6" y="6" width="12" height="12"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Status Section -->
+                <div id="status" class="status-display">Not Tracking</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

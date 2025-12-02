@@ -1,0 +1,17 @@
+node_modules/
+dist/
+release/
+*.log
+.DS_Store
+.env.local
+.env.*.local
+.env
+*.png
+*.jpg
+*.jpeg
+*.gif
+screenshots/
+camera/
+build/icon.ico
+build/icon.icns
+
