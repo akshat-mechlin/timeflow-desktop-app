@@ -1773,14 +1773,14 @@ async function startTracking() {
     });
   } else {
     // Create new time entry for this day cycle
-    // Use the day cycle start time as the entry start_time
+    // Use the actual session start time as the entry start_time
     if (isOnline) {
       try {
         const { data: timeEntry, error } = await supabase
           .from('time_entries')
           .insert({
             user_id: profile.id,
-            start_time: currentDayCycle.start.toISOString(),
+            start_time: sessionStartTime.toISOString(),
             duration: baseDuration // Start with cumulative duration (should be 0 for new day)
           })
           .select()

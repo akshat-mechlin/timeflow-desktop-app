@@ -2,8 +2,8 @@ const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
 
-// Use the icon.svg for taskbar icon (square format, better for icons)
-const svgPath = path.join(__dirname, '..', 'assets', 'icon.svg');
+// Use the timeflowicon.svg for taskbar icon (square format, better for icons)
+const svgPath = path.join(__dirname, '..', 'assets', 'timeflowicon.svg');
 const buildDir = path.join(__dirname, '..', 'build');
 const iconPngPath = path.join(buildDir, 'icon.png');
 const icon256Path = path.join(buildDir, 'icon-256.png');

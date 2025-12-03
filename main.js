@@ -24,7 +24,7 @@ function createMainWindow() {
     iconPath = path.join(__dirname, 'build', 'icon.png');
   }
   if (!fs.existsSync(iconPath)) {
-    iconPath = path.join(__dirname, 'assets', 'icon.svg');
+    iconPath = path.join(__dirname, 'assets', 'timeflowicon.svg');
   }
 
   mainWindow = new BrowserWindow({
