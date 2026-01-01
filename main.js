@@ -205,7 +205,7 @@ ipcMain.handle('get-system-idle-time', () => {
   if (process.platform === 'win32') {
     return new Promise((resolve) => {
       const { exec } = require('child_process');
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); [LastInput]::GetLastInputInfo([ref]$lastInput); $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime"`;
+      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
       
       exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
         if (error) {
@@ -224,8 +224,8 @@ ipcMain.handle('get-system-idle-time', () => {
         }
         try {
           const trimmed = stdout.trim();
-          // Check if output is a valid number (not "True", "False", or other non-numeric)
-          if (trimmed === 'True' || trimmed === 'False' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false') {
+          // Check if output is a valid number (not "True", "False", "ERROR", or other non-numeric)
+          if (trimmed === 'True' || trimmed === 'False' || trimmed === 'ERROR' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false' || trimmed.toLowerCase() === 'error') {
             console.warn('PowerShell returned non-numeric value:', trimmed);
             resolve(null);
             return;
@@ -275,7 +275,7 @@ function startSystemActivityMonitoring() {
     systemActivityMonitor = setInterval(() => {
       checkCount++;
       // Use inline PowerShell command for better reliability (works in packaged app)
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); [LastInput]::GetLastInputInfo([ref]$lastInput); $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime"`;
+      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
       
       exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
         if (error) {
@@ -292,8 +292,8 @@ function startSystemActivityMonitoring() {
         
           try {
           const trimmed = stdout.trim();
-          // Check if output is a valid number (not "True", "False", or other non-numeric)
-          if (trimmed === 'True' || trimmed === 'False' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false') {
+          // Check if output is a valid number (not "True", "False", "ERROR", or other non-numeric)
+          if (trimmed === 'True' || trimmed === 'False' || trimmed === 'ERROR' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false' || trimmed.toLowerCase() === 'error') {
             console.warn('PowerShell returned non-numeric value in monitoring:', trimmed);
             return;
           }
