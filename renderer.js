@@ -1839,8 +1839,10 @@ async function startTracking() {
     // Request current system activity status from main process
     if (isTracking && !pauseStartTime) {
       ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        if (idleSeconds !== null && idleSeconds < 9 * 60) {
-          // User is active (idle less than 9 minutes)
+        // Only update if system clearly shows user is active (idle < 2 minutes)
+        // This prevents the fallback from interfering with inactivity detection
+        if (idleSeconds !== null && idleSeconds < 2 * 60) {
+          // User is active (idle less than 2 minutes)
           const now = Date.now();
           const timeSinceLastUpdate = now - lastActivityTime;
           // Update more frequently (every 2 seconds) to catch activity quickly
@@ -1860,7 +1862,7 @@ async function startTracking() {
           }
         }
       }).catch(err => {
-        // On error, be conservative - don't update (but also don't show false positives)
+        // On error, don't update - rely on other activity detection methods
         // The main activity listeners will catch real activity
       });
     }
@@ -2230,8 +2232,10 @@ function startIdleDetection() {
     if (timeSinceLastActivity > IDLE_THRESHOLD - 10000) {
       // Check system idle time directly before showing overlay
       ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        if (idleSeconds !== null && idleSeconds < 4 * 60) {
-          // User is actually active - update lastActivityTime (4 minutes threshold)
+        // Only reset if system clearly shows user is active (idle < 2 minutes)
+        // This prevents false positives while still allowing inactivity detection
+        if (idleSeconds !== null && idleSeconds < 2 * 60) {
+          // User is actually active - update lastActivityTime (2 minutes threshold)
           lastActivityTime = Date.now();
           console.log(`Safety check: System shows user is active (idle=${idleSeconds.toFixed(1)}s) - updating lastActivityTime`);
           
@@ -2242,28 +2246,13 @@ function startIdleDetection() {
             console.log('Safety check: Cleared pending idle double-check due to detected activity');
           }
         } else if (idleSeconds === null) {
-          // Can't determine system idle time - be conservative and update activity time
-          // This prevents false positives when system monitoring is unreliable
-          console.warn('Safety check: Cannot determine system idle time - being conservative, updating lastActivityTime');
-          lastActivityTime = Date.now();
-          
-          // Clear any pending double-check
-          if (idleDoubleCheckTimer) {
-            clearTimeout(idleDoubleCheckTimer);
-            idleDoubleCheckTimer = null;
-            console.log('Safety check: Cleared pending idle double-check (system idle time unavailable)');
-          }
+          // Can't determine system idle time - rely on lastActivityTime alone
+          // Don't reset lastActivityTime - let the threshold check proceed
+          console.log('Safety check: Cannot determine system idle time - relying on lastActivityTime');
         }
       }).catch(err => {
-        // On error, be conservative - update activity time to prevent false positives
-        console.warn('Safety check: Error getting system idle time - being conservative, updating lastActivityTime');
-        lastActivityTime = Date.now();
-        
-        // Clear any pending double-check
-        if (idleDoubleCheckTimer) {
-          clearTimeout(idleDoubleCheckTimer);
-          idleDoubleCheckTimer = null;
-        }
+        // On error, rely on lastActivityTime alone - don't reset it
+        console.log('Safety check: Error getting system idle time - relying on lastActivityTime');
       });
     }
     
@@ -2296,18 +2285,12 @@ function startIdleDetection() {
           
           // Final safety check - verify system idle time one more time
           const finalIdleSeconds = await ipcRenderer.invoke('get-system-idle-time').catch(() => null);
-          if (finalIdleSeconds !== null && finalIdleSeconds < 4 * 60) {
-            // User is actually active - don't show overlay (4 minutes threshold)
+          
+          // Only prevent showing overlay if system clearly shows user is active (idle < 2 minutes)
+          if (finalIdleSeconds !== null && finalIdleSeconds < 2 * 60) {
+            // User is actually active - don't show overlay
             lastActivityTime = Date.now();
             console.log(`Final check: System shows user is active (idle=${finalIdleSeconds.toFixed(1)}s) - NOT showing overlay`);
-            return;
-          }
-          
-          // If we can't get system idle time, don't show overlay (too risky for false positives)
-          if (finalIdleSeconds === null) {
-            console.warn('Final check: Cannot determine system idle time - NOT showing overlay to prevent false positives');
-            // Update activity time to give user benefit of the doubt
-            lastActivityTime = Date.now();
             return;
           }
           
@@ -2316,10 +2299,13 @@ function startIdleDetection() {
         
           console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity, system idle: ${finalIdleSeconds !== null ? finalIdleSeconds.toFixed(1) : 'N/A'}s`);
           
-          // Only show overlay if still inactive after double-check AND system confirms idle
-          // CRITICAL: Require valid system idle time >= 4 minutes (slightly less than 5 min threshold for safety)
-          // If we can't get system idle time, don't show overlay (too risky for false positives)
-          if (recheckTimeSinceActivity >= IDLE_THRESHOLD && finalIdleSeconds !== null && finalIdleSeconds >= 4 * 60) {
+          // Show overlay if still inactive after double-check
+          // If system idle time is available, require it to be >= 3 minutes (slightly less than 5 min threshold)
+          // If system idle time is unavailable, rely on lastActivityTime alone
+          const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD && 
+            (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
+          
+          if (shouldShowOverlay) {
           // Pause tracking
           pauseStartTime = Date.now();
           
@@ -2443,12 +2429,12 @@ function updateDayCycleDisplay() {
 
 
 function startPeriodicCaptures() {
-  const CAPTURE_INTERVAL = 10 * 60 * 1000; // 10 minutes (600 seconds)
+  const CAPTURE_INTERVAL = 5 * 60 * 1000; // 5 minutes (300 seconds)
 
   // Capture immediately on start
   captureScreenshotAndCamera();
 
-  // Then capture every 10 minutes
+  // Then capture every 5 minutes
   captureInterval = setInterval(() => {
     if (isTracking) {
       captureScreenshotAndCamera();
