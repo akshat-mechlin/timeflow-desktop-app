@@ -2429,21 +2429,44 @@ function updateDayCycleDisplay() {
 
 
 function startPeriodicCaptures() {
+  // Clear any existing interval to prevent duplicates
+  if (captureInterval) {
+    clearInterval(captureInterval);
+    captureInterval = null;
+  }
+
   const CAPTURE_INTERVAL = 5 * 60 * 1000; // 5 minutes (300 seconds)
 
   // Capture immediately on start
-  captureScreenshotAndCamera();
+  captureScreenshotAndCamera().catch(err => {
+    console.warn('Initial capture failed, will retry on next interval:', err);
+  });
 
-  // Then capture every 5 minutes
+  // Then capture every 5 minutes - always capture when tracking is active
   captureInterval = setInterval(() => {
-    if (isTracking) {
-      captureScreenshotAndCamera();
+    if (isTracking && timeEntryId) {
+      // Always attempt capture - don't skip even if paused
+      captureScreenshotAndCamera().catch(err => {
+        console.warn('Periodic capture failed, will retry on next interval:', err);
+      });
+    } else if (isTracking && !timeEntryId) {
+      console.warn('Skipping capture: tracking active but no timeEntryId yet');
     }
   }, CAPTURE_INTERVAL);
+  
+  console.log('Periodic captures started - will capture every 5 minutes');
 }
 
 async function captureScreenshotAndCamera() {
-  if (!isTracking || !timeEntryId) return;
+  // Always attempt capture if tracking is active - don't skip due to pause
+  if (!isTracking) {
+    console.log('Skipping capture: tracking is not active');
+    return;
+  }
+  if (!timeEntryId) {
+    console.warn('Skipping capture: no timeEntryId available yet');
+    return;
+  }
 
   let screenshotPath = null;
 
@@ -2522,8 +2545,13 @@ async function captureScreenshotAndCamera() {
 }
 
 async function captureCamera() {
-  if (!isTracking || !timeEntryId) {
-    console.log('Skipping camera capture: not tracking or no timeEntryId');
+  // Always attempt camera capture if tracking is active
+  if (!isTracking) {
+    console.log('Skipping camera capture: tracking is not active');
+    return;
+  }
+  if (!timeEntryId) {
+    console.warn('Skipping camera capture: no timeEntryId available yet');
     return;
   }
 
