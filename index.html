@@ -71,6 +71,13 @@
                     <img src="assets/mechlin-logo.svg" alt="TimeFlow" class="header-logo">
                 </div>
                 <div class="header-right">
+                    <div class="version-badge" id="version-badge" title="Application Version">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                        </svg>
+                        <span id="version-text">v1.3.0</span>
+                    </div>
                     <div class="user-menu">
                         <span id="user-name" class="user-name">User</span>
                         <button id="logout-btn" class="btn-logout" title="Logout">Logout</button>
@@ -135,6 +142,22 @@
 
                 <!-- Status Section -->
                 <div id="status" class="status-display">Not Tracking</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Update Required Modal -->
+    <div id="update-required-modal" class="update-modal-overlay hidden">
+        <div class="update-modal">
+            <div class="update-modal-header">
+                <h2>⚠️ Update Required</h2>
+            </div>
+            <div class="update-modal-content">
+                <p id="update-message">Your current version is outdated. Please update to continue using the application.</p>
+            </div>
+            <div class="update-modal-actions">
+                <button id="download-update-btn" class="btn btn-primary">Download Update</button>
+                <button id="close-app-btn" class="btn btn-secondary">Close Application</button>
             </div>
         </div>
     </div>

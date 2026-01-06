@@ -5,6 +5,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Get app version from package.json
+const appVersion = require('./package.json').version;
+const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
+
 // Initialize Supabase client - Hardcoded credentials
 const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
 const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
@@ -260,7 +264,8 @@ async function syncDurationToSupabase(timeEntryId, duration) {
         .update({
           duration: maxDuration,
           end_time: null, // Always NULL during active tracking
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
+          app_version: appVersion // Track which version of the tracker updated this entry
         })
         .eq('id', timeEntryId);
 
@@ -301,7 +306,8 @@ async function syncPendingUpdates() {
         .update({
           duration: maxDuration,
           end_time: null, // Always NULL
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
+          app_version: appVersion // Track which version of the tracker updated this entry
         })
         .eq('id', update.timeEntryId);
 
@@ -334,6 +340,7 @@ let loadingContainer, loginContainer, dashboardContainer, loginForm, emailInput,
 let errorMessage, userNameSpan, logoutBtn, startBtn, stopBtn, timerDisplay, statusDisplay;
 let projectSelect, taskSelect, taskNameDisplay, taskTagDisplay;
 let azureSsoBtn, closeBtn, closeBtnLogin, minimizeBtn, minimizeBtnLogin;
+let versionBadge, versionText;
 
 // Initialize DOM elements when DOM is ready
 function initializeDOMElements() {
@@ -359,6 +366,8 @@ function initializeDOMElements() {
   taskSelect = document.getElementById('task-select');
   taskNameDisplay = document.getElementById('task-name');
   taskTagDisplay = document.getElementById('task-tag');
+  versionBadge = document.getElementById('version-badge');
+  versionText = document.getElementById('version-text');
 
   // Verify critical elements exist
   if (!projectSelect) {
@@ -573,6 +582,219 @@ ipcRenderer.on('overlay-stop', () => {
   }
 });
 
+// ============================================
+// VERSION MANAGEMENT FUNCTIONS
+// ============================================
+
+let isVersionValid = false;
+let versionCheckComplete = false;
+let minimumRequiredVersion = null;
+let downloadUrl = null;
+let forceUpdate = false;
+
+// Compare version strings (e.g., "1.4.0" vs "1.3.0")
+function compareVersions(version1, version2) {
+  const v1parts = version1.split('.').map(Number);
+  const v2parts = version2.split('.').map(Number);
+  
+  for (let i = 0; i < Math.max(v1parts.length, v2parts.length); i++) {
+    const v1part = v1parts[i] || 0;
+    const v2part = v2parts[i] || 0;
+    
+    if (v1part > v2part) return 1;
+    if (v1part < v2part) return -1;
+  }
+  
+  return 0;
+}
+
+// Check if current version meets minimum requirements
+async function checkAppVersion() {
+  try {
+    console.log(`🔍 Checking app version: ${appVersion} (Platform: ${appPlatform})`);
+    
+    // Get minimum required version from database
+    const { data: versionData, error: versionError } = await supabase
+      .from('app_versions')
+      .select('version, minimum_required_version, download_url, download_urls, force_update, is_active')
+      .eq('is_active', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+    
+    if (versionError || !versionData) {
+      console.warn('⚠ Could not fetch version info, allowing app to continue:', versionError);
+      // If we can't check version, allow app to continue (graceful degradation)
+      isVersionValid = true;
+      versionCheckComplete = true;
+      return { valid: true, reason: 'version_check_failed' };
+    }
+    
+    minimumRequiredVersion = versionData.minimum_required_version;
+    
+    // Get platform-specific download URL
+    if (versionData.download_urls && typeof versionData.download_urls === 'object') {
+      // Use platform-specific URL if available
+      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
+      downloadUrl = versionData.download_urls[platformKey] || versionData.download_urls.default || versionData.download_url;
+    } else {
+      // Fallback to single download_url
+      downloadUrl = versionData.download_url;
+    }
+    
+    forceUpdate = versionData.force_update || false;
+    
+    console.log(`📋 Minimum required version: ${minimumRequiredVersion}`);
+    console.log(`📋 Current version: ${appVersion}`);
+    console.log(`📋 Force update: ${forceUpdate}`);
+    
+    // Compare versions
+    const versionComparison = compareVersions(appVersion, minimumRequiredVersion);
+    
+    if (versionComparison < 0) {
+      // Current version is older than minimum required
+      console.warn(`❌ Version check failed: ${appVersion} < ${minimumRequiredVersion}`);
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return { 
+        valid: false, 
+        reason: 'version_outdated',
+        minimumVersion: minimumRequiredVersion,
+        currentVersion: appVersion,
+        downloadUrl: downloadUrl,
+        downloadUrls: versionData.download_urls || null,
+        forceUpdate: forceUpdate
+      };
+    } else {
+      // Version is valid
+      console.log(`✓ Version check passed: ${appVersion} >= ${minimumRequiredVersion}`);
+      isVersionValid = true;
+      versionCheckComplete = true;
+      return { valid: true, reason: 'version_valid' };
+    }
+  } catch (error) {
+    console.error('❌ Error checking app version:', error);
+    // On error, allow app to continue (graceful degradation)
+    isVersionValid = true;
+    versionCheckComplete = true;
+    return { valid: true, reason: 'version_check_error' };
+  }
+}
+
+// Track version usage in database
+async function trackVersionUsage() {
+  if (!currentUser) {
+    console.log('No user logged in, skipping version tracking');
+    return;
+  }
+  
+  try {
+    console.log(`📊 Tracking version usage: ${appVersion} for user ${currentUser.id}`);
+    
+    // Check if record exists
+    const { data: existingRecord } = await supabase
+      .from('user_version_tracking')
+      .select('id, session_count')
+      .eq('user_id', currentUser.id)
+      .eq('app_version', appVersion)
+      .single();
+    
+    if (existingRecord) {
+      // Update existing record
+      const { error: updateError } = await supabase
+        .from('user_version_tracking')
+        .update({
+          last_seen_at: new Date().toISOString(),
+          session_count: (existingRecord.session_count || 0) + 1,
+          platform: appPlatform,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existingRecord.id);
+      
+      if (updateError) {
+        console.error('Error updating version tracking:', updateError);
+      } else {
+        console.log('✓ Version tracking updated');
+      }
+    } else {
+      // Insert new record
+      const { error: insertError } = await supabase
+        .from('user_version_tracking')
+        .insert({
+          user_id: currentUser.id,
+          app_version: appVersion,
+          platform: appPlatform,
+          last_seen_at: new Date().toISOString(),
+          first_seen_at: new Date().toISOString(),
+          session_count: 1
+        });
+      
+      if (insertError) {
+        console.error('Error inserting version tracking:', insertError);
+      } else {
+        console.log('✓ Version tracking created');
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error tracking version usage:', error);
+    // Don't block app if tracking fails
+  }
+}
+
+// Show update required modal
+function showUpdateRequiredModal(versionInfo) {
+  const updateModal = document.getElementById('update-required-modal');
+  const updateMessage = document.getElementById('update-message');
+  const downloadBtn = document.getElementById('download-update-btn');
+  const closeBtn = document.getElementById('close-app-btn');
+  
+  if (!updateModal || !updateMessage) {
+    console.error('Update modal elements not found');
+    return;
+  }
+  
+  // Update modal content
+  updateMessage.innerHTML = `
+    <p>Your current version (<strong>${versionInfo.currentVersion}</strong>) is outdated.</p>
+    <p>Please update to version <strong>${versionInfo.minimumVersion}</strong> or higher to continue using the application.</p>
+    ${versionInfo.forceUpdate ? '<p class="update-warning">⚠️ This update is mandatory. The application will not function until you update.</p>' : ''}
+  `;
+  
+  // Setup download button with platform-specific URL
+  if (downloadBtn) {
+    // Get platform-specific download URL
+    let platformUrl = versionInfo.downloadUrl;
+    if (versionInfo.downloadUrls && typeof versionInfo.downloadUrls === 'object') {
+      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
+      platformUrl = versionInfo.downloadUrls[platformKey] || versionInfo.downloadUrls.default || versionInfo.downloadUrl;
+    }
+    
+    if (platformUrl) {
+      downloadBtn.style.display = 'inline-block';
+      downloadBtn.onclick = () => {
+        const { shell } = require('electron');
+        shell.openExternal(platformUrl);
+      };
+    } else {
+      downloadBtn.style.display = 'none';
+    }
+  }
+  
+  // Setup close button
+  if (closeBtn) {
+    closeBtn.onclick = () => {
+      ipcRenderer.invoke('close-window');
+    };
+  }
+  
+  // Show modal
+  updateModal.classList.remove('hidden');
+  
+  // Block all interactions
+  document.body.style.pointerEvents = 'none';
+  updateModal.style.pointerEvents = 'auto';
+}
+
 async function checkAuth() {
   try {
     console.log('Checking authentication...');
@@ -580,6 +802,23 @@ async function checkAuth() {
     loadingContainer.classList.remove('hidden');
     loginContainer.classList.add('hidden');
     dashboardContainer.classList.add('hidden');
+    
+    // First, check app version (before authentication)
+    const versionCheck = await checkAppVersion();
+    
+    if (!versionCheck.valid) {
+      console.error('❌ Version check failed, blocking app access');
+      showUpdateRequiredModal({
+        currentVersion: versionCheck.currentVersion,
+        minimumVersion: versionCheck.minimumVersion,
+        downloadUrl: versionCheck.downloadUrl,
+        downloadUrls: versionCheck.downloadUrls,
+        forceUpdate: versionCheck.forceUpdate
+      });
+      
+      // Block further execution
+      return;
+    }
     
     const { data: { session }, error } = await supabase.auth.getSession();
     
@@ -592,6 +831,10 @@ async function checkAuth() {
     if (session) {
       console.log('Session found, user:', session.user.email);
       currentUser = session.user;
+      
+      // Track version usage after login
+      await trackVersionUsage();
+      
       showDashboard();
     } else {
       console.log('No session found, showing login');
@@ -613,6 +856,11 @@ async function showDashboard() {
   if (loadingContainer) loadingContainer.classList.add('hidden');
   if (loginContainer) loginContainer.classList.add('hidden');
   if (dashboardContainer) dashboardContainer.classList.remove('hidden');
+  
+  // Display app version
+  if (versionText) {
+    versionText.textContent = `v${appVersion}`;
+  }
   
   // Fetch user profile to get full_name
   try {
@@ -694,6 +942,10 @@ async function handleLogin(e) {
 
     console.log('Login successful, user:', data.user.email);
     currentUser = data.user;
+    
+    // Track version usage after successful login
+    await trackVersionUsage();
+    
     showDashboard();
   } catch (err) {
     console.error('Exception during login:', err);
@@ -1748,7 +2000,8 @@ async function startTracking() {
           .from('time_entries')
           .update({
             end_time: null, // Clear end_time to indicate active tracking
-            updated_at: sessionStartTime.toISOString()
+            updated_at: sessionStartTime.toISOString(),
+            app_version: appVersion // Track which version of the tracker updated this entry
           })
           .eq('id', timeEntryId);
 
@@ -1781,7 +2034,8 @@ async function startTracking() {
           .insert({
             user_id: profile.id,
             start_time: sessionStartTime.toISOString(),
-            duration: baseDuration // Start with cumulative duration (should be 0 for new day)
+            duration: baseDuration, // Start with cumulative duration (should be 0 for new day)
+            app_version: appVersion // Track which version of the tracker created this entry
           })
           .select()
           .single();
@@ -2053,7 +2307,8 @@ async function stopTracking() {
             .update({
               end_time: null, // Always NULL, even when stopping
               duration: maxDuration,
-              updated_at: updateTimestamp
+              updated_at: updateTimestamp,
+              app_version: appVersion // Track which version of the tracker updated this entry
             })
             .eq('id', timeEntryId)
             .select('duration, updated_at'); // Request the updated data back
@@ -2120,7 +2375,8 @@ async function stopTracking() {
                 .update({
                   duration: maxDuration,
                   end_time: null, // Always NULL, even when stopping
-                  updated_at: new Date().toISOString()
+                  updated_at: new Date().toISOString(),
+                  app_version: appVersion // Track which version of the tracker updated this entry
                 })
                 .eq('id', timeEntryId);
               
@@ -2932,7 +3188,8 @@ function startRealTimeUpdates() {
             .update({
               duration: maxDuration,
               end_time: null, // Always NULL during active tracking
-              updated_at: new Date().toISOString()
+              updated_at: new Date().toISOString(),
+              app_version: appVersion // Track which version of the tracker updated this entry
             })
             .eq('id', timeEntryId);
 
@@ -3014,7 +3271,8 @@ async function syncCurrentDuration() {
             .from('time_entries')
             .update({
               duration: maxDuration,
-              updated_at: new Date().toISOString()
+              updated_at: new Date().toISOString(),
+              app_version: appVersion // Track which version of the tracker updated this entry
             })
             .eq('id', timeEntryId);
 
