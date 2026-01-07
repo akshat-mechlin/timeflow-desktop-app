@@ -2724,23 +2724,145 @@ async function captureScreenshotAndCamera() {
     return;
   }
 
-  let screenshotPath = null;
+  // Try to capture all screens with multiple fallback strategies
+  let screensCaptured = 0;
+  const timestamp = Date.now();
 
   try {
-    // Capture screenshot - get buffer instead of using filename to avoid file copy issues
-    const screenshotBuffer = await screenshot({ format: 'png' });
-    
-    // Save to temp file
-    screenshotPath = path.join(os.tmpdir(), `screenshot-${Date.now()}.png`);
-    fs.writeFileSync(screenshotPath, screenshotBuffer);
-
-    // Verify file was created
-    if (!fs.existsSync(screenshotPath)) {
-      throw new Error('Screenshot file was not created');
+    // Strategy 1: Try to get all displays using listDisplays()
+    let displays = [];
+    try {
+      if (typeof screenshot.listDisplays === 'function') {
+        displays = await screenshot.listDisplays();
+        console.log(`Found ${displays.length} display(s) using listDisplays()`);
+      }
+    } catch (listError) {
+      console.warn('Could not list displays, falling back to all screens capture:', listError.message || listError);
     }
 
+    // Strategy 2: If listDisplays failed or returned empty, try capturing all screens by index (0-9)
+    if (!displays || displays.length === 0) {
+      console.log('Attempting to capture all screens by index (fallback method)...');
+      for (let screenIndex = 0; screenIndex < 10; screenIndex++) {
+        try {
+          const testBuffer = await screenshot({ screen: screenIndex, format: 'png' });
+          if (testBuffer && testBuffer.length > 0) {
+            displays.push({ id: screenIndex, name: `Screen ${screenIndex}` });
+            console.log(`Found screen at index ${screenIndex}`);
+          }
+        } catch (screenError) {
+          // Screen doesn't exist at this index, continue
+          if (screenIndex === 0) {
+            // If even screen 0 fails, try the primary screen method
+            break;
+          }
+        }
+      }
+    }
+
+    // Strategy 3: If no displays found, try primary screen capture
+    if (displays.length === 0) {
+      console.log('No displays detected, attempting primary screen capture...');
+      try {
+        const primaryBuffer = await screenshot({ format: 'png' });
+        if (primaryBuffer && primaryBuffer.length > 0) {
+          displays = [{ id: 0, name: 'Primary Screen' }];
+          console.log('Captured primary screen');
+        }
+      } catch (primaryError) {
+        console.warn('Primary screen capture failed:', primaryError.message || primaryError);
+      }
+    }
+
+    // Strategy 4: If screenshot-desktop completely fails, use Electron's desktopCapturer
+    if (displays.length === 0) {
+      console.log('screenshot-desktop failed, trying Electron desktopCapturer fallback...');
+      try {
+        const sources = await ipcRenderer.invoke('get-desktop-sources', {
+          types: ['screen'],
+          thumbnailSize: { width: 1920, height: 1080 }
+        });
+        
+        if (sources && sources.length > 0) {
+          console.log(`Found ${sources.length} screen source(s) using Electron desktopCapturer`);
+          for (let i = 0; i < sources.length; i++) {
+            const source = sources[i];
+            const screenshotBuffer = await captureScreenshotWithElectron(source.id);
+            if (screenshotBuffer) {
+              await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
+              screensCaptured++;
+            }
+          }
+        }
+      } catch (electronError) {
+        console.warn('Electron desktopCapturer fallback also failed:', electronError.message || electronError);
+      }
+    } else {
+      // Capture each detected screen
+      for (let i = 0; i < displays.length; i++) {
+        const display = displays[i];
+        try {
+          let screenshotBuffer;
+          
+          if (display.id !== undefined) {
+            // Use screen index
+            screenshotBuffer = await screenshot({ screen: display.id, format: 'png' });
+          } else {
+            // Fallback to primary screen
+            screenshotBuffer = await screenshot({ format: 'png' });
+          }
+
+          if (screenshotBuffer && screenshotBuffer.length > 0) {
+            await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
+            screensCaptured++;
+            console.log(`✓ Captured screen ${i + 1}/${displays.length}: ${display.name || `Screen ${i}`}`);
+          }
+        } catch (screenCaptureError) {
+          console.warn(`Error capturing screen ${i + 1}:`, screenCaptureError.message || screenCaptureError);
+          // Continue with other screens even if one fails
+        }
+      }
+    }
+
+    if (screensCaptured > 0) {
+      console.log(`✓ Successfully captured ${screensCaptured} screen(s)`);
+    } else {
+      console.warn('⚠ No screens were captured - all methods failed');
+    }
+
+    // Capture camera (continue even if screenshot had issues)
+    await captureCamera();
+
+  } catch (error) {
+    console.warn('Error capturing screenshots (continuing with camera):', error.message || error);
+    
+    // Still try to capture camera even if screenshot failed
+    try {
+      await captureCamera();
+    } catch (cameraError) {
+      console.warn('Error capturing camera:', cameraError.message || cameraError);
+    }
+  }
+}
+
+// Helper function to upload a screenshot
+async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
+  if (!screenshotBuffer || screenshotBuffer.length === 0) {
+    throw new Error('Screenshot buffer is empty');
+  }
+
+  // Save to temp file
+  const screenshotPath = path.join(os.tmpdir(), `screenshot-${timestamp}-${screenIdentifier}.png`);
+  fs.writeFileSync(screenshotPath, screenshotBuffer);
+
+  // Verify file was created
+  if (!fs.existsSync(screenshotPath)) {
+    throw new Error('Screenshot file was not created');
+  }
+
+  try {
     // Upload screenshot
-    const screenshotFileName = `screenshots/${currentUser.id}/${Date.now()}-screenshot.png`;
+    const screenshotFileName = `screenshots/${currentUser.id}/${timestamp}-${screenIdentifier}-screenshot.png`;
     const screenshotFile = fs.readFileSync(screenshotPath);
     const { data: screenshotData, error: screenshotError } = await supabase.storage
       .from('screenshots')
@@ -2750,53 +2872,116 @@ async function captureScreenshotAndCamera() {
       });
 
     if (!screenshotError && screenshotData) {
-      // Insert screenshot record
-      const { error: insertError } = await supabase
-        .from('screenshots')
-        .insert({
-          time_entry_id: timeEntryId,
-          storage_path: screenshotFileName,
-          type: 'screenshot',
-          taken_at: new Date().toISOString()
-        });
+      // Insert screenshot record with retry logic
+      let retries = 3;
+      let insertError = null;
+      
+      while (retries > 0) {
+        const { error } = await supabase
+          .from('screenshots')
+          .insert({
+            time_entry_id: timeEntryId,
+            storage_path: screenshotFileName,
+            type: 'screenshot',
+            taken_at: new Date().toISOString()
+          });
+
+        if (!error) {
+          insertError = null;
+          break;
+        } else {
+          insertError = error;
+          retries--;
+          if (retries > 0) {
+            console.warn(`Error inserting screenshot record, retrying... (${retries} attempts left):`, error);
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+      }
 
       if (insertError) {
-        console.error('Error inserting screenshot record:', insertError);
+        console.error('Error inserting screenshot record after retries:', insertError);
       }
     } else if (screenshotError) {
       console.warn('Error uploading screenshot:', screenshotError);
     }
-
+  } finally {
     // Clean up temp file
-    if (screenshotPath && fs.existsSync(screenshotPath)) {
+    if (fs.existsSync(screenshotPath)) {
       try {
         fs.unlinkSync(screenshotPath);
       } catch (unlinkError) {
         console.warn('Error deleting temp screenshot file:', unlinkError);
       }
     }
+  }
+}
 
-    // Capture camera (continue even if screenshot had issues)
-    await captureCamera();
-
-  } catch (error) {
-    console.warn('Error capturing screenshot (continuing with camera):', error.message || error);
-    
-    // Clean up temp file if it exists
-    if (screenshotPath && fs.existsSync(screenshotPath)) {
-      try {
-        fs.unlinkSync(screenshotPath);
-      } catch (unlinkError) {
-        // Ignore cleanup errors
+// Helper function to capture screenshot using Electron's desktopCapturer
+async function captureScreenshotWithElectron(sourceId) {
+  try {
+    // Request desktop capture stream
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: sourceId
+        }
       }
-    }
-    
-    // Still try to capture camera even if screenshot failed
-    try {
-      await captureCamera();
-    } catch (cameraError) {
-      console.warn('Error capturing camera:', cameraError.message || cameraError);
-    }
+    });
+
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true; // Required for autoplay in some browsers
+
+    // Wait for video to be ready
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Video load timeout'));
+      }, 10000);
+
+      video.onloadedmetadata = () => {
+        clearTimeout(timeout);
+        video.play().then(resolve).catch(reject);
+      };
+      video.onerror = (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      };
+    });
+
+    // Create canvas and draw video frame
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Stop the stream immediately
+    stream.getTracks().forEach(track => {
+      track.stop();
+    });
+    video.srcObject = null;
+
+    // Convert canvas to buffer using toDataURL (more reliable than toBlob in Electron)
+    return new Promise((resolve) => {
+      try {
+        const dataUrl = canvas.toDataURL('image/png');
+        // Convert data URL to buffer
+        const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
+        const buffer = Buffer.from(base64Data, 'base64');
+        resolve(buffer);
+      } catch (error) {
+        console.warn('Error converting canvas to buffer:', error);
+        resolve(null);
+      }
+    });
+  } catch (error) {
+    console.warn('Error capturing screenshot with Electron desktopCapturer:', error.message || error);
+    return null;
   }
 }
 

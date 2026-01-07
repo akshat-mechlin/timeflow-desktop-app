@@ -256,6 +256,21 @@ ipcMain.handle('set-is-tracking', (event, value) => {
   }
 });
 
+// Handler to get desktop sources for screenshot capture fallback
+ipcMain.handle('get-desktop-sources', async (event, options) => {
+  try {
+    const { desktopCapturer } = require('electron');
+    const sources = await desktopCapturer.getSources({
+      types: options.types || ['screen'],
+      thumbnailSize: options.thumbnailSize || { width: 1920, height: 1080 }
+    });
+    return sources;
+  } catch (error) {
+    console.error('Error getting desktop sources:', error);
+    return [];
+  }
+});
+
 // System-wide activity monitoring for Windows
 function startSystemActivityMonitoring() {
   if (systemActivityMonitor) {
