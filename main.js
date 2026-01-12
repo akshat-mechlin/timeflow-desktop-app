@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol } = require('electron');
+const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonitor } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -167,6 +167,14 @@ app.whenReady().then(() => {
       createMainWindow();
     }
   });
+
+  // Setup powerMonitor event listeners for automatic tracking stop
+  setupPowerMonitorListeners();
+  
+  // Setup user switch detection (Windows)
+  if (process.platform === 'win32') {
+    setupUserSwitchDetection();
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -179,6 +187,10 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   stopOAuthCallbackServer();
+  // Notify renderer that app is quitting
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('system-event', { type: 'app-quitting' });
+  }
 });
 
 // IPC handlers
@@ -268,6 +280,35 @@ ipcMain.handle('get-desktop-sources', async (event, options) => {
   } catch (error) {
     console.error('Error getting desktop sources:', error);
     return [];
+  }
+});
+
+// Handler to check if screen is off (Windows)
+ipcMain.handle('check-screen-off', async () => {
+  if (process.platform !== 'win32') {
+    return false; // Not Windows, assume screen is on
+  }
+
+  try {
+    const { exec } = require('child_process');
+    // Check if screen is off using PowerShell
+    // This checks the display state using WMI
+    const psCommand = `powershell -Command "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams; foreach ($monitor in $monitors) { if ($monitor.Active -eq $false) { Write-Output 'OFF'; exit } }; Write-Output 'ON'"`;
+    
+    return new Promise((resolve) => {
+      exec(psCommand, { timeout: 2000 }, (error, stdout, stderr) => {
+        if (error || stderr) {
+          // If we can't determine, assume screen is on (safer)
+          resolve(false);
+          return;
+        }
+        const result = stdout.trim().toUpperCase();
+        resolve(result === 'OFF');
+      });
+    });
+  } catch (error) {
+    console.error('Error checking screen state:', error);
+    return false; // Assume screen is on if we can't determine
   }
 });
 
@@ -372,15 +413,34 @@ function stopSystemActivityMonitoring() {
   }
 }
 
-ipcMain.handle('show-overlay', () => {
+ipcMain.handle('show-overlay', (event, options = {}) => {
   try {
-    console.log('show-overlay called');
+    const { title, message, icon, isStopped = false } = options;
+    console.log('show-overlay called', { title, message, icon, isStopped });
+    
+    const sendUpdateMessage = () => {
+      if (overlayWindow && !overlayWindow.isDestroyed()) {
+        if (title || message || icon !== undefined || isStopped !== undefined) {
+          // Small delay to ensure window is ready
+          setTimeout(() => {
+            if (overlayWindow && !overlayWindow.isDestroyed()) {
+              overlayWindow.webContents.send('update-overlay', { title, message, icon, isStopped });
+            }
+          }, 100);
+        }
+      }
+    };
+    
     if (!overlayWindow) {
       console.log('Creating overlay window');
       createOverlayWindow();
-      // Window will be shown in ready-to-show event
+      // Wait for window to be ready before sending message
+      overlayWindow.webContents.once('did-finish-load', () => {
+        sendUpdateMessage();
+      });
     } else {
-      // Window already exists, just show it
+      // Window already exists, update it and show
+      sendUpdateMessage();
       overlayWindow.show();
       overlayWindow.focus();
       console.log('Overlay window shown (existing)');
@@ -629,6 +689,122 @@ function handleOAuthCallback(url) {
       });
     }
   }
+}
+
+// Setup powerMonitor event listeners for automatic tracking stop
+function setupPowerMonitorListeners() {
+  // Screen lock detection (Windows + L or system lock)
+  powerMonitor.on('lock-screen', () => {
+    console.log('🔒 Screen locked - stopping tracker');
+    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
+      mainWindow.webContents.send('system-event', { 
+        type: 'screen-locked',
+        reason: 'Screen was locked (Windows + L or system lock)'
+      });
+    }
+  });
+
+  // Screen unlock detection (for logging, but we don't auto-resume)
+  powerMonitor.on('unlock-screen', () => {
+    console.log('🔓 Screen unlocked');
+    // We don't auto-resume tracking, user must manually start again
+  });
+
+  // Sleep mode detection
+  powerMonitor.on('suspend', () => {
+    console.log('😴 System entering sleep mode - stopping tracker');
+    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
+      mainWindow.webContents.send('system-event', { 
+        type: 'system-sleep',
+        reason: 'PC entered sleep mode'
+      });
+    }
+  });
+
+  // System resume from sleep
+  powerMonitor.on('resume', () => {
+    console.log('⏰ System resumed from sleep');
+    // We don't auto-resume tracking, user must manually start again
+  });
+
+  // Shutdown detection
+  powerMonitor.on('shutdown', () => {
+    console.log('🛑 System shutting down - stopping tracker');
+    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
+      mainWindow.webContents.send('system-event', { 
+        type: 'system-shutdown',
+        reason: 'PC is shutting down'
+      });
+    }
+  });
+
+  console.log('✅ PowerMonitor event listeners setup complete');
+}
+
+// Setup user switch detection for Windows
+function setupUserSwitchDetection() {
+  if (process.platform !== 'win32') {
+    return; // Only for Windows
+  }
+
+  const { exec } = require('child_process');
+  let lastSessionId = null;
+  
+  // Get initial session ID
+  getCurrentSessionId().then(sessionId => {
+    lastSessionId = sessionId;
+    console.log('Initial Windows session ID:', sessionId);
+  });
+
+  // Check for user switch every 2 seconds
+  setInterval(() => {
+    getCurrentSessionId().then(sessionId => {
+      if (lastSessionId !== null && sessionId !== lastSessionId) {
+        console.log('👤 User switched - stopping tracker');
+        console.log(`Session changed: ${lastSessionId} -> ${sessionId}`);
+        if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
+          mainWindow.webContents.send('system-event', { 
+            type: 'user-switched',
+            reason: 'Windows user was switched'
+          });
+        }
+        lastSessionId = sessionId;
+      }
+    }).catch(err => {
+      // Silently handle errors (session ID check might fail occasionally)
+    });
+  }, 2000);
+}
+
+// Get current Windows session ID
+function getCurrentSessionId() {
+  return new Promise((resolve, reject) => {
+    if (process.platform !== 'win32') {
+      reject(new Error('Not Windows'));
+      return;
+    }
+
+    const { exec } = require('child_process');
+    // Get session ID using PowerShell
+    const psCommand = `powershell -Command "Get-Process -Id $PID | Select-Object -ExpandProperty SessionId"`;
+    
+    exec(psCommand, { timeout: 1000 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (stderr) {
+        reject(new Error(stderr));
+        return;
+      }
+      const sessionId = parseInt(stdout.trim());
+      if (isNaN(sessionId)) {
+        reject(new Error('Invalid session ID'));
+        return;
+      }
+      resolve(sessionId);
+    });
+  });
 }
 
 

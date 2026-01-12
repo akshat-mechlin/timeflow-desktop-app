@@ -121,3 +121,4 @@ If you encounter issues:
 3. Ensure RLS policies allow reads (they should by default)
 
 
+

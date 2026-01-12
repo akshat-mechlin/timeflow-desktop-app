@@ -208,8 +208,42 @@ function clearLocalStorage(userId, dayCycle) {
   try {
     const key = getLocalStorageKey(userId, dayCycle);
     localStorage.removeItem(key);
+    console.log(`Cleared local storage for ${dayCycle}`);
   } catch (error) {
     console.error('Error clearing local storage:', error);
+  }
+}
+
+// Clear all old local storage entries for a user (except current day cycle)
+function clearAllOldLocalStorage(userId, currentDayCycle) {
+  try {
+    const prefix = `time_tracker_${userId}_`;
+    const keysToRemove = [];
+    
+    // Iterate through all localStorage keys
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        // Extract the day cycle from the key
+        const dayCycle = key.replace(prefix, '');
+        // If it's not the current day cycle, mark it for removal
+        if (dayCycle !== currentDayCycle) {
+          keysToRemove.push(key);
+        }
+      }
+    }
+    
+    // Remove all old entries
+    keysToRemove.forEach(key => {
+      localStorage.removeItem(key);
+      console.log(`Cleared old local storage entry: ${key}`);
+    });
+    
+    if (keysToRemove.length > 0) {
+      console.log(`🧹 Cleaned up ${keysToRemove.length} old local storage entries`);
+    }
+  } catch (error) {
+    console.error('Error clearing old local storage:', error);
   }
 }
 
@@ -447,6 +481,14 @@ window.addEventListener('beforeunload', async (e) => {
     // For Electron, we can use a blocking approach
     e.preventDefault();
     
+    // CRITICAL: Check day cycle before saving (don't save if day has changed)
+    const currentCycle = getCurrentDayCycle();
+    if (currentDayCycle && currentDayCycle.dateString !== currentCycle.dateString) {
+      console.warn('⚠️ Day cycle changed during shutdown - not saving old day data');
+      // Don't save - let the new day start fresh
+      return;
+    }
+    
     // Create a promise that resolves when stopTracking completes
     const stopPromise = stopTracking();
     
@@ -464,6 +506,107 @@ window.addEventListener('beforeunload', async (e) => {
     await new Promise(resolve => setTimeout(resolve, 300));
   }
 });
+
+// Handle app visibility change (when PC wakes from sleep or app regains focus)
+document.addEventListener('visibilitychange', async () => {
+  if (document.hidden && isTracking) {
+    // App became hidden - check if screen is off
+    console.log('👁️ App became hidden - checking if screen is off...');
+    await checkScreenOffAndStop();
+  } else if (!document.hidden && currentUser) {
+    // App became visible - validate day cycle
+    console.log('🔄 App became visible - validating day cycle...');
+    const newDayCycle = getCurrentDayCycle();
+    
+    if (!currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString) {
+      console.log('🔄 Day cycle changed while app was hidden - resetting');
+      
+      // Clear old local storage
+      if (currentUser) {
+        clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+        if (currentDayCycle) {
+          clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+        }
+      }
+      
+      // Reset state
+      currentDayCycle = newDayCycle;
+      baseDuration = 0;
+      baseDurationAtSessionStart = 0;
+      timeEntryId = null;
+      isTracking = false; // Stop tracking if it was active
+      
+      // Update UI
+      updateDayCycleDisplay();
+      updateTimerDisplay(0);
+      if (statusDisplay) {
+        statusDisplay.textContent = 'Not Tracking';
+        statusDisplay.classList.remove('tracking');
+      }
+      
+      // Reload for new day
+      loadLastTimeEntry();
+    }
+  }
+});
+
+// Check if screen is off and stop tracking if it is
+async function checkScreenOffAndStop() {
+  if (!isTracking) return;
+  
+  try {
+    // Check screen state (Windows)
+    if (process.platform === 'win32') {
+      const isScreenOff = await ipcRenderer.invoke('check-screen-off');
+      if (isScreenOff) {
+        console.log('🖥️ Screen is off - stopping tracker');
+        await stopTracking();
+        if (statusDisplay) {
+          statusDisplay.textContent = 'Stopped: Screen is off';
+          statusDisplay.classList.remove('tracking');
+          setTimeout(() => {
+            if (statusDisplay && !isTracking) {
+              statusDisplay.textContent = 'Not Tracking';
+            }
+          }, 5000);
+        }
+        
+        // Show overlay modal instead of alert
+        await ipcRenderer.invoke('show-overlay', {
+          title: 'Screen Off',
+          message: 'Your screen is off. Tracking has been stopped.',
+          icon: '🖥️',
+          isStopped: true
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error checking screen state:', error);
+  }
+}
+
+// Monitor screen state periodically while tracking
+let screenStateCheckInterval = null;
+
+function startScreenStateMonitoring() {
+  if (screenStateCheckInterval) {
+    clearInterval(screenStateCheckInterval);
+  }
+  
+  // Check screen state every 5 seconds while tracking
+  screenStateCheckInterval = setInterval(async () => {
+    if (isTracking && document.hidden) {
+      await checkScreenOffAndStop();
+    }
+  }, 5000);
+}
+
+function stopScreenStateMonitoring() {
+  if (screenStateCheckInterval) {
+    clearInterval(screenStateCheckInterval);
+    screenStateCheckInterval = null;
+  }
+}
 // Permission check button removed from UI - permissions checked automatically
 
 // Track mouse movements and keystrokes for statistics and reset idle timer
@@ -570,15 +713,119 @@ if (document.readyState === 'loading') {
 }
 
 // IPC handlers for overlay
-ipcRenderer.on('overlay-continue', () => {
+ipcRenderer.on('overlay-continue', async () => {
   if (isTracking && pauseStartTime) {
+    // Resume tracking if paused (inactivity scenario)
     resumeTracking();
+    // Close overlay after resuming
+    await ipcRenderer.invoke('close-overlay').catch(err => {
+      console.error('Error closing overlay:', err);
+    });
+  } else if (!isTracking) {
+    // Start tracking if stopped (system event scenario)
+    // Only start if project and task are selected
+    if (selectedProjectId && selectedTaskId) {
+      await startTracking();
+      // Close overlay after starting
+      await ipcRenderer.invoke('close-overlay').catch(err => {
+        console.error('Error closing overlay:', err);
+      });
+    } else {
+      alert('Please select a project and task before starting tracking.');
+      // Close overlay even if can't start
+      await ipcRenderer.invoke('close-overlay').catch(err => {
+        console.error('Error closing overlay:', err);
+      });
+    }
   }
 });
 
 ipcRenderer.on('overlay-stop', () => {
   if (isTracking) {
+    // Stop tracking if currently tracking
     stopTracking();
+  }
+  // Close overlay
+  ipcRenderer.invoke('close-overlay').catch(err => {
+    console.error('Error closing overlay:', err);
+  });
+});
+
+// Handle system events (screen lock, sleep, shutdown, user switch)
+ipcRenderer.on('system-event', async (event, data) => {
+  const { type, reason } = data;
+  
+  if (!isTracking) {
+    return; // Not tracking, ignore
+  }
+  
+  console.log(`🛑 System event detected: ${type} - ${reason || 'No reason provided'}`);
+  console.log('⏹️ Stopping tracker automatically...');
+  
+  // Stop tracking immediately
+  try {
+    await stopTracking();
+    
+    // Show notification to user
+    if (statusDisplay) {
+      statusDisplay.textContent = `Stopped: ${reason || type}`;
+      statusDisplay.classList.remove('tracking');
+      
+      // Reset status message after 5 seconds
+      setTimeout(() => {
+        if (statusDisplay && !isTracking) {
+          statusDisplay.textContent = 'Not Tracking';
+        }
+      }, 5000);
+    }
+    
+    // Show overlay modal instead of alert
+    const overlayMessages = {
+      'screen-locked': {
+        title: 'Screen Locked',
+        message: 'Your screen was locked. Tracking has been stopped.',
+        icon: '🔒'
+      },
+      'system-sleep': {
+        title: 'System Sleep',
+        message: 'Your PC entered sleep mode. Tracking has been stopped.',
+        icon: '😴'
+      },
+      'system-shutdown': {
+        title: 'System Shutdown',
+        message: 'Your PC is shutting down. Tracking has been stopped.',
+        icon: '🛑'
+      },
+      'user-switched': {
+        title: 'User Switched',
+        message: 'Windows user was switched. Tracking has been stopped.',
+        icon: '👤'
+      },
+      'screen-off': {
+        title: 'Screen Off',
+        message: 'Your screen is off. Tracking has been stopped.',
+        icon: '🖥️'
+      },
+      'app-quitting': {
+        title: 'App Closing',
+        message: 'The application is closing. Tracking has been stopped.',
+        icon: '👋'
+      }
+    };
+    
+    const overlayConfig = overlayMessages[type] || {
+      title: 'Tracking Stopped',
+      message: reason || 'Tracking has been stopped automatically.',
+      icon: '⏹️'
+    };
+    
+    // Show overlay with custom message
+    await ipcRenderer.invoke('show-overlay', {
+      ...overlayConfig,
+      isStopped: true // Indicates tracking is stopped (not paused)
+    });
+  } catch (error) {
+    console.error('Error stopping tracking on system event:', error);
   }
 });
 
@@ -893,8 +1140,36 @@ async function showDashboard() {
   // Setup network monitoring
   setupNetworkMonitoring();
   
-  // Initialize day cycle and check for existing time entry
-  currentDayCycle = getCurrentDayCycle();
+  // CRITICAL: Validate day cycle on startup (handles forced shutdowns)
+  // This ensures we never load stale data from previous day after PC restart
+  console.log('🔄 Validating day cycle on startup...');
+  const startupDayCycle = getCurrentDayCycle();
+  
+  // Clear ALL old local storage entries on startup (safety measure)
+  if (currentUser) {
+    clearAllOldLocalStorage(currentUser.id, startupDayCycle.dateString);
+    console.log('🧹 Cleared all old local storage entries on startup');
+  }
+  
+  // Initialize day cycle
+  currentDayCycle = startupDayCycle;
+  
+  // Reset state to ensure clean start (especially after forced shutdown)
+  // If tracking was active when PC shut down, we don't want to resume with old data
+  baseDuration = 0;
+  baseDurationAtSessionStart = 0;
+  timeEntryId = null;
+  isTracking = false; // Ensure tracking is stopped on startup
+  
+  // Update UI to show reset state
+  updateDayCycleDisplay();
+  updateTimerDisplay(0);
+  if (statusDisplay) {
+    statusDisplay.textContent = 'Not Tracking';
+    statusDisplay.classList.remove('tracking');
+  }
+  
+  // Now load last time entry (will validate day cycle again)
   loadLastTimeEntry();
   
   // Start daily reset check
@@ -1510,30 +1785,45 @@ async function loadLastTimeEntry() {
   
   console.log('🔄 Loading last time entry for current day cycle...');
 
-  // Check if we need to reset (new day cycle)
+  // ALWAYS get the current day cycle first
   const newDayCycle = getCurrentDayCycle();
-  if (currentDayCycle && currentDayCycle.dateString !== newDayCycle.dateString) {
+  
+  // Check if we need to reset (new day cycle) - this works even if currentDayCycle is null
+  const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
+  
+  if (dayCycleChanged) {
     // New day cycle - reset everything
-    console.log('New day cycle detected, resetting:', {
-      old: currentDayCycle.dateString,
+    console.log('🔄 New day cycle detected, resetting:', {
+      old: currentDayCycle ? currentDayCycle.dateString : 'null',
       new: newDayCycle.dateString
     });
     
-    // Clear old local storage data
+    // Clear ALL old local storage data for this user (cleanup old entries)
     if (currentUser) {
-      clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      
+      // Also clear the specific old day cycle if it exists
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      }
     }
     
+    // Reset all state
     currentDayCycle = newDayCycle;
     baseDuration = 0;
     baseDurationAtSessionStart = 0;
     timeEntryId = null;
+    
+    // Update UI immediately
     updateDayCycleDisplay();
     updateTimerDisplay(0);
-    return;
+    
+    // Continue to load data for the NEW day cycle (should be empty)
+    // Don't return here - we want to check for new day's data
+  } else {
+    // Same day cycle - just update reference
+    currentDayCycle = newDayCycle;
   }
-
-  currentDayCycle = newDayCycle;
 
   // Get profile
   const { data: profile } = await supabase
@@ -1548,13 +1838,44 @@ async function loadLastTimeEntry() {
   }
 
   // Load from local storage first (offline data)
+  // BUT validate it's for the correct day cycle BEFORE using it
   const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
   let localDuration = 0;
   let localTimeEntryId = null;
   
+  // CRITICAL: Validate local storage data is for the CURRENT day cycle
   if (localData) {
-    localDuration = localData.duration || 0;
-    localTimeEntryId = localData.timeEntryId || null;
+    // Check if the stored dateString matches current day cycle
+    if (localData.dateString && localData.dateString === currentDayCycle.dateString) {
+      // Additional validation: Check if data is too old (more than 24 hours)
+      // This prevents using stale data after forced shutdowns
+      const now = new Date();
+      const dataAge = localData.lastUpdated ? (now.getTime() - localData.lastUpdated) : Infinity;
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+      
+      if (dataAge > maxAge) {
+        console.warn('⚠️ Local storage data is too old (>24 hours), clearing it:', {
+          ageHours: Math.floor(dataAge / (60 * 60 * 1000)),
+          dateString: localData.dateString
+        });
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+        localDuration = 0;
+        localTimeEntryId = null;
+      } else {
+        // Data is valid for current day cycle and not too old
+        localDuration = localData.duration || 0;
+        localTimeEntryId = localData.timeEntryId || null;
+      }
+    } else {
+      // Data is for a different day - clear it and don't use it
+      console.warn('⚠️ Local storage data is for a different day cycle, clearing it:', {
+        stored: localData.dateString,
+        current: currentDayCycle.dateString
+      });
+      clearLocalStorage(currentUser.id, localData.dateString || currentDayCycle.dateString);
+      localDuration = 0;
+      localTimeEntryId = null;
+    }
   }
 
   // Try to fetch from Supabase (if online)
@@ -1677,10 +1998,12 @@ async function loadLastTimeEntry() {
     }
   }
 
-  // Validate that we're using the correct day cycle
-  // If local storage has data for a different day, clear it
+  // Validation already done above - this check is redundant but kept for safety
   if (localData && localData.dateString && localData.dateString !== currentDayCycle.dateString) {
-    console.log('Local storage data is for a different day cycle, clearing it');
+    console.warn('⚠️ Additional validation: Local storage data mismatch detected, clearing:', {
+      stored: localData.dateString,
+      current: currentDayCycle.dateString
+    });
     clearLocalStorage(currentUser.id, localData.dateString);
     localDuration = 0;
     localTimeEntryId = null;
@@ -1957,15 +2280,38 @@ async function startTracking() {
     return;
   }
 
-  // Check if day cycle has changed
+  // CRITICAL: Always check day cycle FIRST before starting tracking
+  // This ensures we never start tracking with old day's data
   const newDayCycle = getCurrentDayCycle();
-  if (currentDayCycle && currentDayCycle.dateString !== newDayCycle.dateString) {
-    // New day cycle - reset and reload
+  const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
+  
+  if (dayCycleChanged) {
+    // New day cycle detected - reset everything and reload
+    console.log('🔄 Day cycle changed before starting tracking, resetting:', {
+      old: currentDayCycle ? currentDayCycle.dateString : 'null',
+      new: newDayCycle.dateString
+    });
+    
+    // Clear old local storage
+    if (currentUser) {
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      }
+    }
+    
+    // Reset state
     currentDayCycle = newDayCycle;
     baseDuration = 0;
     baseDurationAtSessionStart = 0;
     timeEntryId = null;
+    
+    // Reload for new day cycle (should be empty)
     await loadLastTimeEntry();
+    
+    // Update UI
+    updateDayCycleDisplay();
+    updateTimerDisplay(0);
   }
 
   isTracking = true;
@@ -2127,6 +2473,9 @@ async function startTracking() {
 
   // Start real-time updates (every 30 seconds)
   startRealTimeUpdates();
+  
+  // Start screen state monitoring
+  startScreenStateMonitoring();
 }
 
 async function stopTracking() {
@@ -2168,6 +2517,9 @@ async function stopTracking() {
     clearInterval(systemActivitySyncInterval);
     systemActivitySyncInterval = null;
   }
+  
+  // Stop screen state monitoring
+  stopScreenStateMonitoring();
   
   // Wait a brief moment to ensure any pending async operations complete
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -3502,20 +3854,32 @@ async function syncCurrentDuration() {
 }
 
 function startDailyResetCheck() {
-  // Check every minute if we've crossed the 6 AM IST threshold
+  // Check every 30 seconds if we've crossed the 6 AM IST threshold (more frequent for better detection)
   dailyResetCheckInterval = setInterval(async () => {
     if (!currentUser) return;
 
     const newDayCycle = getCurrentDayCycle();
     
-    // Check if day cycle has changed
-    if (currentDayCycle && currentDayCycle.dateString !== newDayCycle.dateString) {
+    // Check if day cycle has changed - works even if currentDayCycle is null
+    const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
+    
+    if (dayCycleChanged) {
       // New day cycle detected - reset everything
-      console.log('New day cycle detected - resetting tracking');
+      console.log('🔄 New day cycle detected at 6 AM - resetting tracking:', {
+        old: currentDayCycle ? currentDayCycle.dateString : 'null',
+        new: newDayCycle.dateString
+      });
       
       // Stop tracking if active
       if (isTracking) {
+        console.log('Stopping active tracking due to day cycle change');
         await stopTracking();
+      }
+      
+      // Clear ALL old local storage entries
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
       }
       
       // Reset state
@@ -3532,12 +3896,13 @@ function startDailyResetCheck() {
       updateTimerDisplay(0);
       
       // Show notification
-      // Day cycle display removed - just show not tracking status
       if (!isTracking) {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
       }
+      
+      console.log('✅ Day cycle reset complete - timer reset to 00:00:00');
     }
-  }, 60000); // Check every minute
+  }, 30000); // Check every 30 seconds for more responsive day cycle detection
 }
 

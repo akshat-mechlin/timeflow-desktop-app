@@ -94,3 +94,4 @@ The badge has:
 - Download URLs are stored in JSON format for flexibility
 - Backward compatible with single `download_url` field
 
+

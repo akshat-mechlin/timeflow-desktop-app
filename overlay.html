@@ -100,9 +100,9 @@
 </head>
 <body>
   <div class="overlay-container">
-    <div class="overlay-icon">⏸️</div>
-    <h2>Inactivity Detected</h2>
-    <p>You've been inactive. Tracking has been paused.</p>
+    <div class="overlay-icon" id="overlay-icon">⏸️</div>
+    <h2 id="overlay-title">Inactivity Detected</h2>
+    <p id="overlay-message">You've been inactive. Tracking has been paused.</p>
     <div class="button-group">
       <button class="btn-continue" id="continue-btn">Continue</button>
       <button class="btn-stop" id="stop-btn">Stop Tracking</button>
@@ -111,6 +111,30 @@
 
   <script>
     const { ipcRenderer } = require('electron');
+
+    // Update overlay content when message is received
+    ipcRenderer.on('update-overlay', (event, data) => {
+      const { title, message, icon, isStopped } = data;
+      
+      if (title) {
+        document.getElementById('overlay-title').textContent = title;
+      }
+      if (message) {
+        document.getElementById('overlay-message').textContent = message;
+      }
+      if (icon !== undefined) {
+        document.getElementById('overlay-icon').textContent = icon;
+      }
+      
+      // Update button text if tracking is stopped (not paused)
+      if (isStopped) {
+        document.getElementById('continue-btn').textContent = 'Start Tracking';
+        document.getElementById('stop-btn').textContent = 'Close';
+      } else {
+        document.getElementById('continue-btn').textContent = 'Continue';
+        document.getElementById('stop-btn').textContent = 'Stop Tracking';
+      }
+    });
 
     document.getElementById('continue-btn').addEventListener('click', () => {
       ipcRenderer.send('overlay-continue');
