@@ -701,3 +701,33 @@ body {
 .update-modal-actions .btn-secondary:hover {
     background: #4b5563;
 }
+
+/* Secret Clear Cache Button */
+.secret-clear-cache-btn {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 12px 20px;
+    background: #dc2626;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
+    z-index: 9999;
+    transition: all 0.2s ease;
+    font-family: inherit;
+}
+
+.secret-clear-cache-btn:hover {
+    background: #b91c1c;
+    box-shadow: 0 6px 16px rgba(220, 38, 38, 0.4);
+    transform: translateY(-2px);
+}
+
+.secret-clear-cache-btn:active {
+    transform: translateY(0);
+    box-shadow: 0 2px 8px rgba(220, 38, 38, 0.3);
+}
