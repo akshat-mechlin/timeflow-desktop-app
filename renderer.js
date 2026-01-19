@@ -81,25 +81,36 @@ function getCurrentDayCycle() {
   let cycleDate, cycleStart, cycleEnd;
   let cycleYear, cycleMonth, cycleDay;
 
-  // Day cycle starts at 12:00:00 AM (midnight) IST and ends at 11:59:59.999 PM IST
-  // Use current date as the cycle date
-  cycleYear = ist.year;
-  cycleMonth = ist.month;
-  cycleDay = ist.date;
-  
-  // Cycle start: today at 12:00:00 AM IST = yesterday at 18:30:00 UTC (IST is UTC+5:30)
-  // For Jan 1, 2024 12:00:00 AM IST = Dec 31, 2023 18:30:00 UTC
-  const cycleStartDate = new Date(Date.UTC(ist.year, ist.month, ist.date));
-  cycleStartDate.setUTCDate(cycleStartDate.getUTCDate() - 1); // Previous day in UTC
-  cycleStart = new Date(Date.UTC(
-    cycleStartDate.getUTCFullYear(),
-    cycleStartDate.getUTCMonth(),
-    cycleStartDate.getUTCDate(),
-    18, 30, 0, 0  // 12:00:00 AM IST = 18:30:00 UTC (previous day)
-  ));
-  
-  // Cycle end: today at 11:59:59.999 PM IST = today at 18:29:59.999 UTC
-  cycleEnd = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 18, 29, 59, 999));
+  // If current time is before 6 AM IST, the cycle started yesterday at 6 AM
+  if (ist.hours < 6) {
+    // Cycle started yesterday at 6 AM IST
+    // Calculate yesterday's date components
+    const yesterday = new Date(Date.UTC(ist.year, ist.month, ist.date));
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+    
+    cycleYear = yesterday.getUTCFullYear();
+    cycleMonth = yesterday.getUTCMonth();
+    cycleDay = yesterday.getUTCDate();
+    
+    // Cycle start: yesterday at 6:00:00 AM IST = yesterday at 00:30:00 UTC
+    cycleStart = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 0, 30, 0, 0));
+    
+    // Cycle end: today at 5:59:59.999 AM IST = today at 00:29:59.999 UTC
+    cycleEnd = new Date(Date.UTC(ist.year, ist.month, ist.date, 0, 29, 59, 999));
+  } else {
+    // Cycle started today at 6 AM IST
+    cycleYear = ist.year;
+    cycleMonth = ist.month;
+    cycleDay = ist.date;
+    
+    // Cycle start: today at 6:00:00 AM IST = today at 00:30:00 UTC
+    cycleStart = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 0, 30, 0, 0));
+    
+    // Cycle end: tomorrow at 5:59:59.999 AM IST = tomorrow at 00:29:59.999 UTC
+    const tomorrow = new Date(Date.UTC(ist.year, ist.month, ist.date));
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    cycleEnd = new Date(Date.UTC(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth(), tomorrow.getUTCDate(), 0, 29, 59, 999));
+  }
 
   // Create cycle date object for the cycle date (not time)
   cycleDate = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay));
@@ -147,12 +158,13 @@ let dailyResetCheckInterval = null;
 let idleTimer = null; // Timer for inactivity detection
 let idleDoubleCheckTimer = null; // Timer for double-checking inactivity
 let lastActivityTime = Date.now(); // Last time user was active
-let inactivityStartTime = null; // Time when inactivity threshold was reached
 let resetIdleTimerDebounce = null; // Debounce timer for resetIdleTimer
 let mouseMovementCount = 0;
 let keystrokeCount = 0;
 let currentDayCycle = null; // Current day cycle info
 let isOnline = navigator.onLine; // Network status
+let pendingUpdates = []; // Queue for offline updates
+let syncInterval = null; // Interval for syncing when back online
 let systemActivitySyncInterval = null; // Interval for syncing system activity
 let projects = []; // List of projects assigned to user
 let tasks = []; // List of tasks for selected project
@@ -240,11 +252,12 @@ function setupNetworkMonitoring() {
   window.addEventListener('online', () => {
     isOnline = true;
     console.log('Network connection restored');
+    syncPendingUpdates();
   });
   
   window.addEventListener('offline', () => {
     isOnline = false;
-    console.log('Network connection lost - time entries require internet connection');
+    console.log('Network connection lost - using local storage');
   });
   
   // Check network status periodically
@@ -254,6 +267,7 @@ function setupNetworkMonitoring() {
     
     if (!wasOnline && isOnline) {
       console.log('Network connection restored');
+      syncPendingUpdates();
     }
   }, 5000);
 }
@@ -263,53 +277,97 @@ function ensureMaxDuration(currentDuration, newDuration) {
   return Math.max(currentDuration, newDuration);
 }
 
-// CRITICAL: Validate that tracker is only running for current date
-// This function checks if the date has changed and stops tracking if it has
-// Returns true if date is valid (current date), false if date changed
-async function validateCurrentDate() {
-  if (!isTracking || !currentDayCycle) {
-    return true; // Not tracking, so validation passes
-  }
+// Sync duration to Supabase (used when local is higher)
+async function syncDurationToSupabase(timeEntryId, duration) {
+  if (!isOnline || !timeEntryId) return false;
 
-  const newDayCycle = getCurrentDayCycle();
-  const dayCycleChanged = currentDayCycle.dateString !== newDayCycle.dateString;
+  try {
+    // Fetch current duration first
+    const { data: currentEntry } = await supabase
+      .from('time_entries')
+      .select('duration')
+      .eq('id', timeEntryId)
+      .single();
 
-  if (dayCycleChanged) {
-    console.error('🚨 CRITICAL: Date changed while tracking! Stopping tracker immediately.');
-    console.error('Old date:', currentDayCycle.dateString, 'New date:', newDayCycle.dateString);
-    
-    // Stop tracking immediately - date has changed
-    if (isTracking) {
-      console.log('🛑 Forcing stop tracking due to date change');
-      await stopTracking();
+    const remoteDuration = currentEntry?.duration || 0;
+    const maxDuration = ensureMaxDuration(remoteDuration, duration);
+
+    if (maxDuration > remoteDuration) {
+      const { error } = await supabase
+        .from('time_entries')
+        .update({
+          duration: maxDuration,
+          end_time: null, // Always NULL during active tracking
+          updated_at: new Date().toISOString(),
+          app_version: appVersion // Track which version of the tracker updated this entry
+        })
+        .eq('id', timeEntryId);
+
+      if (error) {
+        console.error('Error syncing duration:', error);
+        return false;
+      }
+      return true;
     }
-    
-    // Reset to new day
-    currentDayCycle = newDayCycle;
-    baseDuration = 0;
-    baseDurationAtSessionStart = 0;
-    timeEntryId = null;
-    
-    // Update UI
-    updateTimerDisplay(0);
-    updateDayCycleDisplay();
-    if (statusDisplay) {
-      statusDisplay.textContent = 'Not Tracking - Date Changed';
-      statusDisplay.classList.remove('tracking');
-      setTimeout(() => {
-        if (statusDisplay) {
-          statusDisplay.textContent = 'Not Tracking';
-        }
-      }, 5000);
-    }
-    
-    return false; // Date changed, validation failed
+    return true;
+  } catch (error) {
+    console.error('Error syncing duration:', error);
+    return false;
   }
-
-  return true; // Date is valid (current date)
 }
 
-// Removed syncDurationToSupabase and syncPendingUpdates - time entries are sent directly to Supabase
+// Sync pending updates when back online
+async function syncPendingUpdates() {
+  if (!isOnline || !currentUser || pendingUpdates.length === 0) return;
+
+  console.log(`Syncing ${pendingUpdates.length} pending updates...`);
+
+  for (let i = pendingUpdates.length - 1; i >= 0; i--) {
+    const update = pendingUpdates[i];
+    try {
+      // Fetch current duration first
+      const { data: currentEntry } = await supabase
+        .from('time_entries')
+        .select('duration')
+        .eq('id', update.timeEntryId)
+        .single();
+
+      const remoteDuration = currentEntry?.duration || 0;
+      const maxDuration = ensureMaxDuration(remoteDuration, update.duration);
+
+      const { error } = await supabase
+        .from('time_entries')
+        .update({
+          duration: maxDuration,
+          end_time: null, // Always NULL
+          updated_at: new Date().toISOString(),
+          app_version: appVersion // Track which version of the tracker updated this entry
+        })
+        .eq('id', update.timeEntryId);
+
+      if (!error) {
+        // Remove from queue
+        pendingUpdates.splice(i, 1);
+        console.log('Synced pending update successfully');
+      } else {
+        console.error('Error syncing pending update:', error);
+      }
+    } catch (error) {
+      console.error('Error syncing pending update:', error);
+    }
+  }
+
+  // Update local storage to mark as synced
+  if (currentDayCycle) {
+    const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
+    if (localData) {
+      saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+        ...localData,
+        synced: true
+      });
+    }
+  }
+}
 
 // DOM elements - wait for DOM to be ready
 let loadingContainer, loginContainer, dashboardContainer, loginForm, emailInput, passwordInput;
@@ -317,7 +375,6 @@ let errorMessage, userNameSpan, logoutBtn, startBtn, stopBtn, timerDisplay, stat
 let projectSelect, taskSelect, taskNameDisplay, taskTagDisplay;
 let azureSsoBtn, closeBtn, closeBtnLogin, minimizeBtn, minimizeBtnLogin;
 let versionBadge, versionText;
-let secretClearCacheBtn;
 
 // Initialize DOM elements when DOM is ready
 function initializeDOMElements() {
@@ -345,7 +402,6 @@ function initializeDOMElements() {
   taskTagDisplay = document.getElementById('task-tag');
   versionBadge = document.getElementById('version-badge');
   versionText = document.getElementById('version-text');
-  secretClearCacheBtn = document.getElementById('secret-clear-cache-btn');
 
   // Verify critical elements exist
   if (!projectSelect) {
@@ -403,126 +459,6 @@ stopBtn.addEventListener('click', stopTracking);
   if (taskSelect) {
     taskSelect.addEventListener('change', handleTaskChange);
   }
-  if (secretClearCacheBtn) {
-    secretClearCacheBtn.addEventListener('click', handleClearCacheAndReset);
-  }
-  
-  // Setup keyboard shortcut for Ctrl+H to toggle secret button
-  document.addEventListener('keydown', (e) => {
-    // Ctrl+H or Cmd+H (Mac) to toggle secret button visibility
-    if ((e.ctrlKey || e.metaKey) && (e.key === 'h' || e.key === 'H')) {
-      e.preventDefault();
-      toggleSecretButton();
-    }
-  });
-}
-
-// Toggle secret button visibility
-function toggleSecretButton() {
-  if (secretClearCacheBtn) {
-    secretClearCacheBtn.classList.toggle('hidden');
-    console.log('Secret button visibility toggled:', !secretClearCacheBtn.classList.contains('hidden'));
-  }
-}
-
-// Handle clear cache and reset tracker
-async function handleClearCacheAndReset() {
-  if (!currentUser) {
-    console.warn('Cannot clear cache: No user logged in');
-    return;
-  }
-
-  // Confirm action
-  const confirmed = confirm('⚠️ WARNING: This will clear all cache and reset the tracker to 00:00:00 for the current date.\n\nThis action cannot be undone. Continue?');
-  if (!confirmed) {
-    return;
-  }
-
-  try {
-    console.log('🗑️ Clearing cache and resetting tracker...');
-
-    // Stop tracking if active
-    if (isTracking) {
-      console.log('Stopping active tracking before reset...');
-      await stopTracking();
-    }
-
-    // Clear all localStorage entries for this user
-    if (currentUser) {
-      const prefix = `time_tracker_${currentUser.id}_`;
-      const keysToRemove = [];
-      
-      // Find all localStorage keys for this user
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key && key.startsWith(prefix)) {
-          keysToRemove.push(key);
-        }
-      }
-      
-      // Remove all entries
-      keysToRemove.forEach(key => {
-        localStorage.removeItem(key);
-        console.log(`Cleared localStorage entry: ${key}`);
-      });
-      
-      if (keysToRemove.length > 0) {
-        console.log(`🧹 Cleared ${keysToRemove.length} localStorage entries`);
-      }
-    }
-
-    // Reset to current date cycle
-    const newDayCycle = getCurrentDayCycle();
-    currentDayCycle = newDayCycle;
-    
-    // Reset all tracking state
-    baseDuration = 0;
-    baseDurationAtSessionStart = 0;
-    timeEntryId = null;
-    sessionStartTime = null;
-    pausedDuration = 0;
-    pauseStartTime = null;
-    mouseMovementCount = 0;
-    keystrokeCount = 0;
-    lastActivityTime = Date.now();
-
-    // Clear intervals
-    if (timerInterval) {
-      clearInterval(timerInterval);
-      timerInterval = null;
-    }
-    if (captureInterval) {
-      clearInterval(captureInterval);
-      captureInterval = null;
-    }
-    if (realTimeUpdateInterval) {
-      clearInterval(realTimeUpdateInterval);
-      realTimeUpdateInterval = null;
-    }
-
-    // Update UI
-    updateTimerDisplay(0);
-    updateDayCycleDisplay();
-    
-    if (statusDisplay) {
-      statusDisplay.textContent = 'Not Tracking';
-      statusDisplay.classList.remove('tracking');
-    }
-
-    // Reload last time entry (should be empty for current date)
-    await loadLastTimeEntry();
-
-    // Hide the secret button after reset
-    if (secretClearCacheBtn) {
-      secretClearCacheBtn.classList.add('hidden');
-    }
-
-    console.log('✅ Cache cleared and tracker reset to 00:00:00 for current date:', newDayCycle.dateString);
-    alert('✅ Cache cleared and tracker reset to 00:00:00 for the current date.');
-  } catch (error) {
-    console.error('❌ Error clearing cache and resetting tracker:', error);
-    alert('❌ Error clearing cache. Please check the console for details.');
-  }
 }
 
 // Initialize when DOM is ready
@@ -579,43 +515,28 @@ document.addEventListener('visibilitychange', async () => {
     await checkScreenOffAndStop();
   } else if (!document.hidden && currentUser) {
     // App became visible - validate day cycle
-    // This handles cases where the app was minimized/backgrounded when date changed at midnight
     console.log('🔄 App became visible - validating day cycle...');
     const newDayCycle = getCurrentDayCycle();
     
     if (!currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString) {
-      console.log('🔄 Day cycle changed while app was hidden/closed - resetting to 00:00:00');
+      console.log('🔄 Day cycle changed while app was hidden - resetting');
       
-      // Stop tracking if active (this will save final duration to Supabase)
-      if (isTracking) {
-        console.log('Stopping active tracking due to day cycle change');
-        await stopTracking();
+      // Clear old local storage
+      if (currentUser) {
+        clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+        if (currentDayCycle) {
+          clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+        }
       }
       
-      // Reset all state for new day
+      // Reset state
       currentDayCycle = newDayCycle;
       baseDuration = 0;
       baseDurationAtSessionStart = 0;
       timeEntryId = null;
-      sessionStartTime = null;
-      pausedDuration = 0;
-      pauseStartTime = null;
+      isTracking = false; // Stop tracking if it was active
       
-      // Clear intervals
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-      if (captureInterval) {
-        clearInterval(captureInterval);
-        captureInterval = null;
-      }
-      if (realTimeUpdateInterval) {
-        clearInterval(realTimeUpdateInterval);
-        realTimeUpdateInterval = null;
-      }
-      
-      // Update UI to show 00:00:00
+      // Update UI
       updateDayCycleDisplay();
       updateTimerDisplay(0);
       if (statusDisplay) {
@@ -623,8 +544,8 @@ document.addEventListener('visibilitychange', async () => {
         statusDisplay.classList.remove('tracking');
       }
       
-      // Don't load from database - start fresh at 00:00:00 for new day
-      // This ensures automatic reset when date changes even if app was hidden/closed
+      // Reload for new day
+      loadLastTimeEntry();
     }
   }
 });
@@ -750,8 +671,6 @@ function resetIdleTimer() {
   // Only update if it's been at least 50ms since last update (light debounce to avoid spam)
   if (timeSinceLastUpdate > 50) {
     lastActivityTime = now;
-    // Clear inactivity start time since user is active
-    inactivityStartTime = null;
     
     // Cancel any pending double-check if activity is detected
     if (idleDoubleCheckTimer) {
@@ -771,8 +690,6 @@ ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
     const timeSinceLastUpdate = now - lastActivityTime;
     const previousTime = lastActivityTime;
     lastActivityTime = now;
-    // Clear inactivity start time since user is active
-    inactivityStartTime = null;
     
     // Log system activity (this is critical for debugging)
     if (timeSinceLastUpdate > 2000) { // Only log if it's been more than 2 seconds
@@ -1165,9 +1082,7 @@ async function checkAuth() {
       // Track version usage after login
       await trackVersionUsage();
       
-      console.log('📋 About to call showDashboard() from checkAuth()');
-      await showDashboard();
-      console.log('✓ showDashboard() completed');
+      showDashboard();
     } else {
       console.log('No session found, showing login');
       showLogin();
@@ -1185,7 +1100,6 @@ function showLogin() {
 }
 
 async function showDashboard() {
-  console.log('🚀 showDashboard() called - starting dashboard initialization');
   if (loadingContainer) loadingContainer.classList.add('hidden');
   if (loginContainer) loginContainer.classList.add('hidden');
   if (dashboardContainer) dashboardContainer.classList.remove('hidden');
@@ -1226,48 +1140,50 @@ async function showDashboard() {
   // Setup network monitoring
   setupNetworkMonitoring();
   
-  // CRITICAL: Validate day cycle on startup (handles app being closed during date change)
-  // This ensures we reset to 00:00:00 if the date changed while the app was closed
+  // CRITICAL: Validate day cycle on startup (handles forced shutdowns)
+  // This ensures we never load stale data from previous day after PC restart
   console.log('🔄 Validating day cycle on startup...');
   const startupDayCycle = getCurrentDayCycle();
   
-  // CRITICAL: Don't check dayCycleChanged based on currentDayCycle state (which might be null)
-  // Instead, ALWAYS load from Supabase and check the actual entry date vs current date
-  // This is the correct way to determine if it's a new day
+  // Clear ALL old local storage entries on startup (safety measure)
+  if (currentUser) {
+    clearAllOldLocalStorage(currentUser.id, startupDayCycle.dateString);
+    console.log('🧹 Cleared all old local storage entries on startup');
+  }
   
-  // Set current day cycle first
+  // Initialize day cycle
   currentDayCycle = startupDayCycle;
   
-  // Reset tracking state (but DON'T reset baseDuration - it will be loaded from Supabase)
-  isTracking = false;
+  // Reset state to ensure clean start (especially after forced shutdown)
+  // If tracking was active when PC shut down, we don't want to resume with old data
+  baseDuration = 0;
   baseDurationAtSessionStart = 0;
   timeEntryId = null;
+  isTracking = false; // Ensure tracking is stopped on startup
   
-  // Update UI initially
+  // Update UI to show reset state
   updateDayCycleDisplay();
+  updateTimerDisplay(0);
   if (statusDisplay) {
     statusDisplay.textContent = 'Not Tracking';
     statusDisplay.classList.remove('tracking');
   }
   
-  // ALWAYS load last time entry from Supabase - this will check the actual entry date
-  // and determine if it's a new day by comparing entry date with current date
-  console.log('📥 Loading latest time entry to check date and load duration...');
-  await loadLastTimeEntry();
-  
-  // Update timer display with loaded duration (will be 0 if new day, or actual duration if same day)
-  updateTimerDisplay(baseDuration);
-  
-  if (baseDuration > 0) {
-    console.log(`✅ Loaded duration ${formatDurationFromSeconds(baseDuration)} for ${currentDayCycle.dateString}`);
-  } else {
-    console.log(`ℹ️ No time entry found for ${currentDayCycle.dateString} or new day detected - starting fresh at 00:00:00`);
-  }
+  // Now load last time entry (will validate day cycle again)
+  loadLastTimeEntry();
   
   // Start daily reset check
   startDailyResetCheck();
   
-  // No periodic sync needed - time entries are sent directly to Supabase
+  // Start periodic sync check (every 60 seconds)
+  if (syncInterval) {
+    clearInterval(syncInterval);
+  }
+  syncInterval = setInterval(() => {
+    if (isOnline && pendingUpdates.length > 0) {
+      syncPendingUpdates();
+    }
+  }, 60000);
   
   // Check permissions once when dashboard loads (not on every start button click)
   checkAllPermissions();
@@ -1862,43 +1778,35 @@ function updateStartButtonState() {
  * Checks both local storage (for offline support) and Supabase (for latest data)
  */
 async function loadLastTimeEntry() {
-  console.log('🔵 loadLastTimeEntry() FUNCTION CALLED');
-  console.log('🔵 currentUser check:', { hasUser: !!currentUser, userId: currentUser ? currentUser.id : 'null' });
-  
   if (!currentUser) {
-    console.log('❌ No current user, skipping loadLastTimeEntry');
+    console.log('No current user, skipping loadLastTimeEntry');
     return;
   }
   
   console.log('🔄 Loading last time entry for current day cycle...');
-  console.log('Current state before load:', {
-    currentDayCycle: currentDayCycle ? currentDayCycle.dateString : 'null',
-    baseDuration: baseDuration,
-    timeEntryId: timeEntryId
-  });
 
   // ALWAYS get the current day cycle first
   const newDayCycle = getCurrentDayCycle();
-  console.log('New day cycle calculated:', {
-    dateString: newDayCycle.dateString,
-    start: newDayCycle.start.toISOString(),
-    end: newDayCycle.end.toISOString()
-  });
   
   // Check if we need to reset (new day cycle) - this works even if currentDayCycle is null
   const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
-  console.log('Day cycle check:', {
-    currentDayCycle: currentDayCycle ? currentDayCycle.dateString : 'null',
-    newDayCycle: newDayCycle.dateString,
-    dayCycleChanged: dayCycleChanged
-  });
   
   if (dayCycleChanged) {
-    // New day cycle - reset everything to 00:00:00
-    console.log('🔄 New day cycle detected in loadLastTimeEntry, resetting to 00:00:00:', {
+    // New day cycle - reset everything
+    console.log('🔄 New day cycle detected, resetting:', {
       old: currentDayCycle ? currentDayCycle.dateString : 'null',
       new: newDayCycle.dateString
     });
+    
+    // Clear ALL old local storage data for this user (cleanup old entries)
+    if (currentUser) {
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      
+      // Also clear the specific old day cycle if it exists
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      }
+    }
     
     // Reset all state
     currentDayCycle = newDayCycle;
@@ -1906,16 +1814,14 @@ async function loadLastTimeEntry() {
     baseDurationAtSessionStart = 0;
     timeEntryId = null;
     
-    // Update UI immediately to show 00:00:00
+    // Update UI immediately
     updateDayCycleDisplay();
     updateTimerDisplay(0);
     
-    // For new day cycle, don't load from database - start fresh at 00:00:00
-    // This ensures automatic reset to 00:00:00 when date changes
-    return; // Exit early - don't load any existing entries for new day
+    // Continue to load data for the NEW day cycle (should be empty)
+    // Don't return here - we want to check for new day's data
   } else {
     // Same day cycle - just update reference
-    console.log('✓ Same day cycle - will load duration from Supabase');
     currentDayCycle = newDayCycle;
   }
 
@@ -1931,257 +1837,120 @@ async function loadLastTimeEntry() {
     return;
   }
 
-  // Fetch directly from Supabase (no local storage)
+  // Load from local storage first (offline data)
+  // BUT validate it's for the correct day cycle BEFORE using it
+  const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
+  let localDuration = 0;
+  let localTimeEntryId = null;
+  
+  // CRITICAL: Validate local storage data is for the CURRENT day cycle
+  if (localData) {
+    // Check if the stored dateString matches current day cycle
+    if (localData.dateString && localData.dateString === currentDayCycle.dateString) {
+      // Additional validation: Check if data is too old (more than 24 hours)
+      // This prevents using stale data after forced shutdowns
+      const now = new Date();
+      const dataAge = localData.lastUpdated ? (now.getTime() - localData.lastUpdated) : Infinity;
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+      
+      if (dataAge > maxAge) {
+        console.warn('⚠️ Local storage data is too old (>24 hours), clearing it:', {
+          ageHours: Math.floor(dataAge / (60 * 60 * 1000)),
+          dateString: localData.dateString
+        });
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+        localDuration = 0;
+        localTimeEntryId = null;
+      } else {
+        // Data is valid for current day cycle and not too old
+        localDuration = localData.duration || 0;
+        localTimeEntryId = localData.timeEntryId || null;
+      }
+    } else {
+      // Data is for a different day - clear it and don't use it
+      console.warn('⚠️ Local storage data is for a different day cycle, clearing it:', {
+        stored: localData.dateString,
+        current: currentDayCycle.dateString
+      });
+      clearLocalStorage(currentUser.id, localData.dateString || currentDayCycle.dateString);
+      localDuration = 0;
+      localTimeEntryId = null;
+    }
+  }
+
+  // Try to fetch from Supabase (if online)
   let remoteDuration = 0;
   let remoteTimeEntryId = null;
   
-  console.log('🔵 Checking if online:', isOnline);
   if (isOnline) {
-    console.log('✓ Online - will query Supabase for time entries');
     try {
-      // CRITICAL: First, get the MOST RECENT entry regardless of date
-      // Then compare its date with the current date to determine if it's a new day
-      // This is the correct way to check if it's a new day
-      console.log('🔵 Querying for MOST RECENT time entry (regardless of date)...');
-      
-      // Get the most recent entry for this user (last 7 days to be safe)
-      const sevenDaysAgo = new Date();
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-      
-      const { data: mostRecentEntries, error: recentError } = await supabase
-        .from('time_entries')
-        .select('id, user_id, start_time, end_time, duration, created_at, updated_at')
-        .eq('user_id', profile.id)
-        .gte('updated_at', sevenDaysAgo.toISOString())
-        .order('updated_at', { ascending: false })
-        .limit(10);
-      
-      console.log('Most recent entries query result:', {
-        found: mostRecentEntries ? mostRecentEntries.length : 0,
-        error: recentError
-      });
-      
-      // Also query for entries within current day cycle (for today's entries)
+      // Query for entries that fall within the current day cycle
+      // Check both start_time and updated_at to catch all entries for this cycle
       const cycleStartISO = currentDayCycle.start.toISOString();
       const cycleEndISO = currentDayCycle.end.toISOString();
       
-      console.log('🔵 Also querying for time entries within current day cycle:', {
-        cycleStart: cycleStartISO,
-        cycleEnd: cycleEndISO,
-        dateString: currentDayCycle.dateString,
-        userId: profile.id,
-        cycleStartIST: currentDayCycle.start.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-        cycleEndIST: currentDayCycle.end.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-      });
-      
-      // CRITICAL: Only query by start_time - this is the only reliable way to determine which day an entry belongs to
-      // Don't query by updated_at or created_at as those can include entries from previous days that were just updated today
-      const { data: entriesByStart, error: error1 } = await supabase
+      // First, try to find entries where start_time is within the cycle
+      const { data: timeEntriesByStart, error: error1 } = await supabase
         .from('time_entries')
         .select('id, user_id, start_time, end_time, duration, created_at, updated_at')
         .eq('user_id', profile.id)
         .gte('start_time', cycleStartISO)
         .lte('start_time', cycleEndISO)
         .order('updated_at', { ascending: false })
-        .limit(100); // Increased limit to ensure we get all entries for the day
-      
-      console.log('Query results:', {
-        mostRecent: mostRecentEntries && mostRecentEntries.length > 0 ? 1 : 0,
-        byStart: entriesByStart ? entriesByStart.length : 0,
-        error1: error1
-      });
-      
-      // CRITICAL: First check the most recent entry's date to determine if it's a new day
-      let isNewDay = false;
-      if (mostRecentEntries && mostRecentEntries.length > 0 && !recentError) {
-        const mostRecentEntry = mostRecentEntries[0];
-        const entryStartDate = new Date(mostRecentEntry.start_time);
-        const entryDateIST = entryStartDate.toLocaleString('en-IN', { 
-          timeZone: 'Asia/Kolkata',
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit'
-        });
-        const entryDateParts = entryDateIST.split('/');
-        const entryYear = parseInt(entryDateParts[2]);
-        const entryMonth = parseInt(entryDateParts[1]) - 1;
-        const entryDay = parseInt(entryDateParts[0]);
-        
-        // Get current date in IST
-        const currentDateIST = new Date().toLocaleString('en-IN', { 
-          timeZone: 'Asia/Kolkata',
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit'
-        });
-        const currentDateParts = currentDateIST.split('/');
-        const currentYear = parseInt(currentDateParts[2]);
-        const currentMonth = parseInt(currentDateParts[1]) - 1;
-        const currentDay = parseInt(currentDateParts[0]);
-        
-        // Check if entry date matches current date
-        const isEntryForToday = 
-          entryYear === currentYear &&
-          entryMonth === currentMonth &&
-          entryDay === currentDay;
-        
-        console.log('🔍 Date comparison with most recent entry:', {
-          entryDateIST: entryDateIST,
-          currentDateIST: currentDateIST,
-          entryYear: entryYear,
-          entryMonth: entryMonth + 1,
-          entryDay: entryDay,
-          currentYear: currentYear,
-          currentMonth: currentMonth + 1,
-          currentDay: currentDay,
-          isEntryForToday: isEntryForToday
-        });
-        
-        if (!isEntryForToday) {
-          // Most recent entry is for a different date - it's a new day
-          isNewDay = true;
-          console.log('🔄 NEW DAY detected - most recent entry is for a different date');
-          console.log('Entry date:', entryDateIST, 'Current date:', currentDateIST);
-        } else {
-          console.log('✓ Most recent entry is for TODAY - will load its duration');
-        }
-      } else {
-        // No entries found at all - treat as new day (or first time use)
-        console.log('ℹ️ No recent entries found - starting fresh');
-        isNewDay = true;
-      }
-      
-      // Combine entries (only from start_time query - most reliable)
-      const allTimeEntries = [];
-      if (!error1 && entriesByStart) {
-        allTimeEntries.push(...entriesByStart);
-        console.log(`Found ${entriesByStart.length} entries by start_time query`);
-      }
-      
-      // Deduplicate by ID
-      const entryIds = new Set();
-      const uniqueEntries = [];
-      
-      // Get current date in IST for strict filtering
-      const currentDateIST = new Date().toLocaleString('en-IN', { 
-        timeZone: 'Asia/Kolkata',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-      });
-      const currentDateParts = currentDateIST.split('/');
-      const currentYear = parseInt(currentDateParts[2]);
-      const currentMonth = parseInt(currentDateParts[1]) - 1; // Month is 0-indexed
-      const currentDay = parseInt(currentDateParts[0]);
-      
-      console.log('🔍 Filtering entries for current date:', {
-        currentDateIST: currentDateIST,
-        currentYear: currentYear,
-        currentMonth: currentMonth + 1,
-        currentDay: currentDay
-      });
-      
-      allTimeEntries.forEach(entry => {
-        if (!entryIds.has(entry.id)) {
-          // CRITICAL: Only include entries where start_time date matches current date
-          // This ensures we don't sum durations from entries that started on different dates
-          const entryStartDate = new Date(entry.start_time);
-          const entryDateIST = entryStartDate.toLocaleString('en-IN', { 
-            timeZone: 'Asia/Kolkata',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit'
-          });
-          const entryDateParts = entryDateIST.split('/');
-          const entryYear = parseInt(entryDateParts[2]);
-          const entryMonth = parseInt(entryDateParts[1]) - 1;
-          const entryDay = parseInt(entryDateParts[0]);
-          
-          const isEntryForToday = 
-            entryYear === currentYear &&
-            entryMonth === currentMonth &&
-            entryDay === currentDay;
-          
-          if (isEntryForToday) {
-            entryIds.add(entry.id);
-            uniqueEntries.push(entry);
-            
-            // Log each entry found
-            const entryStart = new Date(entry.start_time);
-            const entryUpdated = new Date(entry.updated_at);
-            console.log('✅ Entry included (start_time matches today):', {
-              id: entry.id,
-              start_time: entry.start_time,
-              updated_at: entry.updated_at,
-              duration: entry.duration,
-              startIST: entryStart.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-              updatedIST: entryUpdated.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-              entryDateIST: entryDateIST,
-              currentDateIST: currentDateIST
-            });
-          } else {
-            // Log entries that were excluded
-            const entryStart = new Date(entry.start_time);
-            console.log('❌ Entry EXCLUDED (start_time is NOT for today):', {
-              id: entry.id,
-              start_time: entry.start_time,
-              duration: entry.duration,
-              entryDateIST: entryDateIST,
-              currentDateIST: currentDateIST,
-              reason: 'start_time date does not match current date'
-            });
-          }
-        }
-      });
-      
-      console.log(`Found ${uniqueEntries.length} unique entries for current date (${currentDateIST})`);
+        .limit(10);
 
-      // If it's a new day (based on most recent entry check), don't use any entries
-      if (isNewDay) {
-        console.log('🔄 NEW DAY - Resetting to 00:00:00 (not using any entries)');
-        remoteDuration = 0;
-        remoteTimeEntryId = null;
-      } else if (uniqueEntries.length > 0) {
-        // Same day - SUM ALL durations from all entries for today
-        // This ensures we get the total duration for the entire day, not just one entry
-        let totalDuration = 0;
-        let mostRecentEntry = null;
-        let mostRecentTime = 0;
-        
-        uniqueEntries.forEach(entry => {
-          const entryDuration = entry.duration || 0;
-          totalDuration += entryDuration;
-          
-          // Also track the most recent entry for project/task restoration
-          const entryTime = new Date(entry.updated_at || entry.created_at).getTime();
-          if (entryTime > mostRecentTime) {
-            mostRecentTime = entryTime;
-            mostRecentEntry = entry;
+      // Also check entries that were updated during this cycle
+      // This catches entries that might have been started earlier but are being tracked in this cycle
+      const { data: timeEntriesByUpdate, error: error2 } = await supabase
+        .from('time_entries')
+        .select('id, user_id, start_time, end_time, duration, created_at, updated_at')
+        .eq('user_id', profile.id)
+        .gte('updated_at', cycleStartISO)
+        .lte('updated_at', cycleEndISO)
+        .order('updated_at', { ascending: false })
+        .limit(10);
+
+      // Combine and deduplicate entries
+      const allEntries = [];
+      const entryIds = new Set();
+      
+      if (!error1 && timeEntriesByStart) {
+        timeEntriesByStart.forEach(entry => {
+          if (!entryIds.has(entry.id)) {
+            entryIds.add(entry.id);
+            allEntries.push(entry);
           }
-          
-          console.log('Entry added to total:', {
-            id: entry.id,
-            duration: entryDuration,
-            totalSoFar: totalDuration
-          });
+        });
+      }
+      
+      if (!error2 && timeEntriesByUpdate) {
+        timeEntriesByUpdate.forEach(entry => {
+          if (!entryIds.has(entry.id)) {
+            entryIds.add(entry.id);
+            allEntries.push(entry);
+          }
+        });
+      }
+
+      if (allEntries.length > 0) {
+        // Sort by updated_at descending to get the most recent
+        allEntries.sort((a, b) => {
+          const aTime = new Date(a.updated_at || a.created_at).getTime();
+          const bTime = new Date(b.updated_at || b.created_at).getTime();
+          return bTime - aTime;
         });
         
-        remoteDuration = totalDuration;
-        remoteTimeEntryId = mostRecentEntry ? mostRecentEntry.id : null;
+        // Use the most recent entry for this cycle
+        const matchingEntry = allEntries[0];
+        remoteDuration = matchingEntry.duration || 0;
+        remoteTimeEntryId = matchingEntry.id;
         
-        console.log('✅ Calculated TOTAL duration for TODAY:', {
-          totalDuration: remoteDuration,
-          totalDurationFormatted: formatDurationFromSeconds(remoteDuration),
-          entryCount: uniqueEntries.length,
-          mostRecentEntryId: remoteTimeEntryId
-        });
-        
-        // Restore project from project_time_entries if it exists (only if entry is for today)
-        if (isOnline && mostRecentEntry && mostRecentEntry.id) {
+        // Restore project from project_time_entries if it exists
+        if (isOnline && matchingEntry.id) {
           const { data: projectLink } = await supabase
             .from('project_time_entries')
             .select('project_id')
-            .eq('time_entry_id', mostRecentEntry.id)
+            .eq('time_entry_id', matchingEntry.id)
             .single();
 
           if (projectLink && projectLink.project_id) {
@@ -2208,78 +1977,60 @@ async function loadLastTimeEntry() {
           }
         }
         
-        console.log('✅ Loaded time entries for current cycle:', {
-          entryCount: uniqueEntries.length,
-          totalDuration: remoteDuration,
+        console.log('✅ Loaded time entry for current cycle:', {
+          id: matchingEntry.id,
+          duration: remoteDuration,
           durationFormatted: formatDurationFromSeconds(remoteDuration),
-          mostRecentEntryId: mostRecentEntry ? mostRecentEntry.id : null,
-          mostRecentStartTime: mostRecentEntry ? mostRecentEntry.start_time : null,
-          mostRecentUpdatedAt: mostRecentEntry ? mostRecentEntry.updated_at : null,
+          start_time: matchingEntry.start_time,
+          updated_at: matchingEntry.updated_at,
           cycle_start: cycleStartISO,
           cycle_end: cycleEndISO,
           cycle_date: currentDayCycle.dateString
         });
       } else {
         console.log('ℹ️ No time entry found for current day cycle:', currentDayCycle.dateString);
-        console.log('Query details:', {
-          cycleStart: cycleStartISO,
-          cycleEnd: cycleEndISO,
-          dateString: currentDayCycle.dateString,
-          userId: profile.id
-        });
         if (error1) console.error('Error querying by start_time:', error1);
         if (error2) console.error('Error querying by updated_at:', error2);
-        
-        // No entry found - duration should be 0 for new day
-        remoteDuration = 0;
-        remoteTimeEntryId = null;
       }
     } catch (error) {
       console.error('❌ Error fetching time entries:', error);
       isOnline = false; // Mark as offline if fetch fails
-      remoteDuration = 0;
-      remoteTimeEntryId = null;
     }
-  } else {
-    console.warn('⚠️ Cannot load time entries: offline. Please ensure internet connection.');
-    remoteDuration = 0;
-    remoteTimeEntryId = null;
   }
 
-  // Use the duration from Supabase (no local storage)
-  // This will be 0 if no entry found, or the actual duration if entry exists
-  console.log('Setting baseDuration from remoteDuration:', {
-    remoteDuration,
-    timeEntryId: remoteTimeEntryId,
-    dateString: currentDayCycle.dateString
-  });
-  baseDuration = remoteDuration;
+  // Validation already done above - this check is redundant but kept for safety
+  if (localData && localData.dateString && localData.dateString !== currentDayCycle.dateString) {
+    console.warn('⚠️ Additional validation: Local storage data mismatch detected, clearing:', {
+      stored: localData.dateString,
+      current: currentDayCycle.dateString
+    });
+    clearLocalStorage(currentUser.id, localData.dateString);
+    localDuration = 0;
+    localTimeEntryId = null;
+  }
+
+  // Use the MAXIMUM duration (never reduce time)
+  baseDuration = ensureMaxDuration(localDuration, remoteDuration);
   
   // Validate duration - it should not exceed the time since cycle start
-  // But allow a generous buffer (e.g., if user was tracking and paused, duration can be close to max)
+  // But allow some buffer (e.g., if user was tracking and paused, duration can be close to max)
   const now = new Date();
   const maxPossibleDuration = Math.floor((now - currentDayCycle.start) / 1000); // in seconds
-  const bufferSeconds = 600; // 10 minute buffer to account for pauses, timezone issues, etc.
-  
-  console.log('Validating duration:', {
-    baseDuration,
-    maxPossibleDuration,
-    buffer: bufferSeconds,
-    cycleStart: currentDayCycle.start.toISOString(),
-    currentTime: now.toISOString(),
-    cycleStartIST: currentDayCycle.start.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-    currentTimeIST: now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-  });
+  const bufferSeconds = 300; // 5 minute buffer to account for pauses, etc.
   
   if (baseDuration > (maxPossibleDuration + bufferSeconds)) {
-    console.warn('⚠️ Duration exceeds maximum possible for current cycle (with buffer), but NOT resetting - using as-is:', {
+    console.warn('Duration exceeds maximum possible for current cycle (with buffer), resetting:', {
       baseDuration,
       maxPossibleDuration,
       buffer: bufferSeconds,
       cycleStart: currentDayCycle.start.toISOString()
     });
-    // Don't reset to 0 - this might be a valid duration if there were timezone issues
-    // Just log a warning but keep the duration
+    // Reset to 0 if duration is clearly wrong
+    baseDuration = 0;
+    baseDurationAtSessionStart = 0;
+    timeEntryId = null;
+    // Clear local storage for this cycle
+    clearLocalStorage(currentUser.id, currentDayCycle.dateString);
   } else if (baseDuration > maxPossibleDuration) {
     // If slightly over (within buffer), cap it to max possible
     console.log('Capping duration to maximum possible:', {
@@ -2289,35 +2040,48 @@ async function loadLastTimeEntry() {
     baseDuration = maxPossibleDuration;
   }
   
-  // Use remote timeEntryId (no local storage)
-  timeEntryId = remoteTimeEntryId;
+  // Use remote timeEntryId if available, otherwise use local
+  timeEntryId = remoteTimeEntryId || localTimeEntryId;
+
+  // If local duration is higher, we need to sync it
+  if (localDuration > remoteDuration && isOnline && timeEntryId && baseDuration <= maxPossibleDuration) {
+    // Sync the higher duration to Supabase
+    await syncDurationToSupabase(timeEntryId, baseDuration);
+  }
+
+  // Save to local storage for offline access (include dateString for validation)
+  saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+    duration: baseDuration,
+    timeEntryId: timeEntryId,
+    dateString: currentDayCycle.dateString // Store dateString for validation
+  });
   
-  console.log('📊 Final duration after validation:', {
+  console.log('Duration loaded:', {
+    localDuration,
     remoteDuration,
     baseDuration,
-    baseDurationFormatted: formatDurationFromSeconds(baseDuration),
     maxPossibleDuration,
     dateString: currentDayCycle.dateString,
     cycleStart: currentDayCycle.start.toISOString(),
-    currentTime: now.toISOString(),
-    timeEntryId: timeEntryId
+    currentTime: now.toISOString()
   });
   
-  // ALWAYS update display with loaded duration (even if 0)
-  // This ensures the tracker shows the correct duration for the current date
+  // Update display with saved duration
   updateDayCycleDisplay();
   updateTimerDisplay(baseDuration);
   
-  // Log the loaded duration for debugging
-  if (baseDuration > 0) {
-    console.log(`✅ Successfully loaded and displayed duration ${formatDurationFromSeconds(baseDuration)} for ${currentDayCycle.dateString}`);
-    console.log(`✓ Timer display updated to show: ${formatDurationFromSeconds(baseDuration)}`);
-  } else {
-    console.log(`ℹ️ No duration found for ${currentDayCycle.dateString} - starting fresh at 00:00:00`);
-    console.log(`✓ Timer display updated to show: 00:00:00`);
+  // Restore project and task from local storage if available
+  if (localData && localData.projectId) {
+    selectedProjectId = localData.projectId;
+    projectSelect.value = localData.projectId;
+    await loadTasks(localData.projectId);
+    
+    if (localData.taskId) {
+      selectedTaskId = localData.taskId;
+      taskSelect.value = localData.taskId;
+    }
+    updateTaskDisplay();
   }
-  
-  // Project and task are restored from Supabase in the query above (via project_time_entries)
   
   // Update start button state
   updateStartButtonState();
@@ -2521,23 +2285,6 @@ async function startTracking() {
   const newDayCycle = getCurrentDayCycle();
   const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
   
-  // CRITICAL: Ensure we can ONLY start tracking for current date
-  if (dayCycleChanged) {
-    console.warn('⚠️ Cannot start tracking: Date has changed. Resetting to current date.');
-    currentDayCycle = newDayCycle;
-    baseDuration = 0;
-    baseDurationAtSessionStart = 0;
-    timeEntryId = null;
-    updateTimerDisplay(0);
-    updateDayCycleDisplay();
-  }
-  
-  // Double-check: Validate current date before proceeding
-  if (!await validateCurrentDate()) {
-    console.error('❌ Cannot start tracking: Date validation failed');
-    return;
-  }
-  
   if (dayCycleChanged) {
     // New day cycle detected - reset everything and reload
     console.log('🔄 Day cycle changed before starting tracking, resetting:', {
@@ -2545,7 +2292,13 @@ async function startTracking() {
       new: newDayCycle.dateString
     });
     
-    // No local storage to clear
+    // Clear old local storage
+    if (currentUser) {
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      }
+    }
     
     // Reset state
     currentDayCycle = newDayCycle;
@@ -2583,47 +2336,12 @@ async function startTracking() {
     return;
   }
 
-  // CRITICAL: Final date validation before creating/updating time entry
-  // This ensures we NEVER create/update time entries for any date other than current date
-  const finalDateCheck = getCurrentDayCycle();
-  if (!currentDayCycle || currentDayCycle.dateString !== finalDateCheck.dateString) {
-    console.error('❌ CRITICAL: Date changed during startTracking setup. Aborting.');
-    isTracking = false;
-    return;
-  }
-
   // If we have an existing time entry for this day cycle, update it
   // Otherwise, create a new one
   if (timeEntryId) {
     // Update existing entry - resume tracking
     if (isOnline) {
       try {
-        // CRITICAL: Verify time entry belongs to current date before updating
-        const { data: existingEntry, error: fetchError } = await supabase
-          .from('time_entries')
-          .select('start_time, user_id')
-          .eq('id', timeEntryId)
-          .single();
-        
-        if (fetchError || !existingEntry) {
-          console.error('❌ Cannot update time entry: Entry not found or error:', fetchError);
-          isTracking = false;
-          return;
-        }
-        
-        // Verify entry belongs to current day cycle
-        const entryStartTime = new Date(existingEntry.start_time);
-        const entryDayCycle = getCurrentDayCycle();
-        // Check if entry start_time falls within current day cycle
-        if (entryStartTime < entryDayCycle.start || entryStartTime > entryDayCycle.end) {
-          console.error('❌ CRITICAL: Time entry does not belong to current date! Aborting.');
-          console.error('Entry start_time:', entryStartTime.toISOString());
-          console.error('Current day cycle:', entryDayCycle.start.toISOString(), 'to', entryDayCycle.end.toISOString());
-          isTracking = false;
-          timeEntryId = null;
-          return;
-        }
-        
         const { error } = await supabase
           .from('time_entries')
           .update({
@@ -2645,66 +2363,23 @@ async function startTracking() {
         isOnline = false;
       }
     }
-    // No local storage - entry already updated in Supabase above
+    // Save to local storage regardless of online status
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+      duration: baseDuration,
+      timeEntryId: timeEntryId,
+      projectId: selectedProjectId,
+      taskId: selectedTaskId
+    });
   } else {
     // Create new time entry for this day cycle
     // Use the actual session start time as the entry start_time
     if (isOnline) {
       try {
-        // CRITICAL: Final date validation before creating time entry
-        // This ensures we NEVER create time entries for any date other than current date
-        const finalDateCheck = getCurrentDayCycle();
-        if (!currentDayCycle || currentDayCycle.dateString !== finalDateCheck.dateString) {
-          console.error('❌ CRITICAL: Date changed during time entry creation. Aborting.');
-          isTracking = false;
-          return;
-        }
-        
-        // CRITICAL: Ensure start_time is always the CURRENT time and within the current day cycle
-        // Use the actual current time (sessionStartTime) - don't adjust it
-        // But verify it's within the cycle boundaries
-        const now = new Date();
-        let entryStartTime = now; // Always use current time
-        
-        // Verify the current time is within the cycle
-        if (now < finalDateCheck.start) {
-          console.error('❌ CRITICAL: Current time is before cycle start! This should not happen.');
-          console.error('Current time:', now.toISOString());
-          console.error('Cycle start:', finalDateCheck.start.toISOString());
-          console.error('Current time IST:', now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-          console.error('Cycle start IST:', finalDateCheck.start.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-          isTracking = false;
-          return;
-        }
-        if (now > finalDateCheck.end) {
-          console.error('❌ CRITICAL: Current time is after cycle end! This should not happen.');
-          console.error('Current time:', now.toISOString());
-          console.error('Cycle end:', finalDateCheck.end.toISOString());
-          console.error('Current time IST:', now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-          console.error('Cycle end IST:', finalDateCheck.end.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-          isTracking = false;
-          return;
-        }
-        
-        // Log the entry creation with date info
-        const entryStartIST = entryStartTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        const entryStartDateIST = entryStartIST.split(',')[0]; // Get date part
-        console.log('Creating time entry for current day:', {
-          dateString: finalDateCheck.dateString,
-          entryStartTime: entryStartTime.toISOString(),
-          entryStartIST: entryStartIST,
-          entryStartDateIST: entryStartDateIST,
-          cycleStart: finalDateCheck.start.toISOString(),
-          cycleEnd: finalDateCheck.end.toISOString(),
-          cycleStartIST: finalDateCheck.start.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-          cycleEndIST: finalDateCheck.end.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-        });
-        
         const { data: timeEntry, error } = await supabase
           .from('time_entries')
           .insert({
             user_id: profile.id,
-            start_time: entryStartTime.toISOString(), // Use current time, not adjusted time
+            start_time: sessionStartTime.toISOString(),
             duration: baseDuration, // Start with cumulative duration (should be 0 for new day)
             app_version: appVersion // Track which version of the tracker created this entry
           })
@@ -2723,9 +2398,15 @@ async function startTracking() {
         console.error('Error creating time entry:', error);
         isOnline = false;
       }
-    } else {
-      console.error('Cannot create time entry: offline. Please ensure internet connection.');
     }
+    
+    // Save to local storage regardless
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+      duration: baseDuration,
+      timeEntryId: timeEntryId,
+      projectId: selectedProjectId,
+      taskId: selectedTaskId
+    });
   }
 
   await ipcRenderer.invoke('set-is-tracking', true);
@@ -2804,14 +2485,6 @@ async function stopTracking() {
     return;
   }
 
-  // CRITICAL: Validate current date before stopping
-  // This ensures we NEVER save time entries for any date other than current date
-  if (!await validateCurrentDate()) {
-    // Date changed - tracking was already stopped by validateCurrentDate
-    isStoppingTracking = false;
-    return;
-  }
-
   // Set flag to prevent race conditions
   isStoppingTracking = true;
 
@@ -2859,21 +2532,10 @@ async function stopTracking() {
     // Calculate session duration accurately
     const now = Date.now();
     
-    // If tracking was paused (modal was open), handle the pause time
-    // For inactivity modal: time was already deducted, so don't add it back
-    // For other pauses: add to pausedDuration normally
+    // If tracking was paused (modal was open), add that time to pausedDuration
     if (pauseStartTime) {
-      // Check if this is an inactivity pause (inactivityStartTime is set)
-      if (inactivityStartTime) {
-        // This is an inactivity pause - time was already deducted
-        // Don't add modal wait time to pausedDuration
-        console.log('Stop tracking while inactivity modal is open - not adding modal wait time');
-      } else {
-        // This is a regular pause - add to pausedDuration
-        pausedDuration += now - pauseStartTime;
-      }
+      pausedDuration += now - pauseStartTime;
       pauseStartTime = null;
-      inactivityStartTime = null;
     }
     
     // Calculate total session time and subtract paused time
@@ -2899,13 +2561,16 @@ async function stopTracking() {
   
   console.log(`Stop tracking - Cumulative duration: ${cumulativeDuration} seconds (base: ${baseDurationAtSessionStart}, session: ${sessionDuration})`);
 
-  // Calculate final duration (no local storage check)
-  let finalDuration = ensureMaxDuration(baseDuration, cumulativeDuration);
+  // Ensure duration never decreases - get current max from local/remote
+  const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
+  const currentMax = localData ? Math.max(localData.duration || 0, baseDuration) : baseDuration;
+  let finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
   
   // Safety check: If tracking was active but duration is 0, something went wrong
-  if (finalDuration === 0 && baseDuration > 0) {
-    console.warn('Warning: Calculated duration is 0 but baseDuration is', baseDuration, '- using baseDuration as fallback');
-    finalDuration = baseDuration;
+  // Use the currentMax as a fallback to prevent losing existing duration
+  if (finalDuration === 0 && currentMax > 0) {
+    console.warn('Warning: Calculated duration is 0 but currentMax is', currentMax, '- using currentMax as fallback');
+    finalDuration = currentMax;
   }
   
   // Additional safety: If we have a sessionStartTime but duration is 0, calculate minimum 1 second
@@ -2917,7 +2582,13 @@ async function stopTracking() {
     }
   }
 
-  // Send duration directly to Supabase when stopping
+  // Save to local storage first (works offline)
+  saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+    duration: finalDuration,
+    timeEntryId: timeEntryId
+  });
+
+  // Sync duration to Supabase when stopping
   console.log('Stopping tracking - syncing final duration to Supabase...');
   if (timeEntryId) {
     if (isOnline) {
@@ -3004,8 +2675,12 @@ async function stopTracking() {
           if (error) {
             console.error(`Error updating time entry on stop (attempt ${retryCount}):`, error);
             if (retryCount >= maxRetries) {
-              // Log error but don't queue (direct to Supabase only)
-              console.error('Failed to save duration after retries. Duration may be lost if offline.');
+              // Queue for retry when online
+              pendingUpdates.push({
+                timeEntryId: timeEntryId,
+                duration: finalDuration,
+                endTime: null // Always NULL
+              });
               isOnline = false;
               break;
             }
@@ -3067,18 +2742,35 @@ async function stopTracking() {
         }
         
         if (updateSuccess) {
+          
           // Update base duration for next session
           baseDuration = maxDuration;
+          // Mark as synced in local storage
+          saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+            duration: maxDuration,
+            timeEntryId: timeEntryId,
+            projectId: selectedProjectId,
+            taskId: selectedTaskId,
+            synced: true
+          });
           console.log(`✓ Final duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
         }
       } catch (error) {
         console.error('Error syncing duration on stop:', error);
-        console.error('Duration may be lost if offline. Please ensure you have internet connection.');
+        pendingUpdates.push({
+          timeEntryId: timeEntryId,
+          duration: finalDuration,
+          endTime: null // Always NULL
+        });
         isOnline = false;
       }
     } else {
-      // Offline - log warning but don't queue (direct to Supabase only)
-      console.warn('Cannot save duration: offline. Duration will be lost. Please ensure internet connection.');
+      // Offline - queue for later sync
+      pendingUpdates.push({
+        timeEntryId: timeEntryId,
+        duration: finalDuration,
+        endTime: null // Always NULL
+      });
       baseDuration = finalDuration;
     }
   } else {
@@ -3181,17 +2873,14 @@ function startIdleDetection() {
     // Re-check time since last activity after potential update
     const updatedTimeSinceLastActivity = Date.now() - lastActivityTime;
     
-    // Check if user has been inactive for threshold (exactly at 5 minutes = 300 seconds)
-    // Trigger when we're at or just past the threshold to catch it immediately
-    // Use >= to catch it as soon as we hit 300 seconds
+    // Check if user has been inactive for threshold
     if (updatedTimeSinceLastActivity >= IDLE_THRESHOLD) {
       // Only start double-check if we don't already have one pending
       if (!idleDoubleCheckTimer) {
         console.log(`Idle threshold reached (${Math.floor(updatedTimeSinceLastActivity / 1000)}s), starting double-check...`);
         
       // Double-check: verify we're still inactive (prevent false positives)
-        // Minimal delay (500ms) for faster detection at exactly 5 minutes
-        const doubleCheckDelay = 500; // Wait 500ms and check again
+        const doubleCheckDelay = 3000; // Wait 3 seconds and check again (longer delay)
         idleDoubleCheckTimer = setTimeout(async () => {
           // Clear the timer reference
           idleDoubleCheckTimer = null;
@@ -3209,7 +2898,6 @@ function startIdleDetection() {
           if (finalIdleSeconds !== null && finalIdleSeconds < 2 * 60) {
             // User is actually active - don't show overlay
             lastActivityTime = Date.now();
-            inactivityStartTime = null; // Clear inactivity tracking
             console.log(`Final check: System shows user is active (idle=${finalIdleSeconds.toFixed(1)}s) - NOT showing overlay`);
             return;
           }
@@ -3226,27 +2914,10 @@ function startIdleDetection() {
             (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
           
           if (shouldShowOverlay) {
-          // Store when user actually became inactive (for calculating inactive time)
-          // This is when the last activity occurred
-          inactivityStartTime = lastActivityTime;
-          
-          // Calculate inactive time: from when user became inactive to now
-          // Since modal shows after 5 minutes of inactivity, we deduct the FULL inactive time
-          // The modal only appears after 5 minutes, so we know the user was inactive for at least 5 minutes
-          // We deduct the full inactive time (which will be at least 5 minutes)
-          const now = Date.now();
-          const totalInactiveTime = now - inactivityStartTime;
-          const inactiveTimeSeconds = Math.floor(totalInactiveTime / 1000); // Deduct full inactive time
-          const inactiveTimeFormatted = formatDurationFromSeconds(inactiveTimeSeconds);
+          // Pause tracking
+          pauseStartTime = Date.now();
           
           console.log('Inactivity confirmed - pausing tracking and showing overlay');
-          console.log('User became inactive at:', new Date(inactivityStartTime).toLocaleTimeString());
-          console.log(`Total inactive time: ${inactiveTimeSeconds}s, Time to deduct (full inactive time, minimum ${IDLE_THRESHOLD / 1000}s): ${inactiveTimeFormatted} (${inactiveTimeSeconds}s)`);
-          
-          // Verify that we're deducting at least 5 minutes (since modal only shows after 5 minutes)
-          if (inactiveTimeSeconds < IDLE_THRESHOLD / 1000) {
-            console.error(`❌ ERROR: Inactive time (${inactiveTimeSeconds}s) is less than threshold (${IDLE_THRESHOLD / 1000}s). This should not happen!`);
-          }
       
           // Stop timer and captures
           if (timerInterval) {
@@ -3261,93 +2932,22 @@ function startIdleDetection() {
             // Sync duration before pausing
             await syncCurrentDuration();
 
-          // Deduct inactive time from time entry (full inactive time, minimum 5 minutes)
-          // Since modal only shows after 5 minutes of inactivity, we deduct the full inactive time
-          // This ensures at least 5 minutes (300s) is deducted, plus any additional time
-          if (timeEntryId && inactiveTimeSeconds > 0) {
-            try {
-              // Fetch current duration
-              const { data: currentEntry, error: fetchError } = await supabase
-                .from('time_entries')
-                .select('duration')
-                .eq('id', timeEntryId)
-                .single();
-              
-              if (!fetchError && currentEntry) {
-                const currentDuration = currentEntry.duration || 0;
-                const newDuration = Math.max(0, currentDuration - inactiveTimeSeconds); // Don't go below 0
-                
-                // Update duration in database
-                const { error: updateError } = await supabase
-                  .from('time_entries')
-                  .update({
-                    duration: newDuration,
-                    updated_at: new Date().toISOString(),
-                    app_version: appVersion
-                  })
-                  .eq('id', timeEntryId);
-                
-                if (!updateError) {
-                  // Update local state
-                  baseDuration = newDuration;
-                  baseDurationAtSessionStart = newDuration; // Update session start duration
-                  
-                  // Update timer display to reflect reduced duration
-                  updateTimerDisplay(newDuration);
-                  
-                  console.log(`✅ Deducted ${inactiveTimeFormatted} (${inactiveTimeSeconds}s) from time entry. New duration: ${formatDurationFromSeconds(newDuration)}`);
-                } else {
-                  console.error('Error updating duration after inactivity:', updateError);
-                }
-              }
-            } catch (error) {
-              console.error('Error deducting inactive time:', error);
-            }
-          }
-          
-          // Pause tracking
-          pauseStartTime = now;
-
-          // Show overlay modal with reduced time message FIRST
-          const overlayMessage = inactiveTimeSeconds > 0 
-            ? `You've been inactive. Tracking has been paused.\n\n${inactiveTimeFormatted} has been reduced from your time entries due to inactivity.`
-            : `You've been inactive. Tracking has been paused.`;
-          
-          ipcRenderer.invoke('show-overlay', {
-            title: 'Inactivity Detected',
-            message: overlayMessage,
-            icon: '⏸️',
-            isStopped: false
-          }).catch(err => {
+          // Show overlay modal
+          ipcRenderer.invoke('show-overlay').catch(err => {
             console.error('Error showing overlay:', err);
           });
-          
-          // Wait for modal to be visible before capturing screenshot/camera
-          // This ensures the modal appears in the screenshot
-          console.log('Waiting for modal to be visible before capturing...');
-          await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms for modal to render
-          
-          // Capture screenshot and camera AFTER modal is shown and visible
-          console.log('Capturing screenshot and camera after inactivity modal is shown...');
-          try {
-            await captureScreenshotAndCamera();
-          } catch (captureError) {
-            console.warn('Error capturing screenshot/camera after inactivity:', captureError);
-          }
         } else {
             console.log(`Activity detected during double-check (${Math.floor(recheckTimeSinceActivity / 1000)}s) - not showing overlay`);
         }
       }, doubleCheckDelay);
       }
     } else {
-      // Activity detected - clear any pending double-check and reset inactivity tracking
+      // Activity detected - clear any pending double-check
       if (idleDoubleCheckTimer) {
         clearTimeout(idleDoubleCheckTimer);
         idleDoubleCheckTimer = null;
         console.log('Activity detected - cleared pending idle double-check');
       }
-      // Clear inactivity start time since user is active
-      inactivityStartTime = null;
     }
     
     // Schedule next check
@@ -3372,54 +2972,12 @@ function startIdleDetection() {
 async function resumeTracking() {
   if (!isTracking || !pauseStartTime) return;
   
-  // CRITICAL: Validate current date before resuming
-  // This ensures we NEVER resume tracking for any date other than current date
-  if (!await validateCurrentDate()) {
-    // Date changed - tracking was stopped by validateCurrentDate
-    return;
-  }
-  
-  // CRITICAL: Do NOT add the time spent on the inactivity modal to pausedDuration
-  // The inactive time was already deducted when the modal was shown
-  // We should resume from exactly where we paused, not add the modal wait time
+  // Calculate paused duration and add to total
   const now = Date.now();
-  const modalWaitTime = now - pauseStartTime;
-  console.log(`Resuming tracking - NOT adding modal wait time (${Math.floor(modalWaitTime / 1000)}s) to duration`);
-  console.log('Resuming from paused state - continuing from when tracking was paused, not adding modal wait time');
-  
-  // IMPORTANT: Adjust sessionStartTime to account for the modal wait time
-  // This ensures the session duration calculation doesn't include the modal wait time
-  // We move sessionStartTime forward by the modal wait time so the duration calculation is correct
-  if (sessionStartTime) {
-    sessionStartTime = new Date(sessionStartTime.getTime() + modalWaitTime);
-    console.log(`Adjusted sessionStartTime forward by ${Math.floor(modalWaitTime / 1000)}s to exclude modal wait time`);
-  }
-  
-  // IMPORTANT: Also update baseDurationAtSessionStart to match current duration in database
-  // This ensures we continue from the correct point after the inactive time was deducted
-  if (timeEntryId && isOnline) {
-    try {
-      const { data: currentEntry, error: fetchError } = await supabase
-        .from('time_entries')
-        .select('duration')
-        .eq('id', timeEntryId)
-        .single();
-      
-      if (!fetchError && currentEntry) {
-        const currentDuration = currentEntry.duration || 0;
-        baseDuration = currentDuration;
-        baseDurationAtSessionStart = currentDuration;
-        console.log(`Updated baseDurationAtSessionStart to ${formatDurationFromSeconds(currentDuration)} from database`);
-      }
-    } catch (error) {
-      console.error('Error fetching current duration on resume:', error);
-    }
-  }
-  
+  pausedDuration += now - pauseStartTime;
   pauseStartTime = null;
-  inactivityStartTime = null; // Clear inactivity start time
   
-  // Sync duration when resuming (to save the state)
+  // Sync duration when resuming (to save the state before pause)
   await syncCurrentDuration();
   
   // Reset activity time
@@ -3454,15 +3012,8 @@ async function resumeTracking() {
 }
 
 function startTimer() {
-  timerInterval = setInterval(async () => {
+  timerInterval = setInterval(() => {
     if (sessionStartTime && !pauseStartTime && isTracking) {
-      // CRITICAL: Validate current date on every timer tick
-      // This ensures tracker can NEVER run for any date other than current date
-      if (!await validateCurrentDate()) {
-        // Date changed - tracking was stopped by validateCurrentDate
-        return;
-      }
-      
       // Calculate session duration accurately
       const now = Date.now();
       let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
@@ -4118,13 +3669,6 @@ function startRealTimeUpdates() {
       return;
     }
     
-    // CRITICAL: Validate current date before updating
-    // This ensures we NEVER update time entries for any date other than current date
-    if (!await validateCurrentDate()) {
-      // Date changed - tracking was stopped by validateCurrentDate
-      return;
-    }
-    
     // Skip if paused (but we'll sync when pause happens)
     if (pauseStartTime) return;
 
@@ -4138,7 +3682,13 @@ function startRealTimeUpdates() {
     // This prevents double-counting if baseDuration was updated during this session
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
 
-    // Send directly to Supabase (no local storage)
+    // Save to local storage first (works offline)
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+      duration: totalDuration,
+      timeEntryId: timeEntryId
+    });
+
+    // Update in Supabase if online
     if (isOnline) {
       try {
         // Fetch current duration from Supabase (source of truth)
@@ -4187,6 +3737,12 @@ function startRealTimeUpdates() {
             // Update baseDuration to reflect what's now in DB
             // This will be used when we stop tracking
             baseDuration = maxDuration;
+            
+            // Update local storage with synced value
+            saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+              duration: maxDuration,
+              timeEntryId: timeEntryId
+            });
           }
         }
       } catch (error) {
@@ -4194,8 +3750,11 @@ function startRealTimeUpdates() {
         isOnline = false;
       }
     } else {
-      // Offline - log warning but don't queue (direct to Supabase only)
-      console.warn('Cannot update duration: offline. Duration will be synced when connection is restored.');
+      // Offline - queue for later sync
+      pendingUpdates.push({
+        timeEntryId: timeEntryId,
+        duration: totalDuration
+      });
     }
   }, 60000); // Every 60 seconds (1 minute)
 }
@@ -4203,13 +3762,6 @@ function startRealTimeUpdates() {
 // Helper function to sync current duration to Supabase
 async function syncCurrentDuration() {
   if (!isTracking || !timeEntryId || !sessionStartTime) return false;
-  
-  // CRITICAL: Validate current date before syncing
-  // This ensures we NEVER sync time entries for any date other than current date
-  if (!await validateCurrentDate()) {
-    // Date changed - tracking was stopped by validateCurrentDate
-    return false;
-  }
   
   try {
     // Calculate current session duration accurately
@@ -4221,7 +3773,15 @@ async function syncCurrentDuration() {
     // Calculate total duration using baseDurationAtSessionStart
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
     
-    // Send directly to Supabase (no local storage)
+    // Save to local storage first (works offline)
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+      duration: totalDuration,
+      timeEntryId: timeEntryId,
+      projectId: selectedProjectId,
+      taskId: selectedTaskId
+    });
+    
+    // Update in Supabase if online
     if (isOnline) {
       try {
         // Fetch current duration from Supabase (source of truth)
@@ -4261,6 +3821,14 @@ async function syncCurrentDuration() {
             // Update baseDuration to reflect what's now in DB
             baseDuration = maxDuration;
             
+            // Update local storage with synced value
+            saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+              duration: maxDuration,
+              timeEntryId: timeEntryId,
+              projectId: selectedProjectId,
+              taskId: selectedTaskId
+            });
+            
             console.log(`Duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)}`);
             return true;
           }
@@ -4272,8 +3840,11 @@ async function syncCurrentDuration() {
         return false;
       }
     } else {
-      // Offline - log warning but don't queue (direct to Supabase only)
-      console.warn('Cannot sync duration: offline. Duration will be synced when connection is restored.');
+      // Offline - queue for later sync
+      pendingUpdates.push({
+        timeEntryId: timeEntryId,
+        duration: totalDuration
+      });
       return false;
     }
   } catch (error) {
@@ -4283,7 +3854,7 @@ async function syncCurrentDuration() {
 }
 
 function startDailyResetCheck() {
-  // Check every 30 seconds if we've crossed the 12 AM (midnight) threshold (more frequent for better detection)
+  // Check every 30 seconds if we've crossed the 6 AM IST threshold (more frequent for better detection)
   dailyResetCheckInterval = setInterval(async () => {
     if (!currentUser) return;
 
@@ -4293,73 +3864,44 @@ function startDailyResetCheck() {
     const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
     
     if (dayCycleChanged) {
-      // New day cycle detected at midnight - reset everything to 00:00:00
-      console.log('🔄 New day cycle detected at 12 AM - automatically resetting tracker to 00:00:00:', {
+      // New day cycle detected - reset everything
+      console.log('🔄 New day cycle detected at 6 AM - resetting tracking:', {
         old: currentDayCycle ? currentDayCycle.dateString : 'null',
         new: newDayCycle.dateString
       });
       
-      // Stop tracking if active (this will save final duration to Supabase)
+      // Stop tracking if active
       if (isTracking) {
         console.log('Stopping active tracking due to day cycle change');
         await stopTracking();
       }
       
-      // CRITICAL: Reset all state to 0 for new day (don't load from database)
+      // Clear ALL old local storage entries
+      clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
+      if (currentDayCycle) {
+        clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+      }
+      
+      // Reset state
       currentDayCycle = newDayCycle;
       baseDuration = 0;
       baseDurationAtSessionStart = 0;
       timeEntryId = null;
-      sessionStartTime = null;
-      pausedDuration = 0;
-      pauseStartTime = null;
       
-      // Clear any existing intervals
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-      if (captureInterval) {
-        clearInterval(captureInterval);
-        captureInterval = null;
-      }
-      if (realTimeUpdateInterval) {
-        clearInterval(realTimeUpdateInterval);
-        realTimeUpdateInterval = null;
-      }
+      // Reload last time entry (should be empty for new day)
+      await loadLastTimeEntry();
       
-      // Update UI to show 00:00:00
+      // Update UI
       updateDayCycleDisplay();
       updateTimerDisplay(0);
       
-      // Update status
-      if (statusDisplay) {
+      // Show notification
+      if (!isTracking) {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
       }
       
-      // Reset project and task selections (optional - comment out if you want to keep them)
-      // selectedProjectId = null;
-      // selectedTaskId = null;
-      // if (projectSelect) projectSelect.value = '';
-      // if (taskSelect) taskSelect.value = '';
-      // updateTaskDisplay();
-      // updateStartButtonState();
-      
-      console.log('✅ Day cycle reset complete - tracker reset to 00:00:00 for new day:', newDayCycle.dateString);
-      
-      // Show user notification (optional - can be removed if too intrusive)
-      if (statusDisplay) {
-        const originalText = statusDisplay.textContent;
-        statusDisplay.textContent = '🔄 Reset: New Day';
-        statusDisplay.style.color = '#2563eb';
-        setTimeout(() => {
-          if (statusDisplay) {
-            statusDisplay.textContent = originalText;
-            statusDisplay.style.color = '';
-          }
-        }, 3000);
-      }
+      console.log('✅ Day cycle reset complete - timer reset to 00:00:00');
     }
   }, 30000); // Check every 30 seconds for more responsive day cycle detection
 }

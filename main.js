@@ -43,8 +43,8 @@ function createMainWindow() {
 
   mainWindow.loadFile('index.html');
 
-  // Open DevTools by default for debugging
-  mainWindow.webContents.openDevTools();
+  // DevTools disabled - uncomment the line below if you need to debug
+  // mainWindow.webContents.openDevTools();
 
   mainWindow.on('closed', () => {
     mainWindow = null;
