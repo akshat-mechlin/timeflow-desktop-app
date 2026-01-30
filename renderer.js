@@ -5,8 +5,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Get app version from package.json
-const appVersion = require('./package.json').version;
+// App version: from package.json with fallback (renderer require can fail when packaged)
+let appVersion;
+let TRACKER_VERSION;
+try {
+  const pkg = require(path.join(__dirname, 'package.json'));
+  appVersion = pkg && pkg.version ? String(pkg.version).trim() : '0.0.0';
+  TRACKER_VERSION = appVersion;
+} catch (e) {
+  console.warn('Could not read version from package.json:', e.message);
+  appVersion = '0.0.0';
+  TRACKER_VERSION = '0.0.0';
+}
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
@@ -855,73 +865,94 @@ function compareVersions(version1, version2) {
   return 0;
 }
 
-// Check if current version meets minimum requirements
+// Required version to compare against (match = no modal, mismatch = show update modal)
+const REQUIRED_VERSION = '1.5.0';
+
+// Check if current version meets minimum requirements (reads from system_settings.tracker_required_version)
 async function checkAppVersion() {
   try {
-    console.log(`🔍 Checking app version: ${appVersion} (Platform: ${appPlatform})`);
-    
-    // Get minimum required version from database
-    const { data: versionData, error: versionError } = await supabase
-      .from('app_versions')
-      .select('version, minimum_required_version, download_url, download_urls, force_update, is_active')
-      .eq('is_active', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    if (versionError || !versionData) {
-      console.warn('⚠ Could not fetch version info, allowing app to continue:', versionError);
-      // If we can't check version, allow app to continue (graceful degradation)
+    console.log(`🔍 Checking app version: ${TRACKER_VERSION} (Platform: ${appPlatform})`);
+
+    // 1) Local check first (no DB) — if tracker is below required, block immediately
+    if (compareVersions(TRACKER_VERSION, REQUIRED_VERSION) < 0) {
+      console.warn(`❌ Version mismatch (local): ${TRACKER_VERSION} < ${REQUIRED_VERSION} — showing update modal`);
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
+        reason: 'version_outdated',
+        minimumVersion: REQUIRED_VERSION,
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
+
+    // 2) Optional: get required version from DB (for dynamic updates later)
+    const { data: settingRow, error: settingError } = await supabase
+      .from('system_settings')
+      .select('setting_value')
+      .eq('setting_key', 'tracker_required_version')
+      .maybeSingle();
+
+    if (settingError) {
+      console.warn('⚠ Could not fetch tracker_required_version:', settingError);
       isVersionValid = true;
       versionCheckComplete = true;
       return { valid: true, reason: 'version_check_failed' };
     }
-    
-    minimumRequiredVersion = versionData.minimum_required_version;
-    
-    // Get platform-specific download URL
-    if (versionData.download_urls && typeof versionData.download_urls === 'object') {
-      // Use platform-specific URL if available
-      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
-      downloadUrl = versionData.download_urls[platformKey] || versionData.download_urls.default || versionData.download_url;
-    } else {
-      // Fallback to single download_url
-      downloadUrl = versionData.download_url;
-    }
-    
-    forceUpdate = versionData.force_update || false;
-    
-    console.log(`📋 Minimum required version: ${minimumRequiredVersion}`);
-    console.log(`📋 Current version: ${appVersion}`);
-    console.log(`📋 Force update: ${forceUpdate}`);
-    
-    // Compare versions
-    const versionComparison = compareVersions(appVersion, minimumRequiredVersion);
-    
-    if (versionComparison < 0) {
-      // Current version is older than minimum required
-      console.warn(`❌ Version check failed: ${appVersion} < ${minimumRequiredVersion}`);
-      isVersionValid = false;
-      versionCheckComplete = true;
-      return { 
-        valid: false, 
-        reason: 'version_outdated',
-        minimumVersion: minimumRequiredVersion,
-        currentVersion: appVersion,
-        downloadUrl: downloadUrl,
-        downloadUrls: versionData.download_urls || null,
-        forceUpdate: forceUpdate
-      };
-    } else {
-      // Version is valid
-      console.log(`✓ Version check passed: ${appVersion} >= ${minimumRequiredVersion}`);
+
+    if (!settingRow || settingRow.setting_value == null || settingRow.setting_value === '') {
+      console.warn('⚠ tracker_required_version not set in system_settings, allowing app to continue');
       isVersionValid = true;
       versionCheckComplete = true;
-      return { valid: true, reason: 'version_valid' };
+      return { valid: true, reason: 'version_check_skipped' };
     }
+
+    // Normalize required version to string (setting_value is jsonb: can be "1.5.0", "1.5", or number)
+    const rawRequired = settingRow.setting_value;
+    let requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+    const parts = requiredStr.split('.').filter(Boolean);
+    if (parts.length === 1) parts.push('0', '0');
+    else if (parts.length === 2) parts.push('0');
+    minimumRequiredVersion = parts.slice(0, 3).map(p => (parseInt(p, 10) || 0).toString()).join('.');
+
+    if (!minimumRequiredVersion || !/^\d+\.\d+\.\d+$/.test(minimumRequiredVersion)) {
+      console.warn('⚠ tracker_required_version invalid format:', rawRequired);
+      isVersionValid = true;
+      versionCheckComplete = true;
+      return { valid: true, reason: 'version_check_skipped' };
+    }
+
+    console.log(`📋 Required version (from DB): ${minimumRequiredVersion}`);
+    console.log(`📋 Current tracker version (check): ${TRACKER_VERSION}`);
+
+    const versionComparison = compareVersions(TRACKER_VERSION, minimumRequiredVersion);
+
+    if (versionComparison < 0) {
+      // Tracker version is lower than required → block and show modal
+      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} < ${minimumRequiredVersion} — showing update modal`);
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
+        reason: 'version_outdated',
+        minimumVersion: minimumRequiredVersion,
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: downloadUrl || null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
+
+    // Same or newer → allow app
+    console.log(`✓ Version OK: ${TRACKER_VERSION} >= ${minimumRequiredVersion}`);
+    isVersionValid = true;
+    versionCheckComplete = true;
+    return { valid: true, reason: 'version_valid' };
   } catch (error) {
     console.error('❌ Error checking app version:', error);
-    // On error, allow app to continue (graceful degradation)
     isVersionValid = true;
     versionCheckComplete = true;
     return { valid: true, reason: 'version_check_error' };
@@ -988,34 +1019,36 @@ async function trackVersionUsage() {
   }
 }
 
-// Show update required modal
+// Show update required modal when app version is below tracker_required_version
 function showUpdateRequiredModal(versionInfo) {
   const updateModal = document.getElementById('update-required-modal');
   const updateMessage = document.getElementById('update-message');
   const downloadBtn = document.getElementById('download-update-btn');
   const closeBtn = document.getElementById('close-app-btn');
-  
+
+  const currentVer = versionInfo.currentVersion || TRACKER_VERSION || appVersion;
+  const minVer = versionInfo.minimumVersion || '';
+
   if (!updateModal || !updateMessage) {
     console.error('Update modal elements not found');
+    if (typeof alert === 'function') {
+      alert(`Update required: Please update from ${currentVer} to ${minVer} or higher.`);
+    }
     return;
   }
-  
-  // Update modal content
+
   updateMessage.innerHTML = `
-    <p>Your current version (<strong>${versionInfo.currentVersion}</strong>) is outdated.</p>
-    <p>Please update to version <strong>${versionInfo.minimumVersion}</strong> or higher to continue using the application.</p>
+    <p>Your current version (<strong>${currentVer}</strong>) is below the required version.</p>
+    <p>Please update to version <strong>${minVer}</strong> or higher to continue using the application.</p>
     ${versionInfo.forceUpdate ? '<p class="update-warning">⚠️ This update is mandatory. The application will not function until you update.</p>' : ''}
   `;
-  
-  // Setup download button with platform-specific URL
+
   if (downloadBtn) {
-    // Get platform-specific download URL
     let platformUrl = versionInfo.downloadUrl;
     if (versionInfo.downloadUrls && typeof versionInfo.downloadUrls === 'object') {
       const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
       platformUrl = versionInfo.downloadUrls[platformKey] || versionInfo.downloadUrls.default || versionInfo.downloadUrl;
     }
-    
     if (platformUrl) {
       downloadBtn.style.display = 'inline-block';
       downloadBtn.onclick = () => {
@@ -1026,47 +1059,60 @@ function showUpdateRequiredModal(versionInfo) {
       downloadBtn.style.display = 'none';
     }
   }
-  
-  // Setup close button
+
   if (closeBtn) {
     closeBtn.onclick = () => {
       ipcRenderer.invoke('close-window');
     };
   }
-  
-  // Show modal
-  updateModal.classList.remove('hidden');
-  
-  // Block all interactions
+
+  // Ensure modal is visible: remove hidden, show overlay, block background
   document.body.style.pointerEvents = 'none';
   updateModal.style.pointerEvents = 'auto';
+  updateModal.classList.remove('hidden');
+  updateModal.style.display = '';
+  updateModal.style.visibility = 'visible';
+  updateModal.style.opacity = '1';
+  requestAnimationFrame(() => {
+    updateModal.classList.remove('hidden');
+    updateModal.style.display = 'flex';
+  });
 }
 
 async function checkAuth() {
   try {
     console.log('Checking authentication...');
+    if (!loadingContainer || !loginContainer || !dashboardContainer) {
+      console.error('DOM containers not ready');
+      return;
+    }
     // Show loading state while checking
     loadingContainer.classList.remove('hidden');
     loginContainer.classList.add('hidden');
     dashboardContainer.classList.add('hidden');
-    
-    // First, check app version (before authentication)
-    const versionCheck = await checkAppVersion();
-    
-    if (!versionCheck.valid) {
+
+    // Version check: run synchronously (no await) so we never depend on DB/network to block.
+    // Previously the async check (Supabase) could fail and return valid: true, so login appeared.
+    const versionOutdated = compareVersions(TRACKER_VERSION, REQUIRED_VERSION) < 0;
+    if (versionOutdated) {
       console.error('❌ Version check failed, blocking app access');
+      isVersionValid = false;
+      versionCheckComplete = true;
+      if (loadingContainer) loadingContainer.classList.add('hidden');
+      if (loginContainer) loginContainer.classList.add('hidden');
+      if (dashboardContainer) dashboardContainer.classList.add('hidden');
       showUpdateRequiredModal({
-        currentVersion: versionCheck.currentVersion,
-        minimumVersion: versionCheck.minimumVersion,
-        downloadUrl: versionCheck.downloadUrl,
-        downloadUrls: versionCheck.downloadUrls,
-        forceUpdate: versionCheck.forceUpdate
+        currentVersion: TRACKER_VERSION,
+        minimumVersion: REQUIRED_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
       });
-      
-      // Block further execution
       return;
     }
-    
+    isVersionValid = true;
+    versionCheckComplete = true;
+
     const { data: { session }, error } = await supabase.auth.getSession();
     
     if (error) {
@@ -1094,6 +1140,7 @@ async function checkAuth() {
 }
 
 function showLogin() {
+  if (!isVersionValid) return;
   if (loadingContainer) loadingContainer.classList.add('hidden');
   if (loginContainer) loginContainer.classList.remove('hidden');
   if (dashboardContainer) dashboardContainer.classList.add('hidden');
