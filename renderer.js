@@ -1026,38 +1026,26 @@ function showUpdateRequiredModal(versionInfo) {
   const downloadBtn = document.getElementById('download-update-btn');
   const closeBtn = document.getElementById('close-app-btn');
 
-  const currentVer = versionInfo.currentVersion || TRACKER_VERSION || appVersion;
-  const minVer = versionInfo.minimumVersion || '';
-
   if (!updateModal || !updateMessage) {
     console.error('Update modal elements not found');
     if (typeof alert === 'function') {
-      alert(`Update required: Please update from ${currentVer} to ${minVer} or higher.`);
+      alert('Your current version is old please update to new version.');
     }
     return;
   }
 
   updateMessage.innerHTML = `
-    <p>Your current version (<strong>${currentVer}</strong>) is below the required version.</p>
-    <p>Please update to version <strong>${minVer}</strong> or higher to continue using the application.</p>
+    <p>Your current version is old please update to new version.</p>
     ${versionInfo.forceUpdate ? '<p class="update-warning">⚠️ This update is mandatory. The application will not function until you update.</p>' : ''}
   `;
 
+  const updateAppUrl = 'https://timeflow.mechlintech.com';
   if (downloadBtn) {
-    let platformUrl = versionInfo.downloadUrl;
-    if (versionInfo.downloadUrls && typeof versionInfo.downloadUrls === 'object') {
-      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
-      platformUrl = versionInfo.downloadUrls[platformKey] || versionInfo.downloadUrls.default || versionInfo.downloadUrl;
-    }
-    if (platformUrl) {
-      downloadBtn.style.display = 'inline-block';
-      downloadBtn.onclick = () => {
-        const { shell } = require('electron');
-        shell.openExternal(platformUrl);
-      };
-    } else {
-      downloadBtn.style.display = 'none';
-    }
+    downloadBtn.style.display = 'inline-block';
+    downloadBtn.onclick = () => {
+      const { shell } = require('electron');
+      shell.openExternal(updateAppUrl);
+    };
   }
 
   if (closeBtn) {
