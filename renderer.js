@@ -865,23 +865,21 @@ function compareVersions(version1, version2) {
   return 0;
 }
 
-// Required version to compare against (match = no modal, mismatch = show update modal)
-const REQUIRED_VERSION = '1.5.0';
-
-// Check if current version meets minimum requirements (reads from system_settings.tracker_required_version)
+// Fetch required version via RPC (bypasses RLS, avoids "infinite recursion in policy for relation profiles"). No fallback — if fetch fails, app is blocked.
 async function checkAppVersion() {
   try {
     console.log(`🔍 Checking app version: ${TRACKER_VERSION} (Platform: ${appPlatform})`);
 
-    // 1) Local check first (no DB) — if tracker is below required, block immediately
-    if (compareVersions(TRACKER_VERSION, REQUIRED_VERSION) < 0) {
-      console.warn(`❌ Version mismatch (local): ${TRACKER_VERSION} < ${REQUIRED_VERSION} — showing update modal`);
+    const { data: requiredFromDb, error: rpcError } = await supabase.rpc('get_tracker_required_version');
+
+    if (rpcError) {
+      console.error('❌ Could not fetch tracker_required_version:', rpcError.message || rpcError.code || JSON.stringify(rpcError));
       isVersionValid = false;
       versionCheckComplete = true;
       return {
         valid: false,
-        reason: 'version_outdated',
-        minimumVersion: REQUIRED_VERSION,
+        reason: 'version_check_failed',
+        minimumVersion: '',
         currentVersion: TRACKER_VERSION,
         downloadUrl: null,
         downloadUrls: null,
@@ -889,50 +887,51 @@ async function checkAppVersion() {
       };
     }
 
-    // 2) Optional: get required version from DB (for dynamic updates later)
-    const { data: settingRow, error: settingError } = await supabase
-      .from('system_settings')
-      .select('setting_value')
-      .eq('setting_key', 'tracker_required_version')
-      .maybeSingle();
-
-    if (settingError) {
-      console.warn('⚠ Could not fetch tracker_required_version:', settingError);
-      isVersionValid = true;
+    if (requiredFromDb == null || requiredFromDb === '') {
+      console.error('❌ tracker_required_version not set in system_settings');
+      isVersionValid = false;
       versionCheckComplete = true;
-      return { valid: true, reason: 'version_check_failed' };
+      return {
+        valid: false,
+        reason: 'version_check_skipped',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
     }
 
-    if (!settingRow || settingRow.setting_value == null || settingRow.setting_value === '') {
-      console.warn('⚠ tracker_required_version not set in system_settings, allowing app to continue');
-      isVersionValid = true;
-      versionCheckComplete = true;
-      return { valid: true, reason: 'version_check_skipped' };
-    }
-
-    // Normalize required version to string (setting_value is jsonb: can be "1.5.0", "1.5", or number)
-    const rawRequired = settingRow.setting_value;
-    let requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+    const rawRequired = requiredFromDb;
+    const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
     const parts = requiredStr.split('.').filter(Boolean);
     if (parts.length === 1) parts.push('0', '0');
     else if (parts.length === 2) parts.push('0');
     minimumRequiredVersion = parts.slice(0, 3).map(p => (parseInt(p, 10) || 0).toString()).join('.');
 
     if (!minimumRequiredVersion || !/^\d+\.\d+\.\d+$/.test(minimumRequiredVersion)) {
-      console.warn('⚠ tracker_required_version invalid format:', rawRequired);
-      isVersionValid = true;
+      console.error('❌ tracker_required_version invalid format:', rawRequired);
+      isVersionValid = false;
       versionCheckComplete = true;
-      return { valid: true, reason: 'version_check_skipped' };
+      return {
+        valid: false,
+        reason: 'version_check_skipped',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
     }
 
     console.log(`📋 Required version (from DB): ${minimumRequiredVersion}`);
-    console.log(`📋 Current tracker version (check): ${TRACKER_VERSION}`);
+    console.log(`📋 Current tracker version: ${TRACKER_VERSION}`);
 
     const versionComparison = compareVersions(TRACKER_VERSION, minimumRequiredVersion);
 
-    if (versionComparison < 0) {
-      // Tracker version is lower than required → block and show modal
-      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} < ${minimumRequiredVersion} — showing update modal`);
+    // Exact match only: if not equal, show update modal (no "equal or greater" logic)
+    if (versionComparison !== 0) {
+      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} !== ${minimumRequiredVersion} (exact match required) — showing update modal`);
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -946,16 +945,23 @@ async function checkAppVersion() {
       };
     }
 
-    // Same or newer → allow app
-    console.log(`✓ Version OK: ${TRACKER_VERSION} >= ${minimumRequiredVersion}`);
+    console.log(`✓ Version OK: exact match ${TRACKER_VERSION}`);
     isVersionValid = true;
     versionCheckComplete = true;
     return { valid: true, reason: 'version_valid' };
   } catch (error) {
     console.error('❌ Error checking app version:', error);
-    isVersionValid = true;
+    isVersionValid = false;
     versionCheckComplete = true;
-    return { valid: true, reason: 'version_check_error' };
+    return {
+      valid: false,
+      reason: 'version_check_error',
+      minimumVersion: '',
+      currentVersion: TRACKER_VERSION,
+      downloadUrl: null,
+      downloadUrls: null,
+      forceUpdate: true
+    };
   }
 }
 
@@ -1079,27 +1085,22 @@ async function checkAuth() {
     loginContainer.classList.add('hidden');
     dashboardContainer.classList.add('hidden');
 
-    // Version check: run synchronously (no await) so we never depend on DB/network to block.
-    // Previously the async check (Supabase) could fail and return valid: true, so login appeared.
-    const versionOutdated = compareVersions(TRACKER_VERSION, REQUIRED_VERSION) < 0;
-    if (versionOutdated) {
+    // Version check: fetch required version from DB (tracker_required_version), then compare. No fallback — fetch failure blocks app.
+    const versionCheck = await checkAppVersion();
+    if (!versionCheck.valid) {
       console.error('❌ Version check failed, blocking app access');
-      isVersionValid = false;
-      versionCheckComplete = true;
       if (loadingContainer) loadingContainer.classList.add('hidden');
       if (loginContainer) loginContainer.classList.add('hidden');
       if (dashboardContainer) dashboardContainer.classList.add('hidden');
       showUpdateRequiredModal({
-        currentVersion: TRACKER_VERSION,
-        minimumVersion: REQUIRED_VERSION,
-        downloadUrl: null,
-        downloadUrls: null,
-        forceUpdate: true
+        currentVersion: versionCheck.currentVersion,
+        minimumVersion: versionCheck.minimumVersion,
+        downloadUrl: versionCheck.downloadUrl,
+        downloadUrls: versionCheck.downloadUrls,
+        forceUpdate: versionCheck.forceUpdate
       });
       return;
     }
-    isVersionValid = true;
-    versionCheckComplete = true;
 
     const { data: { session }, error } = await supabase.auth.getSession();
     
