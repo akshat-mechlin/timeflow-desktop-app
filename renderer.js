@@ -5,8 +5,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Get app version from package.json
-const appVersion = require('./package.json').version;
+// App version: from package.json with fallback (renderer require can fail when packaged)
+let appVersion;
+let TRACKER_VERSION;
+try {
+  const pkg = require(path.join(__dirname, 'package.json'));
+  appVersion = pkg && pkg.version ? String(pkg.version).trim() : '0.0.0';
+  TRACKER_VERSION = appVersion;
+} catch (e) {
+  console.warn('Could not read version from package.json:', e.message);
+  appVersion = '0.0.0';
+  TRACKER_VERSION = '0.0.0';
+}
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
@@ -51,71 +61,69 @@ supabase.auth.getSession().then(({ data, error }) => {
   console.error('Exception testing Supabase connection:', err);
 });
 
-// IST timezone utilities
-// IST is UTC+5:30
+// Day cycle timezone utilities
+// USE_LOCAL_TIME_FOR_DAY_CYCLE: set to true to use machine local time (for testing date-change reset by changing system clock).
+// Set to false for production so day cycle uses IST (global time - reset at midnight IST).
+// true = use machine local time (change system clock to test midnight rollover, e.g. 11:55 PM → 12:05 AM = new day, new DB entry)
+const USE_LOCAL_TIME_FOR_DAY_CYCLE = false; // false = use IST (Asia/Kolkata) for production
+
+// IST is UTC+5:30 (used when USE_LOCAL_TIME_FOR_DAY_CYCLE is false)
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
+/**
+ * Returns date components used for day cycle. When USE_LOCAL_TIME_FOR_DAY_CYCLE is true,
+ * uses local machine time (for testing). Otherwise uses IST (Asia/Kolkata) so "today" is always the date in India.
+ */
 function getISTComponents() {
   const now = new Date();
-  // Get UTC time in milliseconds
-  const utcTime = now.getTime();
-  // Add IST offset to get IST time in milliseconds
-  const istTimeMs = utcTime + IST_OFFSET_MS;
-  
-  // Create a date object representing IST time
-  const istDate = new Date(istTimeMs);
-  
-  // Extract components (using UTC methods because we've already adjusted for IST)
-  const year = istDate.getUTCFullYear();
-  const month = istDate.getUTCMonth();
-  const date = istDate.getUTCDate();
-  const hours = istDate.getUTCHours();
-  const minutes = istDate.getUTCMinutes();
-  
-  return { year, month, date, hours, minutes };
+  if (USE_LOCAL_TIME_FOR_DAY_CYCLE) {
+    // Use local machine time for day cycle (for testing - change system date/time to verify reset at midnight)
+    return {
+      year: now.getFullYear(),
+      month: now.getMonth(),
+      date: now.getDate(),
+      hours: now.getHours(),
+      minutes: now.getMinutes()
+    };
+  }
+  // Production: use Asia/Kolkata so day is always the calendar date in India (global time)
+  const istStr = now.toLocaleString('en-CA', { timeZone: 'Asia/Kolkata' }); // e.g. "2026-02-04, 14:30:00"
+  const [datePart, timePart] = istStr.split(', ');
+  const [y, m, d] = datePart.split('-').map(Number);
+  const [hr, min] = (timePart || '0:0:0').split(':').map(Number);
+  return {
+    year: y,
+    month: m - 1, // 0-based for Date
+    date: d,
+    hours: hr,
+    minutes: min
+  };
 }
 
+/**
+ * Day cycle = one calendar day. Resets at midnight (00:00) in the chosen time (local or IST).
+ * Same calendar day = same session (e.g. start at 8 PM same day continues that day's time).
+ */
 function getCurrentDayCycle() {
   const ist = getISTComponents();
-  
-  let cycleDate, cycleStart, cycleEnd;
-  let cycleYear, cycleMonth, cycleDay;
+  const cycleYear = ist.year;
+  const cycleMonth = ist.month;
+  const cycleDay = ist.date;
 
-  // If current time is before 6 AM IST, the cycle started yesterday at 6 AM
-  if (ist.hours < 6) {
-    // Cycle started yesterday at 6 AM IST
-    // Calculate yesterday's date components
-    const yesterday = new Date(Date.UTC(ist.year, ist.month, ist.date));
-    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
-    
-    cycleYear = yesterday.getUTCFullYear();
-    cycleMonth = yesterday.getUTCMonth();
-    cycleDay = yesterday.getUTCDate();
-    
-    // Cycle start: yesterday at 6:00:00 AM IST = yesterday at 00:30:00 UTC
-    cycleStart = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 0, 30, 0, 0));
-    
-    // Cycle end: today at 5:59:59.999 AM IST = today at 00:29:59.999 UTC
-    cycleEnd = new Date(Date.UTC(ist.year, ist.month, ist.date, 0, 29, 59, 999));
+  let cycleStart, cycleEnd, cycleDate;
+
+  if (USE_LOCAL_TIME_FOR_DAY_CYCLE) {
+    // Local: cycle is midnight to 23:59:59.999 in local time
+    cycleStart = new Date(cycleYear, cycleMonth, cycleDay, 0, 0, 0, 0);
+    cycleEnd = new Date(cycleYear, cycleMonth, cycleDay, 23, 59, 59, 999);
+    cycleDate = new Date(cycleYear, cycleMonth, cycleDay);
   } else {
-    // Cycle started today at 6 AM IST
-    cycleYear = ist.year;
-    cycleMonth = ist.month;
-    cycleDay = ist.date;
-    
-    // Cycle start: today at 6:00:00 AM IST = today at 00:30:00 UTC
-    cycleStart = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 0, 30, 0, 0));
-    
-    // Cycle end: tomorrow at 5:59:59.999 AM IST = tomorrow at 00:29:59.999 UTC
-    const tomorrow = new Date(Date.UTC(ist.year, ist.month, ist.date));
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    cycleEnd = new Date(Date.UTC(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth(), tomorrow.getUTCDate(), 0, 29, 59, 999));
+    // IST: midnight IST = (cycleDay-1) 18:30 UTC, end of day IST = cycleDay 18:29:59.999 UTC
+    cycleStart = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay - 1, 18, 30, 0, 0));
+    cycleEnd = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay, 18, 29, 59, 999));
+    cycleDate = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay));
   }
 
-  // Create cycle date object for the cycle date (not time)
-  cycleDate = new Date(Date.UTC(cycleYear, cycleMonth, cycleDay));
-  
-  // Format date string as YYYY-MM-DD
   const dateString = `${cycleYear}-${String(cycleMonth + 1).padStart(2, '0')}-${String(cycleDay).padStart(2, '0')}`;
 
   return {
@@ -683,9 +691,13 @@ document.addEventListener('visibilitychange', async () => {
     const newDayCycle = getCurrentDayCycle();
     
     if (!currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString) {
-      console.log('🔄 Day cycle changed while app was hidden - resetting');
+      const wasTracking = isTracking;
+      console.log('🔄 Day cycle changed while app was hidden - resetting', { wasTracking });
       
-      // Clear old local storage
+      if (wasTracking) {
+        await stopTracking();
+      }
+      
       if (currentUser) {
         clearAllOldLocalStorage(currentUser.id, newDayCycle.dateString);
         if (currentDayCycle) {
@@ -693,23 +705,23 @@ document.addEventListener('visibilitychange', async () => {
         }
       }
       
-      // Reset state
       currentDayCycle = newDayCycle;
       baseDuration = 0;
       baseDurationAtSessionStart = 0;
       timeEntryId = null;
-      isTracking = false; // Stop tracking if it was active
+      isTracking = false;
       
-      // Update UI
+      await loadLastTimeEntry();
       updateDayCycleDisplay();
       updateTimerDisplay(0);
-      if (statusDisplay) {
+      
+      if (wasTracking && selectedProjectId && selectedTaskId) {
+        console.log('🔄 Auto-starting tracker for new day (app became visible)');
+        await startTracking();
+      } else if (statusDisplay) {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
       }
-      
-      // Reload for new day
-      loadLastTimeEntry();
     }
   }
 });
@@ -1061,76 +1073,103 @@ function compareVersions(version1, version2) {
   return 0;
 }
 
-// Check if current version meets minimum requirements
+// Fetch required version via RPC (bypasses RLS, avoids "infinite recursion in policy for relation profiles"). No fallback — if fetch fails, app is blocked.
 async function checkAppVersion() {
   try {
-    console.log(`🔍 Checking app version: ${appVersion} (Platform: ${appPlatform})`);
-    
-    // Get minimum required version from database
-    const { data: versionData, error: versionError } = await supabase
-      .from('app_versions')
-      .select('version, minimum_required_version, download_url, download_urls, force_update, is_active')
-      .eq('is_active', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    if (versionError || !versionData) {
-      console.warn('⚠ Could not fetch version info, allowing app to continue:', versionError);
-      // If we can't check version, allow app to continue (graceful degradation)
-      isVersionValid = true;
-      versionCheckComplete = true;
-      return { valid: true, reason: 'version_check_failed' };
-    }
-    
-    minimumRequiredVersion = versionData.minimum_required_version;
-    
-    // Get platform-specific download URL
-    if (versionData.download_urls && typeof versionData.download_urls === 'object') {
-      // Use platform-specific URL if available
-      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
-      downloadUrl = versionData.download_urls[platformKey] || versionData.download_urls.default || versionData.download_url;
-    } else {
-      // Fallback to single download_url
-      downloadUrl = versionData.download_url;
-    }
-    
-    forceUpdate = versionData.force_update || false;
-    
-    console.log(`📋 Minimum required version: ${minimumRequiredVersion}`);
-    console.log(`📋 Current version: ${appVersion}`);
-    console.log(`📋 Force update: ${forceUpdate}`);
-    
-    // Compare versions
-    const versionComparison = compareVersions(appVersion, minimumRequiredVersion);
-    
-    if (versionComparison < 0) {
-      // Current version is older than minimum required
-      console.warn(`❌ Version check failed: ${appVersion} < ${minimumRequiredVersion}`);
+    console.log(`🔍 Checking app version: ${TRACKER_VERSION} (Platform: ${appPlatform})`);
+
+    const { data: requiredFromDb, error: rpcError } = await supabase.rpc('get_tracker_required_version');
+
+    if (rpcError) {
+      console.error('❌ Could not fetch tracker_required_version:', rpcError.message || rpcError.code || JSON.stringify(rpcError));
       isVersionValid = false;
       versionCheckComplete = true;
-      return { 
-        valid: false, 
+      return {
+        valid: false,
+        reason: 'version_check_failed',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
+
+    if (requiredFromDb == null || requiredFromDb === '') {
+      console.error('❌ tracker_required_version not set in system_settings');
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
+        reason: 'version_check_skipped',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
+
+    const rawRequired = requiredFromDb;
+    const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+    const parts = requiredStr.split('.').filter(Boolean);
+    if (parts.length === 1) parts.push('0', '0');
+    else if (parts.length === 2) parts.push('0');
+    minimumRequiredVersion = parts.slice(0, 3).map(p => (parseInt(p, 10) || 0).toString()).join('.');
+
+    if (!minimumRequiredVersion || !/^\d+\.\d+\.\d+$/.test(minimumRequiredVersion)) {
+      console.error('❌ tracker_required_version invalid format:', rawRequired);
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
+        reason: 'version_check_skipped',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
+
+    console.log(`📋 Required version (from DB): ${minimumRequiredVersion}`);
+    console.log(`📋 Current tracker version: ${TRACKER_VERSION}`);
+
+    const versionComparison = compareVersions(TRACKER_VERSION, minimumRequiredVersion);
+
+    // Exact match only: if not equal, show update modal (no "equal or greater" logic)
+    if (versionComparison !== 0) {
+      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} !== ${minimumRequiredVersion} (exact match required) — showing update modal`);
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
         reason: 'version_outdated',
         minimumVersion: minimumRequiredVersion,
-        currentVersion: appVersion,
-        downloadUrl: downloadUrl,
-        downloadUrls: versionData.download_urls || null,
-        forceUpdate: forceUpdate
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: downloadUrl || null,
+        downloadUrls: null,
+        forceUpdate: true
       };
-    } else {
-      // Version is valid
-      console.log(`✓ Version check passed: ${appVersion} >= ${minimumRequiredVersion}`);
-      isVersionValid = true;
-      versionCheckComplete = true;
-      return { valid: true, reason: 'version_valid' };
     }
-  } catch (error) {
-    console.error('❌ Error checking app version:', error);
-    // On error, allow app to continue (graceful degradation)
+
+    console.log(`✓ Version OK: exact match ${TRACKER_VERSION}`);
     isVersionValid = true;
     versionCheckComplete = true;
-    return { valid: true, reason: 'version_check_error' };
+    return { valid: true, reason: 'version_valid' };
+  } catch (error) {
+    console.error('❌ Error checking app version:', error);
+    isVersionValid = false;
+    versionCheckComplete = true;
+    return {
+      valid: false,
+      reason: 'version_check_error',
+      minimumVersion: '',
+      currentVersion: TRACKER_VERSION,
+      downloadUrl: null,
+      downloadUrls: null,
+      forceUpdate: true
+    };
   }
 }
 
@@ -1194,58 +1233,52 @@ async function trackVersionUsage() {
   }
 }
 
-// Show update required modal
+// Show update required modal when app version is below tracker_required_version
 function showUpdateRequiredModal(versionInfo) {
   const updateModal = document.getElementById('update-required-modal');
   const updateMessage = document.getElementById('update-message');
   const downloadBtn = document.getElementById('download-update-btn');
   const closeBtn = document.getElementById('close-app-btn');
-  
+
   if (!updateModal || !updateMessage) {
     console.error('Update modal elements not found');
+    if (typeof alert === 'function') {
+      alert('Your current version is old please update to new version.');
+    }
     return;
   }
-  
-  // Update modal content
+
   updateMessage.innerHTML = `
-    <p>Your current version (<strong>${versionInfo.currentVersion}</strong>) is outdated.</p>
-    <p>Please update to version <strong>${versionInfo.minimumVersion}</strong> or higher to continue using the application.</p>
+    <p>Your current version is old please update to new version.</p>
     ${versionInfo.forceUpdate ? '<p class="update-warning">⚠️ This update is mandatory. The application will not function until you update.</p>' : ''}
   `;
-  
-  // Setup download button with platform-specific URL
+
+  const updateAppUrl = 'https://timeflow.mechlintech.com';
   if (downloadBtn) {
-    // Get platform-specific download URL
-    let platformUrl = versionInfo.downloadUrl;
-    if (versionInfo.downloadUrls && typeof versionInfo.downloadUrls === 'object') {
-      const platformKey = appPlatform === 'win32' ? 'windows' : appPlatform === 'darwin' ? 'mac' : 'default';
-      platformUrl = versionInfo.downloadUrls[platformKey] || versionInfo.downloadUrls.default || versionInfo.downloadUrl;
-    }
-    
-    if (platformUrl) {
-      downloadBtn.style.display = 'inline-block';
-      downloadBtn.onclick = () => {
-        const { shell } = require('electron');
-        shell.openExternal(platformUrl);
-      };
-    } else {
-      downloadBtn.style.display = 'none';
-    }
+    downloadBtn.style.display = 'inline-block';
+    downloadBtn.onclick = () => {
+      const { shell } = require('electron');
+      shell.openExternal(updateAppUrl);
+    };
   }
-  
-  // Setup close button
+
   if (closeBtn) {
     closeBtn.onclick = () => {
       ipcRenderer.invoke('close-window');
     };
   }
-  
-  // Show modal
-  updateModal.classList.remove('hidden');
-  
-  // Block all interactions
+
+  // Ensure modal is visible: remove hidden, show overlay, block background
   document.body.style.pointerEvents = 'none';
   updateModal.style.pointerEvents = 'auto';
+  updateModal.classList.remove('hidden');
+  updateModal.style.display = '';
+  updateModal.style.visibility = 'visible';
+  updateModal.style.opacity = '1';
+  requestAnimationFrame(() => {
+    updateModal.classList.remove('hidden');
+    updateModal.style.display = 'flex';
+  });
 }
 
 // Show camera detection modal
@@ -1311,16 +1344,22 @@ function hideCameraDetectionModal() {
 async function checkAuth() {
   try {
     console.log('Checking authentication...');
+    if (!loadingContainer || !loginContainer || !dashboardContainer) {
+      console.error('DOM containers not ready');
+      return;
+    }
     // Show loading state while checking
     loadingContainer.classList.remove('hidden');
     loginContainer.classList.add('hidden');
     dashboardContainer.classList.add('hidden');
-    
-    // First, check app version (before authentication)
+
+    // Version check: fetch required version from DB (tracker_required_version), then compare. No fallback — fetch failure blocks app.
     const versionCheck = await checkAppVersion();
-    
     if (!versionCheck.valid) {
       console.error('❌ Version check failed, blocking app access');
+      if (loadingContainer) loadingContainer.classList.add('hidden');
+      if (loginContainer) loginContainer.classList.add('hidden');
+      if (dashboardContainer) dashboardContainer.classList.add('hidden');
       showUpdateRequiredModal({
         currentVersion: versionCheck.currentVersion,
         minimumVersion: versionCheck.minimumVersion,
@@ -1328,11 +1367,9 @@ async function checkAuth() {
         downloadUrls: versionCheck.downloadUrls,
         forceUpdate: versionCheck.forceUpdate
       });
-      
-      // Block further execution
       return;
     }
-    
+
     const { data: { session }, error } = await supabase.auth.getSession();
     
     if (error) {
@@ -1360,6 +1397,7 @@ async function checkAuth() {
 }
 
 function showLogin() {
+  if (!isVersionValid) return;
   if (loadingContainer) loadingContainer.classList.add('hidden');
   if (loginContainer) loginContainer.classList.remove('hidden');
   if (dashboardContainer) dashboardContainer.classList.add('hidden');
@@ -1438,8 +1476,8 @@ async function showDashboard() {
     statusDisplay.classList.remove('tracking');
   }
   
-  // Now load last time entry (will validate day cycle again)
-  loadLastTimeEntry();
+  // Now load last time entry (will validate day cycle again); await so we show correct day/session
+  await loadLastTimeEntry();
   
   // Start daily reset check
   startDailyResetCheck();
@@ -2109,7 +2147,7 @@ async function loadLastTimeEntry() {
   }
 
   // Load from local storage first (offline data)
-  // BUT validate it's for the correct day cycle BEFORE using it
+  // BUT validate it's for the correct day cycle AND that stored timeEntryId belongs to this day
   const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
   let localDuration = 0;
   let localTimeEntryId = null;
@@ -2119,7 +2157,6 @@ async function loadLastTimeEntry() {
     // Check if the stored dateString matches current day cycle
     if (localData.dateString && localData.dateString === currentDayCycle.dateString) {
       // Additional validation: Check if data is too old (more than 24 hours)
-      // This prevents using stale data after forced shutdowns
       const now = new Date();
       const dataAge = localData.lastUpdated ? (now.getTime() - localData.lastUpdated) : Infinity;
       const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
@@ -2132,8 +2169,45 @@ async function loadLastTimeEntry() {
         clearLocalStorage(currentUser.id, currentDayCycle.dateString);
         localDuration = 0;
         localTimeEntryId = null;
+      } else if (localData.timeEntryId && isOnline) {
+        // Stored timeEntryId may be from a previous bug (e.g. yesterday's entry saved under today's date).
+        // Validate that this entry actually started in the current day cycle; if not, discard local data.
+        try {
+          const { data: entry, error } = await supabase
+            .from('time_entries')
+            .select('start_time')
+            .eq('id', localData.timeEntryId)
+            .eq('user_id', profile.id)
+            .single();
+          if (error || !entry || !entry.start_time) {
+            clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+            localDuration = 0;
+            localTimeEntryId = null;
+          } else {
+            const entryStartMs = new Date(entry.start_time).getTime();
+            const cycleStartMs = currentDayCycle.start.getTime();
+            const cycleEndMs = currentDayCycle.end.getTime();
+            if (entryStartMs < cycleStartMs || entryStartMs > cycleEndMs) {
+              console.warn('⚠️ Local storage timeEntryId is from a different day (wrong session), clearing:', {
+                entryStart: entry.start_time,
+                dateString: currentDayCycle.dateString
+              });
+              clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+              localDuration = 0;
+              localTimeEntryId = null;
+            } else {
+              localDuration = localData.duration || 0;
+              localTimeEntryId = localData.timeEntryId || null;
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Could not validate local storage timeEntryId, discarding local data:', e.message);
+          clearLocalStorage(currentUser.id, currentDayCycle.dateString);
+          localDuration = 0;
+          localTimeEntryId = null;
+        }
       } else {
-        // Data is valid for current day cycle and not too old
+        // No timeEntryId in local, or offline - use as-is (dateString already matches)
         localDuration = localData.duration || 0;
         localTimeEntryId = localData.timeEntryId || null;
       }
@@ -2155,12 +2229,12 @@ async function loadLastTimeEntry() {
   
   if (isOnline) {
     try {
-      // Query for entries that fall within the current day cycle
-      // Check both start_time and updated_at to catch all entries for this cycle
+      // Only load entries that STARTED in the current day cycle (one session per calendar day).
+      // Do NOT query by updated_at: the previous day's entry gets updated at day change, so its
+      // updated_at would be in the new day and we'd wrongly reuse it (old time, no new DB entry).
       const cycleStartISO = currentDayCycle.start.toISOString();
       const cycleEndISO = currentDayCycle.end.toISOString();
-      
-      // First, try to find entries where start_time is within the cycle
+
       const { data: timeEntriesByStart, error: error1 } = await supabase
         .from('time_entries')
         .select('id, user_id, start_time, end_time, duration, created_at, updated_at')
@@ -2170,54 +2244,31 @@ async function loadLastTimeEntry() {
         .order('updated_at', { ascending: false })
         .limit(10);
 
-      // Also check entries that were updated during this cycle
-      // This catches entries that might have been started earlier but are being tracked in this cycle
-      const { data: timeEntriesByUpdate, error: error2 } = await supabase
-        .from('time_entries')
-        .select('id, user_id, start_time, end_time, duration, created_at, updated_at')
-        .eq('user_id', profile.id)
-        .gte('updated_at', cycleStartISO)
-        .lte('updated_at', cycleEndISO)
-        .order('updated_at', { ascending: false })
-        .limit(10);
-
-      // Combine and deduplicate entries
-      const allEntries = [];
-      const entryIds = new Set();
-      
-      if (!error1 && timeEntriesByStart) {
-        timeEntriesByStart.forEach(entry => {
-          if (!entryIds.has(entry.id)) {
-            entryIds.add(entry.id);
-            allEntries.push(entry);
-          }
-        });
-      }
-      
-      if (!error2 && timeEntriesByUpdate) {
-        timeEntriesByUpdate.forEach(entry => {
-          if (!entryIds.has(entry.id)) {
-            entryIds.add(entry.id);
-            allEntries.push(entry);
-          }
-        });
-      }
+      const allEntries = timeEntriesByStart || [];
 
       if (allEntries.length > 0) {
-        // Sort by updated_at descending to get the most recent
-        allEntries.sort((a, b) => {
-          const aTime = new Date(a.updated_at || a.created_at).getTime();
-          const bTime = new Date(b.updated_at || b.created_at).getTime();
-          return bTime - aTime;
-        });
-        
-        // Use the most recent entry for this cycle
+        // Use the most recent entry that started in this cycle
         const matchingEntry = allEntries[0];
-        remoteDuration = matchingEntry.duration || 0;
-        remoteTimeEntryId = matchingEntry.id;
+        // Defensive: only use entry if start_time is actually inside current day cycle (handles timezone/DB quirks)
+        const entryStart = matchingEntry.start_time ? new Date(matchingEntry.start_time).getTime() : 0;
+        const cycleStartMs = currentDayCycle.start.getTime();
+        const cycleEndMs = currentDayCycle.end.getTime();
+        if (entryStart < cycleStartMs || entryStart > cycleEndMs) {
+          console.warn('⚠️ Ignoring entry that is outside current day cycle (wrong day):', {
+            entryStart: matchingEntry.start_time,
+            cycleStart: cycleStartISO,
+            cycleEnd: cycleEndISO,
+            dateString: currentDayCycle.dateString
+          });
+          remoteDuration = 0;
+          remoteTimeEntryId = null;
+        } else {
+          remoteDuration = matchingEntry.duration || 0;
+          remoteTimeEntryId = matchingEntry.id;
+        }
         
-        // Restore project from project_time_entries if it exists
-        if (isOnline && matchingEntry.id) {
+        if (remoteTimeEntryId && isOnline) {
+          // Restore project from project_time_entries if it exists
           const { data: projectLink } = await supabase
             .from('project_time_entries')
             .select('project_id')
@@ -2231,7 +2282,6 @@ async function loadLastTimeEntry() {
             }
             await loadTasks(projectLink.project_id);
             
-            // Try to get task from project
             const { data: projectData } = await supabase
               .from('projects')
               .select('task_id')
@@ -2246,22 +2296,21 @@ async function loadLastTimeEntry() {
               updateTaskDisplay();
             }
           }
+
+          console.log('✅ Loaded time entry for current cycle:', {
+            id: matchingEntry.id,
+            duration: remoteDuration,
+            durationFormatted: formatDurationFromSeconds(remoteDuration),
+            start_time: matchingEntry.start_time,
+            updated_at: matchingEntry.updated_at,
+            cycle_start: cycleStartISO,
+            cycle_end: cycleEndISO,
+            cycle_date: currentDayCycle.dateString
+          });
         }
-        
-        console.log('✅ Loaded time entry for current cycle:', {
-          id: matchingEntry.id,
-          duration: remoteDuration,
-          durationFormatted: formatDurationFromSeconds(remoteDuration),
-          start_time: matchingEntry.start_time,
-          updated_at: matchingEntry.updated_at,
-          cycle_start: cycleStartISO,
-          cycle_end: cycleEndISO,
-          cycle_date: currentDayCycle.dateString
-        });
       } else {
         console.log('ℹ️ No time entry found for current day cycle:', currentDayCycle.dateString);
         if (error1) console.error('Error querying by start_time:', error1);
-        if (error2) console.error('Error querying by updated_at:', error2);
       }
     } catch (error) {
       console.error('❌ Error fetching time entries:', error);
@@ -4339,8 +4388,7 @@ async function syncCurrentDuration() {
 }
 
 function startDailyResetCheck() {
-  // Performance optimization: Check every 60 seconds (reduced from 30 seconds)
-  // 6 AM threshold check doesn't need to be as frequent
+
   dailyResetCheckInterval = setInterval(async () => {
     if (!currentUser) return;
 
@@ -4350,14 +4398,15 @@ function startDailyResetCheck() {
     const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
     
     if (dayCycleChanged) {
-      // New day cycle detected - reset everything
-      console.log('🔄 New day cycle detected at 6 AM - resetting tracking:', {
+      // New day detected - stop current tracking (saves to old day's session), then reset for new day
+      const wasTracking = isTracking;
+      console.log('🔄 New day detected (date change) - resetting tracking:', {
         old: currentDayCycle ? currentDayCycle.dateString : 'null',
-        new: newDayCycle.dateString
+        new: newDayCycle.dateString,
+        wasTracking
       });
       
-      // Stop tracking if active
-      if (isTracking) {
+      if (wasTracking) {
         console.log('Stopping active tracking due to day cycle change');
         await stopTracking();
       }
@@ -4381,13 +4430,19 @@ function startDailyResetCheck() {
       updateDayCycleDisplay();
       updateTimerDisplay(0);
       
-      // Show notification
-      if (!isTracking) {
+      if (!wasTracking) {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
+      } else if (selectedProjectId && selectedTaskId) {
+        // Auto-start tracker for the new day so user doesn't have to click Start again
+        console.log('🔄 Auto-starting tracker for new day');
+        await startTracking();
+        console.log('✅ Day cycle reset complete - auto-started for new day');
+      } else {
+        statusDisplay.textContent = 'Not Tracking';
+        statusDisplay.classList.remove('tracking');
+        console.log('✅ Day cycle reset complete - timer reset to 00:00:00 (project/task not selected, not auto-starting)');
       }
-      
-      console.log('✅ Day cycle reset complete - timer reset to 00:00:00');
     }
   }, 60000); // Optimized: Check every 60 seconds (reduced from 30 seconds for better performance)
 }
