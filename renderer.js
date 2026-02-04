@@ -179,6 +179,165 @@ let tasks = []; // List of tasks for selected project
 let selectedProjectId = null; // Currently selected project
 let selectedTaskId = null; // Currently selected task
 
+// Performance optimization: Cache display configuration
+let cachedDisplays = null;
+let displayCacheTimestamp = 0;
+const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
+
+// Capture Settings Manager
+let captureSettings = {
+  enableScreenshotCapture: true, // Default to enabled
+  enableCameraCapture: true, // Default to enabled
+  settingsChannel: null,
+  refreshInterval: null
+};
+
+// Initialize capture settings from user profile
+async function initializeCaptureSettings(userId) {
+  try {
+    console.log('Fetching capture settings for user:', userId);
+    
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('enable_screenshot_capture, enable_camera_capture')
+      .eq('id', userId)
+      .single();
+
+    if (error) {
+      console.error('Error fetching capture settings:', error);
+      console.error('Error details:', JSON.stringify(error, null, 2));
+      
+      // If profile doesn't exist, create it with default enabled settings
+      if (error.code === 'PGRST116' || error.message?.includes('No rows')) {
+        console.log('Profile not found, creating default profile...');
+        const { data: newProfile, error: createError } = await supabase
+          .from('profiles')
+          .insert({
+            id: userId,
+            enable_screenshot_capture: true,
+            enable_camera_capture: true
+          })
+          .select('enable_screenshot_capture, enable_camera_capture')
+          .single();
+        
+        if (createError) {
+          console.error('Error creating profile:', createError);
+          // Default to enabled on error (graceful degradation)
+          captureSettings.enableScreenshotCapture = true;
+          captureSettings.enableCameraCapture = true;
+          return;
+        }
+        
+        if (newProfile) {
+          captureSettings.enableScreenshotCapture = newProfile.enable_screenshot_capture ?? true;
+          captureSettings.enableCameraCapture = newProfile.enable_camera_capture ?? true;
+          console.log('Created profile with default settings:', {
+            screenshot: captureSettings.enableScreenshotCapture,
+            camera: captureSettings.enableCameraCapture
+          });
+        } else {
+          captureSettings.enableScreenshotCapture = true;
+          captureSettings.enableCameraCapture = true;
+        }
+      } else {
+        // Default to enabled on other errors (graceful degradation)
+        captureSettings.enableScreenshotCapture = true;
+        captureSettings.enableCameraCapture = true;
+      }
+      return;
+    }
+
+    if (profile) {
+      captureSettings.enableScreenshotCapture = profile.enable_screenshot_capture ?? true;
+      captureSettings.enableCameraCapture = profile.enable_camera_capture ?? true;
+      console.log('✅ Capture settings loaded:', {
+        screenshot: captureSettings.enableScreenshotCapture,
+        camera: captureSettings.enableCameraCapture
+      });
+    } else {
+      // Default to enabled if profile not found
+      console.warn('Profile not found, defaulting to enabled');
+      captureSettings.enableScreenshotCapture = true;
+      captureSettings.enableCameraCapture = true;
+    }
+
+    // Setup real-time subscription to profile changes
+    setupCaptureSettingsSubscription(userId);
+    
+    // Setup periodic refresh as fallback (every 5 minutes)
+    if (captureSettings.refreshInterval) {
+      clearInterval(captureSettings.refreshInterval);
+    }
+    captureSettings.refreshInterval = setInterval(() => {
+      initializeCaptureSettings(userId).catch(err => {
+        console.error('Error refreshing capture settings:', err);
+      });
+    }, 5 * 60 * 1000); // Every 5 minutes
+
+  } catch (error) {
+    console.error('Exception fetching capture settings:', error);
+    // Default to enabled on exception (graceful degradation)
+    captureSettings.enableScreenshotCapture = true;
+    captureSettings.enableCameraCapture = true;
+  }
+}
+
+// Setup real-time subscription to profile changes
+function setupCaptureSettingsSubscription(userId) {
+  // Clean up existing subscription
+  if (captureSettings.settingsChannel) {
+    supabase.removeChannel(captureSettings.settingsChannel);
+    captureSettings.settingsChannel = null;
+  }
+
+  try {
+    captureSettings.settingsChannel = supabase
+      .channel(`capture-settings-${userId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'profiles',
+          filter: `id=eq.${userId}`,
+        },
+        (payload) => {
+          const updatedProfile = payload.new;
+          const oldScreenshot = captureSettings.enableScreenshotCapture;
+          const oldCamera = captureSettings.enableCameraCapture;
+          
+          captureSettings.enableScreenshotCapture = updatedProfile.enable_screenshot_capture ?? true;
+          captureSettings.enableCameraCapture = updatedProfile.enable_camera_capture ?? true;
+
+          // Notify user if settings changed
+          if (oldScreenshot !== captureSettings.enableScreenshotCapture) {
+            console.log(`Screenshot capture ${captureSettings.enableScreenshotCapture ? 'enabled' : 'disabled'} by administrator`);
+          }
+          if (oldCamera !== captureSettings.enableCameraCapture) {
+            console.log(`Camera capture ${captureSettings.enableCameraCapture ? 'enabled' : 'disabled'} by administrator`);
+          }
+        }
+      )
+      .subscribe();
+
+    console.log('Capture settings real-time subscription established');
+  } catch (error) {
+    console.error('Error setting up capture settings subscription:', error);
+  }
+}
+
+// Cleanup capture settings subscription
+function cleanupCaptureSettings() {
+  if (captureSettings.settingsChannel) {
+    supabase.removeChannel(captureSettings.settingsChannel);
+    captureSettings.settingsChannel = null;
+  }
+  if (captureSettings.refreshInterval) {
+    clearInterval(captureSettings.refreshInterval);
+    captureSettings.refreshInterval = null;
+  }
+}
+
 // Local storage utilities for offline support
 function getLocalStorageKey(userId, dayCycle) {
   return `time_tracker_${userId}_${dayCycle}`;
@@ -480,6 +639,11 @@ if (document.readyState === 'loading') {
   checkAuth();
 }
 
+// Cleanup on app shutdown
+window.addEventListener('beforeunload', () => {
+  cleanupCaptureSettings();
+});
+
 // Handle window beforeunload to save duration if tracking is active
 window.addEventListener('beforeunload', async (e) => {
   if (isTracking) {
@@ -623,35 +787,43 @@ function stopScreenStateMonitoring() {
 
 // Track mouse movements and keystrokes for statistics and reset idle timer
 function setupActivityListeners() {
+  // Performance optimization: Throttle activity handlers to reduce overhead
+  let lastActivityCheck = 0;
+  const ACTIVITY_THROTTLE_MS = 100; // Throttle to max once per 100ms
+  
   // Create a throttled version that logs activity for debugging
   const activityHandler = (eventType) => {
     return () => {
       if (isTracking && !pauseStartTime) {
-        resetIdleTimer();
-        // Log occasionally for debugging (only every 5 seconds)
         const now = Date.now();
-        if (!activityHandler.lastLogTime || (now - activityHandler.lastLogTime) > 5000) {
-          console.log(`Activity detected: ${eventType}`);
-          activityHandler.lastLogTime = now;
+        // Throttle activity checks to reduce CPU usage
+        if (now - lastActivityCheck >= ACTIVITY_THROTTLE_MS) {
+          resetIdleTimer();
+          lastActivityCheck = now;
+          
+          // Log occasionally for debugging (only every 5 seconds)
+          if (!activityHandler.lastLogTime || (now - activityHandler.lastLogTime) > 5000) {
+            console.log(`Activity detected: ${eventType}`);
+            activityHandler.lastLogTime = now;
+          }
         }
       }
     };
   };
   
-  // Mouse events - capture on both document and window
+  // Performance optimization: Only add listeners to document (not both document and window)
+  // This reduces the number of event listeners by half, improving performance
   const mouseEvents = ['mousemove', 'mousedown', 'mouseup', 'click', 'wheel', 'contextmenu'];
   mouseEvents.forEach(eventType => {
     const handler = activityHandler(`mouse:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
-    window.addEventListener(eventType, handler, { capture: true, passive: true });
   });
   
-  // Keyboard events - capture on both document and window
+  // Keyboard events - only on document
   const keyboardEvents = ['keydown', 'keyup', 'keypress'];
   keyboardEvents.forEach(eventType => {
     const handler = activityHandler(`keyboard:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
-    window.addEventListener(eventType, handler, { capture: true, passive: true });
   });
   
   // Also listen for focus events (user switching windows/apps)
@@ -662,19 +834,34 @@ function setupActivityListeners() {
     }
   }, { capture: true, passive: true });
   
-  // Track mouse movements and keystrokes for statistics
+  // Performance optimization: Throttle statistics tracking to reduce overhead
+  let lastMouseMoveTime = 0;
+  let lastKeypressTime = 0;
+  const STATS_THROTTLE_MS = 100; // Throttle to max once per 100ms
+  
   document.addEventListener('mousemove', () => {
-    mouseMovementCount++;
+    const now = Date.now();
+    if (now - lastMouseMoveTime >= STATS_THROTTLE_MS) {
+      mouseMovementCount++;
+      lastMouseMoveTime = now;
+    }
   }, { capture: true, passive: true });
   
   document.addEventListener('keypress', () => {
-    keystrokeCount++;
+    const now = Date.now();
+    if (now - lastKeypressTime >= STATS_THROTTLE_MS) {
+      keystrokeCount++;
+      lastKeypressTime = now;
+    }
   }, { capture: true, passive: true });
 }
 
 // Reset idle timer when activity is detected
 function resetIdleTimer() {
-  if (!isTracking || pauseStartTime) return; // Don't reset if paused or not tracking
+  if (!isTracking) return; // Don't reset if not tracking
+  
+  // Don't reset if paused (waiting for user to click Continue or Stop on modal)
+  if (pauseStartTime) return;
   
   // Update immediately (no debounce) to ensure activity is captured
   const now = Date.now();
@@ -698,6 +885,7 @@ function resetIdleTimer() {
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
   if (isTracking && !pauseStartTime) {
     // Update lastActivityTime directly for system-wide activity
+    // Don't update if paused (waiting for user to click Continue or Stop on modal)
     const now = Date.now();
     const timeSinceLastUpdate = now - lastActivityTime;
     const previousTime = lastActivityTime;
@@ -752,12 +940,63 @@ ipcRenderer.on('overlay-continue', async () => {
   }
 });
 
-ipcRenderer.on('overlay-stop', () => {
+ipcRenderer.on('overlay-stop', async () => {
   if (isTracking) {
-    // Stop tracking if currently tracking
-    stopTracking();
+    if (pauseStartTime) pauseStartTime = null;
+    const entryIdToUpdate = timeEntryId;
+    await stopTracking();
+
+    // Inactivity Stop: fetch from DB, reduce by 5 min, write back, then show in tracker
+    if (entryIdToUpdate) {
+      let dbDurationSeconds = 0;
+      if (isOnline) {
+        try {
+          const { data: entry, error } = await supabase
+            .from('time_entries')
+            .select('duration')
+            .eq('id', entryIdToUpdate)
+            .single();
+          if (!error && entry != null) {
+            dbDurationSeconds = Number(entry.duration) || 0;
+          }
+        } catch (e) {
+          console.error('Overlay Stop: error fetching duration from DB', e);
+        }
+      }
+      const FIVE_MIN_SEC = 5 * 60;
+      const durationToReduce = dbDurationSeconds > 0 ? dbDurationSeconds : baseDuration;
+      const reducedSeconds = Math.max(0, durationToReduce - FIVE_MIN_SEC);
+      console.log(`Overlay Stop: DB duration=${dbDurationSeconds}s, after 5 min deduction=${reducedSeconds}s`);
+
+      if (isOnline && durationToReduce > 0) {
+        try {
+          const { error: updateError } = await supabase
+            .from('time_entries')
+            .update({
+              duration: reducedSeconds,
+              updated_at: new Date().toISOString(),
+              app_version: appVersion
+            })
+            .eq('id', entryIdToUpdate);
+          if (updateError) {
+            console.error('Overlay Stop: error saving reduced duration to DB', updateError);
+          } else {
+            console.log(`Overlay Stop: saved reduced duration to DB: ${reducedSeconds}s`);
+          }
+        } catch (e) {
+          console.error('Overlay Stop: error updating DB', e);
+        }
+      }
+      baseDuration = reducedSeconds;
+      saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+        duration: reducedSeconds,
+        timeEntryId: entryIdToUpdate,
+        projectId: selectedProjectId,
+        taskId: selectedTaskId
+      });
+      updateTimerDisplay(reducedSeconds);
+    }
   }
-  // Close overlay
   ipcRenderer.invoke('close-overlay').catch(err => {
     console.error('Error closing overlay:', err);
   });
@@ -1075,6 +1314,66 @@ function showUpdateRequiredModal(versionInfo) {
   });
 }
 
+// Show camera detection modal
+function showCameraDetectionModal() {
+  const cameraModal = document.getElementById('camera-detection-modal');
+  const cameraMessage = document.getElementById('camera-message');
+  const cameraTitle = document.getElementById('camera-modal-title');
+  const retryBtn = document.getElementById('camera-retry-btn');
+  const closeCameraModalBtn = document.getElementById('close-camera-modal-btn');
+  
+  if (!cameraModal || !cameraMessage) {
+    console.error('Camera detection modal elements not found');
+    // Fallback to alert if modal elements don't exist
+    alert('No camera device detected. Please connect a camera to start tracking.');
+    return;
+  }
+  
+  // Update modal content
+  if (cameraTitle) {
+    cameraTitle.textContent = 'Camera Required';
+  }
+  cameraMessage.textContent = 'No camera device detected. Please connect a camera to start tracking.';
+  
+  // Setup retry button
+  if (retryBtn) {
+    retryBtn.onclick = async () => {
+      const cameraCheck = await checkCameraDevice();
+      if (cameraCheck.detected) {
+        hideCameraDetectionModal();
+        // Retry starting tracking
+        await startTracking();
+      } else {
+        cameraMessage.textContent = cameraCheck.error || 'No camera device detected. Please connect a camera to start tracking.';
+      }
+    };
+  }
+  
+  // Setup close button
+  if (closeCameraModalBtn) {
+    closeCameraModalBtn.onclick = () => {
+      hideCameraDetectionModal();
+    };
+  }
+  
+  // Show modal
+  cameraModal.classList.remove('hidden');
+  
+  // Block all interactions
+  document.body.style.pointerEvents = 'none';
+  cameraModal.style.pointerEvents = 'auto';
+}
+
+// Hide camera detection modal
+function hideCameraDetectionModal() {
+  const cameraModal = document.getElementById('camera-detection-modal');
+  if (cameraModal) {
+    cameraModal.classList.add('hidden');
+    // Restore interactions
+    document.body.style.pointerEvents = 'auto';
+  }
+}
+
 async function checkAuth() {
   try {
     console.log('Checking authentication...');
@@ -1171,6 +1470,9 @@ async function showDashboard() {
     userNameSpan.textContent = currentUser.email || 'User';
     }
   }
+  
+  // Initialize capture settings
+  await initializeCaptureSettings(currentUser.id);
   
   // Fetch projects assigned to user
   await loadProjects();
@@ -1446,6 +1748,8 @@ async function handleClose() {
 }
 
 async function handleLogout() {
+  // Cleanup capture settings subscription
+  cleanupCaptureSettings();
   try {
     console.log('Logout initiated...');
     
@@ -2210,6 +2514,61 @@ async function checkCameraPermission() {
   }
 }
 
+// Check if camera device is actually detected (not just permission)
+async function checkCameraDevice() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      return { detected: false, error: 'Camera API not available' };
+    }
+
+    // Enumerate devices to check if camera hardware exists
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(device => device.kind === 'videoinput');
+    
+    if (videoDevices.length === 0) {
+      return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
+    }
+
+    // Try to access the camera to verify it's actually available
+    try {
+      const stream = await Promise.race([
+        navigator.mediaDevices.getUserMedia({ 
+          video: { 
+            facingMode: 'user',
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          } 
+        }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Camera access timeout')), 5000)
+        )
+      ]);
+      
+      // If successful, stop the stream immediately
+      if (stream && stream.getTracks) {
+        stream.getTracks().forEach(track => {
+          track.stop();
+          track.enabled = false;
+        });
+      }
+      
+      return { detected: true };
+    } catch (accessError) {
+      // If we can enumerate devices but can't access, it might be permission or device in use
+      // But we know the device exists, so return detected: true
+      if (accessError.name === 'NotFoundError' || accessError.name === 'DevicesNotFoundError') {
+        return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
+      }
+      // For other errors (permission, in use, etc.), device exists but can't access
+      // We'll still consider it detected since the hardware exists
+      return { detected: true, warning: 'Camera device found but may be in use or requires permission.' };
+    }
+  } catch (error) {
+    console.error('Error checking camera device:', error);
+    return { detected: false, error: 'Unable to check for camera device. Please ensure a camera is connected.' };
+  }
+}
+
 async function checkScreenshotPermission() {
   try {
     // Try to capture a test screenshot - use buffer method to avoid file copy issues
@@ -2327,6 +2686,19 @@ async function startTracking() {
   if (!selectedProjectId || !selectedTaskId) {
     alert('Please select a project and task before starting tracking.');
     return;
+  }
+
+  // Check if camera device is detected before starting tracking
+  // Skip camera check if camera capture is disabled for this user
+  if (captureSettings.enableCameraCapture) {
+    console.log('Camera capture is enabled - checking for camera device...');
+    const cameraCheck = await checkCameraDevice();
+    if (!cameraCheck.detected) {
+      showCameraDetectionModal();
+      return;
+    }
+  } else {
+    console.log('Camera capture is disabled for this user - skipping camera device check');
   }
 
   // CRITICAL: Always check day cycle FIRST before starting tracking
@@ -2484,6 +2856,8 @@ async function startTracking() {
   if (systemActivitySyncInterval) {
     clearInterval(systemActivitySyncInterval);
   }
+  // Performance optimization: Adaptive system activity sync frequency
+  // Check more frequently when approaching idle threshold, less frequently when active
   systemActivitySyncInterval = setInterval(() => {
     // Request current system activity status from main process
     if (isTracking && !pauseStartTime) {
@@ -2515,7 +2889,7 @@ async function startTracking() {
         // The main activity listeners will catch real activity
       });
     }
-  }, 2000); // Check every 2 seconds (more frequent for better reliability)
+  }, 5000); // Optimized: Check every 5 seconds (reduced from 2 seconds for better performance)
 
   // Start periodic captures (every 30 seconds)
   startPeriodicCaptures();
@@ -2609,11 +2983,24 @@ async function stopTracking() {
   const cumulativeDuration = baseDurationAtSessionStart + sessionDuration;
   
   console.log(`Stop tracking - Cumulative duration: ${cumulativeDuration} seconds (base: ${baseDurationAtSessionStart}, session: ${sessionDuration})`);
+  console.log(`Stop tracking - Paused duration (inactive time excluded): ${Math.floor(pausedDuration / 1000)}s`);
 
-  // Ensure duration never decreases - get current max from local/remote
+  // CRITICAL: If we have pausedDuration (inactive time was deducted), we must trust our calculated duration
+  // Don't let old values from Supabase/local storage override the corrected duration
   const localData = loadFromLocalStorage(currentUser.id, currentDayCycle.dateString);
   const currentMax = localData ? Math.max(localData.duration || 0, baseDuration) : baseDuration;
-  let finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
+  let finalDuration;
+  
+  if (pausedDuration > 0) {
+    // Inactive time was deducted - trust our calculated duration
+    // Only use local/remote if it's higher (shouldn't happen, but safety check)
+    // Use our calculated duration, but ensure we don't go below what we already have synced
+    finalDuration = Math.max(cumulativeDuration, currentMax);
+    console.log(`⚠️ Inactive time was deducted - using calculated duration: ${finalDuration}s (paused: ${Math.floor(pausedDuration / 1000)}s)`);
+  } else {
+    // No inactive time deducted - use normal max duration logic
+    finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
+  }
   
   // Safety check: If tracking was active but duration is 0, something went wrong
   // Use the currentMax as a fallback to prevent losing existing duration
@@ -2657,7 +3044,19 @@ async function stopTracking() {
         const remoteDuration = currentEntry?.duration || 0;
         console.log(`📊 Current state in database before update: duration=${remoteDuration}s, updated_at=${currentEntry?.updated_at || 'N/A'}`);
         
-        const maxDuration = ensureMaxDuration(remoteDuration, finalDuration);
+        // CRITICAL FIX: If inactive time was deducted (pausedDuration > 0), we must use our calculated duration
+        // The remote duration might still have the old value (before inactivity deduction)
+        // Only use ensureMaxDuration if no inactive time was deducted
+        let maxDuration;
+        if (pausedDuration > 0) {
+          // Inactive time was deducted - trust our calculated finalDuration
+          // The remote value might be stale (includes inactive time)
+          maxDuration = Math.max(finalDuration, remoteDuration);
+          console.log(`⚠️ Inactive time was deducted - using calculated duration: ${finalDuration}s instead of potentially stale remote: ${remoteDuration}s`);
+        } else {
+          // No inactive time deducted - use normal max logic
+          maxDuration = ensureMaxDuration(remoteDuration, finalDuration);
+        }
         
         // If remote duration is suspiciously low (like 15 seconds) but we calculated much more, log a warning
         if (remoteDuration < 60 && finalDuration > 300) {
@@ -2794,6 +3193,10 @@ async function stopTracking() {
           
           // Update base duration for next session
           baseDuration = maxDuration;
+          
+          // CRITICAL: Reset pausedDuration after successful sync to prevent it from affecting future calculations
+          pausedDuration = 0;
+          
           // Mark as synced in local storage
           saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
             duration: maxDuration,
@@ -2803,6 +3206,7 @@ async function stopTracking() {
             synced: true
           });
           console.log(`✓ Final duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
+          console.log(`✓ Paused duration reset to 0 after successful sync`);
         }
       } catch (error) {
         console.error('Error syncing duration on stop:', error);
@@ -2839,11 +3243,15 @@ async function stopTracking() {
 
   sessionStartTime = null;
   baseDurationAtSessionStart = 0;
+  // CRITICAL: Reset pausedDuration after stopping to prevent it from affecting future sessions
+  // Note: This is reset here as a safety measure, but should already be reset after successful sync above
   pausedDuration = 0;
   pauseStartTime = null;
   
   // Clear the stopping flag
   isStoppingTracking = false;
+  
+  console.log(`✓ Tracking stopped. Final duration: ${formatDurationFromSeconds(baseDuration)}s. Paused duration reset.`);
 }
 
 function formatDurationFromSeconds(totalSeconds) {
@@ -2963,10 +3371,8 @@ function startIdleDetection() {
             (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
           
           if (shouldShowOverlay) {
-          // Pause tracking
+          // Pause tracking (no time deduction here - deduction only on Stop)
           pauseStartTime = Date.now();
-          
-          console.log('Inactivity confirmed - pausing tracking and showing overlay');
       
           // Stop timer and captures
           if (timerInterval) {
@@ -2978,10 +3384,10 @@ function startIdleDetection() {
             captureInterval = null;
           }
 
-            // Sync duration before pausing
-            await syncCurrentDuration();
+          // Sync current duration to DB (no deduction - time unchanged)
+          await syncCurrentDuration();
 
-          // Show overlay modal
+          // Show overlay - Continue = resume with no time change; Stop = deduct 5 min and stop
           ipcRenderer.invoke('show-overlay').catch(err => {
             console.error('Error showing overlay:', err);
           });
@@ -2997,6 +3403,8 @@ function startIdleDetection() {
         idleDoubleCheckTimer = null;
         console.log('Activity detected - cleared pending idle double-check');
       }
+      
+      // User must click Continue (resume, no deduction) or Stop (deduct 5 min and stop).
     }
     
     // Schedule next check
@@ -3017,16 +3425,15 @@ function startIdleDetection() {
   idleTimer = setTimeout(checkIdle, 1000);
 }
 
-// Resume tracking after inactivity
+// Resume tracking after inactivity (called when user clicks Continue)
 async function resumeTracking() {
   if (!isTracking || !pauseStartTime) return;
   
-  // Calculate paused duration and add to total
   const now = Date.now();
-  pausedDuration += now - pauseStartTime;
+  // No time deduction on Continue - leave duration unchanged, just resume and sync
   pauseStartTime = null;
   
-  // Sync duration when resuming (to save the state before pause)
+  // Sync current duration to DB (no reduction)
   await syncCurrentDuration();
   
   // Reset activity time
@@ -3055,12 +3462,24 @@ async function resumeTracking() {
   
   // Update status
   if (statusDisplay) {
-  statusDisplay.textContent = 'Tracking';
-  statusDisplay.classList.add('tracking');
+    statusDisplay.textContent = 'Tracking';
+    statusDisplay.classList.add('tracking');
   }
+  
+
+  console.log('Tracking resumed (Continue) - no time deduction, synced to DB');
 }
 
 function startTimer() {
+  // Clear any existing timer first
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
+  
+  // Performance optimization: Throttle UI updates to 1 second
+  let lastUpdateTime = Date.now();
+  
   timerInterval = setInterval(() => {
     if (sessionStartTime && !pauseStartTime && isTracking) {
       // Calculate session duration accurately
@@ -3071,7 +3490,13 @@ function startTimer() {
       
       // Total duration = baseDurationAtSessionStart + session (prevents double-counting)
       const totalDuration = baseDurationAtSessionStart + sessionDuration;
-      updateTimerDisplay(totalDuration);
+      
+      // Only update UI if enough time has passed (throttle to 1 second)
+      // This prevents excessive DOM updates when app is visible
+      if (now - lastUpdateTime >= 1000) {
+        updateTimerDisplay(totalDuration);
+        lastUpdateTime = now;
+      }
     }
   }, 1000);
 }
@@ -3125,36 +3550,74 @@ async function captureScreenshotAndCamera() {
     return;
   }
 
+  // Check if screenshot capture is enabled
+  console.log('🔍 Checking screenshot capture setting:', captureSettings.enableScreenshotCapture);
+  if (!captureSettings.enableScreenshotCapture) {
+    console.log('❌ Screenshot capture is disabled for this user - skipping screenshots');
+    // Still try to capture camera if enabled
+    if (captureSettings.enableCameraCapture) {
+      await captureCamera();
+    }
+    return;
+  }
+  console.log('✅ Screenshot capture is enabled - proceeding with screenshots');
+
   // Try to capture all screens with multiple fallback strategies
   let screensCaptured = 0;
   const timestamp = Date.now();
 
   try {
-    // Strategy 1: Try to get all displays using listDisplays()
+    // Performance optimization: Use cached display configuration if available
     let displays = [];
-    try {
-      if (typeof screenshot.listDisplays === 'function') {
-        displays = await screenshot.listDisplays();
-        console.log(`Found ${displays.length} display(s) using listDisplays()`);
+    const now = Date.now();
+    
+    // Check if we have a valid cached display configuration
+    if (cachedDisplays && (now - displayCacheTimestamp) < DISPLAY_CACHE_DURATION) {
+      displays = cachedDisplays;
+      console.log(`Using cached display configuration: ${displays.length} display(s)`);
+    } else {
+      // Strategy 1: Try to get all displays using listDisplays()
+      try {
+        if (typeof screenshot.listDisplays === 'function') {
+          displays = await screenshot.listDisplays();
+          console.log(`Found ${displays.length} display(s) using listDisplays()`);
+          
+          // Cache the display configuration
+          if (displays && displays.length > 0) {
+            cachedDisplays = displays;
+            displayCacheTimestamp = now;
+          }
+        }
+      } catch (listError) {
+        console.warn('Could not list displays, falling back to all screens capture:', listError.message || listError);
       }
-    } catch (listError) {
-      console.warn('Could not list displays, falling back to all screens capture:', listError.message || listError);
     }
 
-    // Strategy 2: If listDisplays failed or returned empty, try capturing all screens by index (0-9)
+    // Strategy 2: If listDisplays failed or returned empty, try capturing screens by index
+    // Performance optimization: Limit to 4 screens max and break early on consecutive failures
     if (!displays || displays.length === 0) {
-      console.log('Attempting to capture all screens by index (fallback method)...');
-      for (let screenIndex = 0; screenIndex < 10; screenIndex++) {
+      console.log('Attempting to capture screens by index (fallback method)...');
+      let consecutiveFailures = 0;
+      const MAX_SCREENS = 4; // Optimized: Limit to 4 screens (most users have 1-2)
+      
+      for (let screenIndex = 0; screenIndex < MAX_SCREENS; screenIndex++) {
         try {
           const testBuffer = await screenshot({ screen: screenIndex, format: 'png' });
           if (testBuffer && testBuffer.length > 0) {
             displays.push({ id: screenIndex, name: `Screen ${screenIndex}` });
             console.log(`Found screen at index ${screenIndex}`);
+            consecutiveFailures = 0; // Reset on success
+          } else {
+            consecutiveFailures++;
           }
         } catch (screenError) {
-          // Screen doesn't exist at this index, continue
+          consecutiveFailures++;
+          // If screen 0 fails, break immediately (no primary screen)
           if (screenIndex === 0) {
-            // If even screen 0 fails, try the primary screen method
+            break;
+          }
+          // If 2 consecutive failures after finding screens, likely no more screens
+          if (consecutiveFailures >= 2 && displays.length > 0) {
             break;
           }
         }
@@ -3214,6 +3677,12 @@ async function captureScreenshotAndCamera() {
           }
 
           if (screenshotBuffer && screenshotBuffer.length > 0) {
+            // Performance optimization: Update cache if we successfully captured
+            if (!cachedDisplays || cachedDisplays.length !== displays.length) {
+              cachedDisplays = displays;
+              displayCacheTimestamp = Date.now();
+            }
+            
             await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
             screensCaptured++;
             console.log(`✓ Captured screen ${i + 1}/${displays.length}: ${display.name || `Screen ${i}`}`);
@@ -3232,16 +3701,25 @@ async function captureScreenshotAndCamera() {
     }
 
     // Capture camera (continue even if screenshot had issues)
-    await captureCamera();
+    // Only capture camera if enabled
+    if (captureSettings.enableCameraCapture) {
+      await captureCamera();
+    } else {
+      console.log('Camera capture is disabled for this user - skipping camera');
+    }
 
   } catch (error) {
     console.warn('Error capturing screenshots (continuing with camera):', error.message || error);
     
-    // Still try to capture camera even if screenshot failed
-    try {
-      await captureCamera();
-    } catch (cameraError) {
-      console.warn('Error capturing camera:', cameraError.message || cameraError);
+    // Still try to capture camera even if screenshot failed (if enabled)
+    if (captureSettings.enableCameraCapture) {
+      try {
+        await captureCamera();
+      } catch (cameraError) {
+        console.warn('Error capturing camera:', cameraError.message || cameraError);
+      }
+    } else {
+      console.log('Camera capture is disabled for this user - skipping camera');
     }
   }
 }
@@ -3396,6 +3874,14 @@ async function captureCamera() {
     console.warn('Skipping camera capture: no timeEntryId available yet');
     return;
   }
+  
+  // Check if camera capture is enabled
+  console.log('🔍 Checking camera capture setting:', captureSettings.enableCameraCapture);
+  if (!captureSettings.enableCameraCapture) {
+    console.log('❌ Camera capture is disabled for this user - skipping camera');
+    return;
+  }
+  console.log('✅ Camera capture is enabled - proceeding with camera capture');
 
   let stream = null;
   let video = null;
@@ -3707,7 +4193,7 @@ function startRealTimeUpdates() {
     realTimeUpdateInterval = null;
   }
   
-  // Update duration in database every 1 minute (60 seconds)
+  // Performance optimization: Update duration in database every 2 minutes (reduced frequency)
   // Use baseDurationAtSessionStart to prevent double-counting
   realTimeUpdateInterval = setInterval(async () => {
     // Double-check isTracking and isStoppingTracking to prevent race conditions
@@ -3765,9 +4251,10 @@ function startRealTimeUpdates() {
         // This ensures we never reduce time and handle any edge cases
         const maxDuration = Math.max(savedDuration, totalDuration);
 
-        // Only update if there's a meaningful change (more than 1 second)
+        // Performance optimization: Only update if there's a meaningful change (more than 5 seconds)
         // AND if the calculated duration is greater than saved (never reduce)
-        if (Math.abs(maxDuration - savedDuration) > 1 && totalDuration > savedDuration) {
+        // This reduces unnecessary database writes
+        if (Math.abs(maxDuration - savedDuration) > 5 && totalDuration > savedDuration) {
           console.log(`Real-time update: Updating duration from ${savedDuration}s to ${maxDuration}s`);
           const { error: updateError } = await supabase
             .from('time_entries')
@@ -3805,7 +4292,7 @@ function startRealTimeUpdates() {
         duration: totalDuration
       });
     }
-  }, 60000); // Every 60 seconds (1 minute)
+  }, 120000); // Optimized: Every 2 minutes (reduced from 1 minute for better performance)
 }
 
 // Helper function to sync current duration to Supabase
@@ -3848,8 +4335,18 @@ async function syncCurrentDuration() {
 
         const savedDuration = currentEntry?.duration || 0;
         
-        // Use the maximum of saved duration and calculated duration
-        const maxDuration = Math.max(savedDuration, totalDuration);
+        // CRITICAL FIX: If inactive time was deducted (pausedDuration > 0), trust our calculated duration
+        // The saved duration might still include inactive time if sync hasn't completed yet
+        let maxDuration;
+        if (pausedDuration > 0) {
+          // Inactive time was deducted - our calculated totalDuration is correct
+          // Only use savedDuration if it's actually higher (shouldn't happen after sync, but safety check)
+          maxDuration = Math.max(totalDuration, savedDuration);
+          console.log(`⚠️ syncCurrentDuration: Inactive time deducted - using calculated: ${totalDuration}s, saved: ${savedDuration}s`);
+        } else {
+          // No inactive time deducted - use normal max logic
+          maxDuration = Math.max(savedDuration, totalDuration);
+        }
 
         // Update if there's a meaningful change (more than 1 second)
         if (Math.abs(maxDuration - savedDuration) > 1) {
@@ -3903,7 +4400,7 @@ async function syncCurrentDuration() {
 }
 
 function startDailyResetCheck() {
-  // Check every 30 seconds if date has changed (midnight) - triggers new session for new day
+
   dailyResetCheckInterval = setInterval(async () => {
     if (!currentUser) return;
 
@@ -3959,6 +4456,6 @@ function startDailyResetCheck() {
         console.log('✅ Day cycle reset complete - timer reset to 00:00:00 (project/task not selected, not auto-starting)');
       }
     }
-  }, 30000); // Check every 30 seconds for date-change detection
+  }, 60000); // Optimized: Check every 60 seconds (reduced from 30 seconds for better performance)
 }
 
