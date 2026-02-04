@@ -942,28 +942,61 @@ ipcRenderer.on('overlay-continue', async () => {
 
 ipcRenderer.on('overlay-stop', async () => {
   if (isTracking) {
-    // If tracking was paused due to inactivity, ensure inactive time is deducted before stopping
-    if (pauseStartTime) {
-      const now = Date.now();
-      const additionalPausedTime = now - pauseStartTime;
-      
-      // Add any additional paused time (if user was inactive longer than the initial 5 minutes)
-      if (additionalPausedTime > 0) {
-        pausedDuration += additionalPausedTime;
-        console.log(`Adding additional paused time before stop: ${Math.floor(additionalPausedTime / 1000)}s`);
+    if (pauseStartTime) pauseStartTime = null;
+    const entryIdToUpdate = timeEntryId;
+    await stopTracking();
+
+    // Inactivity Stop: fetch from DB, reduce by 5 min, write back, then show in tracker
+    if (entryIdToUpdate) {
+      let dbDurationSeconds = 0;
+      if (isOnline) {
+        try {
+          const { data: entry, error } = await supabase
+            .from('time_entries')
+            .select('duration')
+            .eq('id', entryIdToUpdate)
+            .single();
+          if (!error && entry != null) {
+            dbDurationSeconds = Number(entry.duration) || 0;
+          }
+        } catch (e) {
+          console.error('Overlay Stop: error fetching duration from DB', e);
+        }
       }
-      
-      // Sync duration to ensure inactive time is saved before stopping
-      await syncCurrentDuration();
-      
-      pauseStartTime = null;
-      console.log(`Stopping tracking after inactivity. Total inactive time excluded: ${Math.floor(pausedDuration / 1000)}s (${Math.floor(pausedDuration / 60000)} minutes)`);
+      const FIVE_MIN_SEC = 5 * 60;
+      const durationToReduce = dbDurationSeconds > 0 ? dbDurationSeconds : baseDuration;
+      const reducedSeconds = Math.max(0, durationToReduce - FIVE_MIN_SEC);
+      console.log(`Overlay Stop: DB duration=${dbDurationSeconds}s, after 5 min deduction=${reducedSeconds}s`);
+
+      if (isOnline && durationToReduce > 0) {
+        try {
+          const { error: updateError } = await supabase
+            .from('time_entries')
+            .update({
+              duration: reducedSeconds,
+              updated_at: new Date().toISOString(),
+              app_version: appVersion
+            })
+            .eq('id', entryIdToUpdate);
+          if (updateError) {
+            console.error('Overlay Stop: error saving reduced duration to DB', updateError);
+          } else {
+            console.log(`Overlay Stop: saved reduced duration to DB: ${reducedSeconds}s`);
+          }
+        } catch (e) {
+          console.error('Overlay Stop: error updating DB', e);
+        }
+      }
+      baseDuration = reducedSeconds;
+      saveToLocalStorage(currentUser.id, currentDayCycle.dateString, {
+        duration: reducedSeconds,
+        timeEntryId: entryIdToUpdate,
+        projectId: selectedProjectId,
+        taskId: selectedTaskId
+      });
+      updateTimerDisplay(reducedSeconds);
     }
-    
-    // Stop tracking
-    stopTracking();
   }
-  // Close overlay
   ipcRenderer.invoke('close-overlay').catch(err => {
     console.error('Error closing overlay:', err);
   });
@@ -3338,18 +3371,8 @@ function startIdleDetection() {
             (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
           
           if (shouldShowOverlay) {
-          // Calculate the actual inactive time (from when activity stopped to now)
-          const inactiveDuration = recheckTimeSinceActivity;
-          
-          // Pause tracking and mark the inactive period
+          // Pause tracking (no time deduction here - deduction only on Stop)
           pauseStartTime = Date.now();
-          
-          // CRITICAL: Add the inactive time to pausedDuration to exclude it from total tracked time
-          // This ensures the inactive period (minimum 5 minutes) is deducted from total duration
-          pausedDuration += inactiveDuration;
-          
-          console.log(`Inactivity confirmed - deducting ${Math.floor(inactiveDuration / 1000)}s (${Math.floor(inactiveDuration / 60000)} minutes) from tracked time`);
-          console.log(`Total paused duration: ${Math.floor(pausedDuration / 1000)}s`);
       
           // Stop timer and captures
           if (timerInterval) {
@@ -3361,11 +3384,10 @@ function startIdleDetection() {
             captureInterval = null;
           }
 
-            // Sync duration before pausing (this will save the duration with inactive time excluded)
-            await syncCurrentDuration();
+          // Sync current duration to DB (no deduction - time unchanged)
+          await syncCurrentDuration();
 
-          // Show overlay modal - user must click Continue or Stop to proceed
-          // Both actions will ensure the inactive time (minimum 5 minutes) is deducted
+          // Show overlay - Continue = resume with no time change; Stop = deduct 5 min and stop
           ipcRenderer.invoke('show-overlay').catch(err => {
             console.error('Error showing overlay:', err);
           });
@@ -3382,8 +3404,7 @@ function startIdleDetection() {
         console.log('Activity detected - cleared pending idle double-check');
       }
       
-      // Note: We do NOT auto-resume here. User must click Continue or Stop on the modal.
-      // This ensures the inactive time is properly deducted regardless of user choice.
+      // User must click Continue (resume, no deduction) or Stop (deduct 5 min and stop).
     }
     
     // Schedule next check
@@ -3408,21 +3429,11 @@ function startIdleDetection() {
 async function resumeTracking() {
   if (!isTracking || !pauseStartTime) return;
   
-  // Calculate the additional paused time (from when pause started to now)
-  // Note: The initial inactive period (minimum 5 minutes) was already added to pausedDuration
-  // when inactivity was detected, so we only need to add the time since pauseStartTime
   const now = Date.now();
-  const additionalPausedTime = now - pauseStartTime;
-  
-  // Add any additional paused time (if user was inactive longer than the initial 5 minutes)
-  if (additionalPausedTime > 0) {
-    pausedDuration += additionalPausedTime;
-    console.log(`Adding additional paused time: ${Math.floor(additionalPausedTime / 1000)}s`);
-  }
-  
+  // No time deduction on Continue - leave duration unchanged, just resume and sync
   pauseStartTime = null;
   
-  // Sync duration when resuming (this saves the duration with all inactive time excluded)
+  // Sync current duration to DB (no reduction)
   await syncCurrentDuration();
   
   // Reset activity time
@@ -3455,7 +3466,8 @@ async function resumeTracking() {
     statusDisplay.classList.add('tracking');
   }
   
-  console.log(`Tracking resumed by user. Total inactive time excluded: ${Math.floor(pausedDuration / 1000)}s (${Math.floor(pausedDuration / 60000)} minutes)`);
+
+  console.log('Tracking resumed (Continue) - no time deduction, synced to DB');
 }
 
 function startTimer() {
