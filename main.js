@@ -520,7 +520,7 @@ function startOAuthCallbackServer() {
           <html>
             <head><title>Login Successful</title></head>
             <body style="font-family: Arial; text-align: center; padding: 50px;">
-              <h1 style="color: green;">✓ Login Successful!</h1>
+              <h1 style="color: green;">Login Successful!</h1>
               <p>You can close this window and return to the Time Flow app.</p>
               <script>setTimeout(() => window.close(), 2000);</script>
             </body>
