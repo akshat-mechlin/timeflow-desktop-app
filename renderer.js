@@ -161,7 +161,11 @@ let pausedDuration = 0; // Track paused time in current session
 let pauseStartTime = null; // When tracking was paused
 let isStoppingTracking = false; // Flag to prevent race conditions during stop
 let timerInterval = null;
-let captureInterval = null;
+let captureInterval = null; // Kept for clearInterval compatibility when stopping
+let captureTimeoutId = null; // setTimeout chain for reliable 5-7 min interval
+let lastCaptureTime = 0; // When we last ran capture (for catch-up and watchdog)
+let captureInProgress = false; // Prevents overlapping captures and watchdog restart during capture
+let captureWatchdogInterval = null; // Restarts capture loop if it was lost (e.g. after background throttle)
 let dailyResetCheckInterval = null;
 let idleTimer = null; // Timer for inactivity detection
 let idleDoubleCheckTimer = null; // Timer for double-checking inactivity
@@ -721,6 +725,15 @@ document.addEventListener('visibilitychange', async () => {
       } else if (statusDisplay) {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
+      }
+    }
+
+    // Catch-up: if we're tracking and last screenshot was too long ago (e.g. app was in background and timers were throttled), capture now and reschedule
+    if (isTracking && !pauseStartTime && timeEntryId && !captureInProgress) {
+      const timeSinceLastCapture = Date.now() - lastCaptureTime;
+      if (timeSinceLastCapture >= CAPTURE_INTERVAL_MIN_MS) {
+        console.log(`App visible: last capture ${Math.round(timeSinceLastCapture / 60000)} min ago - running catch-up capture`);
+        startPeriodicCaptures();
       }
     }
   }
@@ -1779,6 +1792,14 @@ async function handleLogout() {
     if (captureInterval) {
       clearInterval(captureInterval);
       captureInterval = null;
+    }
+    if (captureTimeoutId) {
+      clearTimeout(captureTimeoutId);
+      captureTimeoutId = null;
+    }
+    if (captureWatchdogInterval) {
+      clearInterval(captureWatchdogInterval);
+      captureWatchdogInterval = null;
     }
     if (realTimeUpdateInterval) {
       clearInterval(realTimeUpdateInterval);
@@ -2936,6 +2957,14 @@ async function stopTracking() {
     clearInterval(captureInterval);
     captureInterval = null;
   }
+  if (captureTimeoutId) {
+    clearTimeout(captureTimeoutId);
+    captureTimeoutId = null;
+  }
+  if (captureWatchdogInterval) {
+    clearInterval(captureWatchdogInterval);
+    captureWatchdogInterval = null;
+  }
   if (systemActivitySyncInterval) {
     clearInterval(systemActivitySyncInterval);
     systemActivitySyncInterval = null;
@@ -3383,6 +3412,10 @@ function startIdleDetection() {
             clearInterval(captureInterval);
             captureInterval = null;
           }
+          if (captureTimeoutId) {
+            clearTimeout(captureTimeoutId);
+            captureTimeoutId = null;
+          }
 
           // Sync current duration to DB (no deduction - time unchanged)
           await syncCurrentDuration();
@@ -3510,33 +3543,64 @@ function updateDayCycleDisplay() {
 }
 
 
+// Capture interval: 5-7 minutes (user expectation). Min used for catch-up threshold.
+const CAPTURE_INTERVAL_MIN_MS = 5 * 60 * 1000;
+const CAPTURE_INTERVAL_MAX_MS = 7 * 60 * 1000;
+
+function getNextCaptureDelayMs() {
+  return CAPTURE_INTERVAL_MIN_MS + Math.floor(Math.random() * (CAPTURE_INTERVAL_MAX_MS - CAPTURE_INTERVAL_MIN_MS + 1));
+}
+
+function scheduleNextCapture() {
+  if (!isTracking || pauseStartTime || !timeEntryId) return;
+  const delay = getNextCaptureDelayMs();
+  captureTimeoutId = setTimeout(() => {
+    captureTimeoutId = null;
+    if (isTracking && timeEntryId) {
+      captureScreenshotAndCamera()
+        .then(() => { scheduleNextCapture(); })
+        .catch(err => {
+          console.warn('Periodic capture failed, will retry on next interval:', err);
+          scheduleNextCapture();
+        });
+    }
+  }, delay);
+  console.log(`Next screenshot scheduled in ${Math.round(delay / 60000)} min`);
+}
+
 function startPeriodicCaptures() {
-  // Clear any existing interval to prevent duplicates
+  // Clear any existing interval/timeout to prevent duplicates
   if (captureInterval) {
     clearInterval(captureInterval);
     captureInterval = null;
   }
-
-  const CAPTURE_INTERVAL = 5 * 60 * 1000; // 5 minutes (300 seconds)
+  if (captureTimeoutId) {
+    clearTimeout(captureTimeoutId);
+    captureTimeoutId = null;
+  }
 
   // Capture immediately on start
-  captureScreenshotAndCamera().catch(err => {
-    console.warn('Initial capture failed, will retry on next interval:', err);
-  });
+  captureScreenshotAndCamera()
+    .then(() => { scheduleNextCapture(); })
+    .catch(err => {
+      console.warn('Initial capture failed, will retry on next interval:', err);
+      scheduleNextCapture();
+    });
 
-  // Then capture every 5 minutes - always capture when tracking is active
-  captureInterval = setInterval(() => {
-    if (isTracking && timeEntryId) {
-      // Always attempt capture - don't skip even if paused
-      captureScreenshotAndCamera().catch(err => {
-        console.warn('Periodic capture failed, will retry on next interval:', err);
-      });
-    } else if (isTracking && !timeEntryId) {
-      console.warn('Skipping capture: tracking active but no timeEntryId yet');
-    }
-  }, CAPTURE_INTERVAL);
-  
-  console.log('Periodic captures started - will capture every 5 minutes');
+  // Start watchdog: restart capture loop if it was lost (e.g. after app was in background and timers throttled)
+  if (captureWatchdogInterval) {
+    clearInterval(captureWatchdogInterval);
+    captureWatchdogInterval = null;
+  }
+  const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
+  captureWatchdogInterval = setInterval(() => {
+    if (!isTracking || pauseStartTime || !timeEntryId) return;
+    if (captureTimeoutId !== null || captureInProgress) return; // Loop is running or capture in progress
+    console.warn('Capture loop was lost (no scheduled capture) - restarting periodic captures');
+    startPeriodicCaptures();
+  }, WATCHDOG_MS);
+
+  console.log('Periodic captures started - will capture every 5-7 minutes (after each capture completes)');
 }
 
 async function captureScreenshotAndCamera() {
@@ -3550,6 +3614,16 @@ async function captureScreenshotAndCamera() {
     return;
   }
 
+  captureInProgress = true;
+  lastCaptureTime = Date.now();
+  try {
+    await captureScreenshotAndCameraImpl();
+  } finally {
+    captureInProgress = false;
+  }
+}
+
+async function captureScreenshotAndCameraImpl() {
   // Check if screenshot capture is enabled
   console.log('🔍 Checking screenshot capture setting:', captureSettings.enableScreenshotCapture);
   if (!captureSettings.enableScreenshotCapture) {
