@@ -818,54 +818,33 @@ function stopScreenStateMonitoring() {
 }
 // Permission check button removed from UI - permissions checked automatically
 
-// Track mouse movements and keystrokes for statistics and reset idle timer
+// In-window activity: mouse click or keyboard key in the tracker window (resets inactivity timer). No mousemove, no "low/high" - any click/key counts.
 function setupActivityListeners() {
-  // Performance optimization: Throttle activity handlers to reduce overhead
-  let lastActivityCheck = 0;
-  const ACTIVITY_THROTTLE_MS = 100; // Throttle to max once per 100ms
-  
-  // Create a throttled version that logs activity for debugging
+  // Single click or key = activity (no throttle)
   const activityHandler = (eventType) => {
     return () => {
       if (isTracking && !pauseStartTime) {
-        const now = Date.now();
-        // Throttle activity checks to reduce CPU usage
-        if (now - lastActivityCheck >= ACTIVITY_THROTTLE_MS) {
-          resetIdleTimer();
-          lastActivityCheck = now;
-          
-          // Log occasionally for debugging (only every 5 seconds)
-          if (!activityHandler.lastLogTime || (now - activityHandler.lastLogTime) > 5000) {
-            console.log(`Activity detected: ${eventType}`);
-            activityHandler.lastLogTime = now;
-          }
+        resetIdleTimer();
+        if (!activityHandler.lastLogTime || (Date.now() - activityHandler.lastLogTime) > 5000) {
+          console.log(`Activity detected: ${eventType}`);
+          activityHandler.lastLogTime = Date.now();
         }
       }
     };
   };
-  
-  // Performance optimization: Only add listeners to document (not both document and window)
-  // This reduces the number of event listeners by half, improving performance
-  const mouseEvents = ['mousemove', 'mousedown', 'mouseup', 'click', 'wheel', 'contextmenu'];
-  mouseEvents.forEach(eventType => {
+
+  // Only mouse clicks and keyboard keys count as activity (no mousemove, wheel, etc.)
+  const mouseClickEvents = ['mousedown', 'mouseup', 'click'];
+  mouseClickEvents.forEach(eventType => {
     const handler = activityHandler(`mouse:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
   });
-  
-  // Keyboard events - only on document
-  const keyboardEvents = ['keydown', 'keyup', 'keypress'];
+
+  const keyboardEvents = ['keydown', 'keypress'];
   keyboardEvents.forEach(eventType => {
     const handler = activityHandler(`keyboard:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
   });
-  
-  // Also listen for focus events (user switching windows/apps)
-  window.addEventListener('focus', activityHandler('window:focus'), { capture: true, passive: true });
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && isTracking && !pauseStartTime) {
-      activityHandler('document:visible')();
-    }
-  }, { capture: true, passive: true });
   
   // Performance optimization: Throttle statistics tracking to reduce overhead
   let lastMouseMoveTime = 0;
@@ -889,22 +868,16 @@ function setupActivityListeners() {
   }, { capture: true, passive: true });
 }
 
-// Reset idle timer when activity is detected
+// Reset idle timer when activity is detected (mouse click or keyboard key only).
 function resetIdleTimer() {
-  if (!isTracking) return; // Don't reset if not tracking
-  
-  // Don't reset if paused (waiting for user to click Continue or Stop on modal)
+  if (!isTracking) return;
   if (pauseStartTime) return;
-  
-  // Update immediately (no debounce) to ensure activity is captured
+
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
-  
-  // Only update if it's been at least 50ms since last update (light debounce to avoid spam)
+  // Light 50ms debounce to avoid key-repeat spam; any single click/key still counts
   if (timeSinceLastUpdate > 50) {
     lastActivityTime = now;
-    
-    // Cancel any pending double-check if activity is detected
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
@@ -913,27 +886,18 @@ function resetIdleTimer() {
   }
 }
 
-// Listen for system-wide activity from main process
-// This is the PRIMARY method for detecting activity when user works in other apps
+// Activity = (1) mouse click or keyboard key in THIS window, OR (2) system-wide: any mouse/keyboard anywhere on PC (from main process).
+// (2) prevents "inactive" when user is working in another app (browser, IDE, etc.). No low/high activity - any event counts.
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
-  if (isTracking && !pauseStartTime) {
-    // Update lastActivityTime directly for system-wide activity
-    // Don't update if paused (waiting for user to click Continue or Stop on modal)
-    const now = Date.now();
-    const timeSinceLastUpdate = now - lastActivityTime;
-    const previousTime = lastActivityTime;
+  if (!isTracking || pauseStartTime) return;
+  const now = Date.now();
+  const timeSinceLastUpdate = now - lastActivityTime;
+  if (timeSinceLastUpdate > 50) {
     lastActivityTime = now;
-    
-    // Log system activity (this is critical for debugging)
-    if (timeSinceLastUpdate > 2000) { // Only log if it's been more than 2 seconds
-      console.log(`✓ System-wide activity detected: ${Math.floor(timeSinceLastUpdate / 1000)}s since last (idle: ${idleSeconds ? idleSeconds.toFixed(1) : 'N/A'}s)`);
-    }
-    
-    // Clear any pending double-check
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
-      console.log('System activity detected - cleared pending idle double-check');
+      console.log(`System activity (idle=${idleSeconds != null ? idleSeconds.toFixed(1) : '?'}s) - cancelled idle double-check`);
     }
   }
 });
@@ -2897,47 +2861,9 @@ async function startTracking() {
   // Start inactivity detection
   startIdleDetection();
   
-  // Also periodically sync with system activity (fallback)
-  // This ensures we don't miss activity even if IPC messages are delayed
-  if (systemActivitySyncInterval) {
-    clearInterval(systemActivitySyncInterval);
-  }
-  // Performance optimization: Adaptive system activity sync frequency
-  // Check more frequently when approaching idle threshold, less frequently when active
-  systemActivitySyncInterval = setInterval(() => {
-    // Request current system activity status from main process
-    if (isTracking && !pauseStartTime) {
-      ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        // Only update if system clearly shows user is active (idle < 2 minutes)
-        // This prevents the fallback from interfering with inactivity detection
-        if (idleSeconds !== null && idleSeconds < 2 * 60) {
-          // User is active (idle less than 2 minutes)
-          const now = Date.now();
-          const timeSinceLastUpdate = now - lastActivityTime;
-          // Update more frequently (every 2 seconds) to catch activity quickly
-          if (timeSinceLastUpdate > 2000) {
-            lastActivityTime = now;
-            // Log occasionally
-            if (timeSinceLastUpdate > 10000) {
-              console.log(`Fallback sync: System activity detected - idle=${idleSeconds.toFixed(1)}s, updated lastActivityTime`);
-            }
-            
-            // Clear any pending double-check
-            if (idleDoubleCheckTimer) {
-              clearTimeout(idleDoubleCheckTimer);
-              idleDoubleCheckTimer = null;
-              console.log('Fallback sync: Cleared pending idle double-check');
-            }
-          }
-        }
-      }).catch(err => {
-        // On error, don't update - rely on other activity detection methods
-        // The main activity listeners will catch real activity
-      });
-    }
-  }, 5000); // Optimized: Check every 5 seconds (reduced from 2 seconds for better performance)
+  // Activity = only mouse click or keyboard key in this window; no system-activity fallback (avoids false inactivity)
 
-  // Start periodic captures (every 30 seconds)
+  // Start periodic captures (every 5-7 minutes)
   startPeriodicCaptures();
 
   // Start real-time updates (every 30 seconds)
@@ -3345,85 +3271,25 @@ function startIdleDetection() {
 
     const now = Date.now();
     const timeSinceLastActivity = now - lastActivityTime;
-    
-    // Before checking threshold, verify system activity one more time
-    // This is a safety check to ensure we have the latest activity status
-    if (timeSinceLastActivity > IDLE_THRESHOLD - 10000) {
-      // Check system idle time directly before showing overlay
-      ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        // Only reset if system clearly shows user is active (idle < 2 minutes)
-        // This prevents false positives while still allowing inactivity detection
-        if (idleSeconds !== null && idleSeconds < 2 * 60) {
-          // User is actually active - update lastActivityTime (2 minutes threshold)
-          lastActivityTime = Date.now();
-          console.log(`Safety check: System shows user is active (idle=${idleSeconds.toFixed(1)}s) - updating lastActivityTime`);
-          
-          // Clear any pending double-check
-          if (idleDoubleCheckTimer) {
-            clearTimeout(idleDoubleCheckTimer);
-            idleDoubleCheckTimer = null;
-            console.log('Safety check: Cleared pending idle double-check due to detected activity');
-          }
-        } else if (idleSeconds === null) {
-          // Can't determine system idle time - rely on lastActivityTime alone
-          // Don't reset lastActivityTime - let the threshold check proceed
-          console.log('Safety check: Cannot determine system idle time - relying on lastActivityTime');
-        }
-      }).catch(err => {
-        // On error, rely on lastActivityTime alone - don't reset it
-        console.log('Safety check: Error getting system idle time - relying on lastActivityTime');
-      });
-    }
-    
-    // Debug logging (only log when close to threshold)
+
     if (timeSinceLastActivity > IDLE_THRESHOLD - 10000 && timeSinceLastActivity < IDLE_THRESHOLD + 10000) {
-      console.log(`Idle check: ${Math.floor(timeSinceLastActivity / 1000)}s since last activity (threshold: ${IDLE_THRESHOLD / 1000}s)`);
-      console.log(`Last activity time: ${new Date(lastActivityTime).toLocaleTimeString()}, Current time: ${new Date(now).toLocaleTimeString()}`);
+      console.log(`Idle check: ${Math.floor(timeSinceLastActivity / 1000)}s since last mouse/keyboard activity (threshold: ${IDLE_THRESHOLD / 1000}s)`);
     }
-    
-    // Re-check time since last activity after potential update
-    const updatedTimeSinceLastActivity = Date.now() - lastActivityTime;
-    
-    // Check if user has been inactive for threshold
-    if (updatedTimeSinceLastActivity >= IDLE_THRESHOLD) {
-      // Only start double-check if we don't already have one pending
+
+    // Inactivity = no activity for 5 min. Activity = (A) mouse click/key in this window OR (B) system-wide mouse/key (main process). No low/high - any event counts.
+    if (timeSinceLastActivity >= IDLE_THRESHOLD) {
       if (!idleDoubleCheckTimer) {
-        console.log(`Idle threshold reached (${Math.floor(updatedTimeSinceLastActivity / 1000)}s), starting double-check...`);
-        
-      // Double-check: verify we're still inactive (prevent false positives)
-        const doubleCheckDelay = 3000; // Wait 3 seconds and check again (longer delay)
+        console.log(`Idle threshold reached (${Math.floor(timeSinceLastActivity / 1000)}s), starting double-check...`);
+        const doubleCheckDelay = 3000;
         idleDoubleCheckTimer = setTimeout(async () => {
-          // Clear the timer reference
           idleDoubleCheckTimer = null;
-          
-          // Re-check conditions
-          if (!isTracking || pauseStartTime) {
-            console.log('Tracking stopped or paused during double-check - cancelling');
-            return;
-          }
-          
-          // Final safety check - verify system idle time one more time
-          const finalIdleSeconds = await ipcRenderer.invoke('get-system-idle-time').catch(() => null);
-          
-          // Only prevent showing overlay if system clearly shows user is active (idle < 2 minutes)
-          if (finalIdleSeconds !== null && finalIdleSeconds < 2 * 60) {
-            // User is actually active - don't show overlay
-            lastActivityTime = Date.now();
-            console.log(`Final check: System shows user is active (idle=${finalIdleSeconds.toFixed(1)}s) - NOT showing overlay`);
-            return;
-          }
-          
-        const recheckTime = Date.now();
-        const recheckTimeSinceActivity = recheckTime - lastActivityTime;
-        
-          console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity, system idle: ${finalIdleSeconds !== null ? finalIdleSeconds.toFixed(1) : 'N/A'}s`);
-          
-          // Show overlay if still inactive after double-check
-          // If system idle time is available, require it to be >= 3 minutes (slightly less than 5 min threshold)
-          // If system idle time is unavailable, rely on lastActivityTime alone
-          const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD && 
-            (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
-          
+          if (!isTracking || pauseStartTime) return;
+
+          const recheckTime = Date.now();
+          const recheckTimeSinceActivity = recheckTime - lastActivityTime;
+          console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity`);
+          const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD;
+
           if (shouldShowOverlay) {
           // Pause tracking (no time deduction here - deduction only on Stop)
           pauseStartTime = Date.now();
@@ -3486,12 +3352,13 @@ function startIdleDetection() {
 // Resume tracking after inactivity (called when user clicks Continue)
 async function resumeTracking() {
   if (!isTracking || !pauseStartTime) return;
-  
+
   const now = Date.now();
-  // No time deduction on Continue - leave duration unchanged, just resume and sync
+  // Exclude time while inactivity modal was open from tracked time (don't add it when they click Continue)
+  pausedDuration += now - pauseStartTime;
   pauseStartTime = null;
-  
-  // Sync current duration to DB (no reduction)
+
+  // Sync current duration to DB (duration = up to last activity, no time added for modal-open period)
   await syncCurrentDuration();
   
   // Reset activity time
@@ -4581,11 +4448,12 @@ function startRealTimeUpdates() {
 // Helper function to sync current duration to Supabase
 async function syncCurrentDuration() {
   if (!isTracking || !timeEntryId || !sessionStartTime) return false;
-  
+
   try {
-    // Calculate current session duration accurately
+    // When paused (inactivity modal open), use pause time as "now" so we don't count time while modal is open
     const now = Date.now();
-    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    const effectiveNow = pauseStartTime || now;
+    let sessionDuration = Math.floor((effectiveNow - sessionStartTime.getTime()) / 1000);
     sessionDuration -= Math.floor(pausedDuration / 1000);
     if (sessionDuration < 0) sessionDuration = 0;
     
