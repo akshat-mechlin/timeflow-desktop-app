@@ -833,7 +833,7 @@ function setupActivityListeners() {
     };
   };
 
-  // Only mouse clicks and keyboard keys count as activity (no mousemove, wheel, etc.)
+  // Mouse clicks, keyboard keys, and mouse move (hover) count as activity - single key/click/hover = active
   const mouseClickEvents = ['mousedown', 'mouseup', 'click'];
   mouseClickEvents.forEach(eventType => {
     const handler = activityHandler(`mouse:${eventType}`);
@@ -845,6 +845,18 @@ function setupActivityListeners() {
     const handler = activityHandler(`keyboard:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
   });
+
+  // Mouse move (hover) in tracker window = activity; throttle to avoid spam (max once per 15s for idle reset)
+  let lastMouseMoveActivityTime = 0;
+  const MOUSE_MOVE_ACTIVITY_THROTTLE_MS = 15000;
+  document.addEventListener('mousemove', () => {
+    if (!isTracking || pauseStartTime) return;
+    const now = Date.now();
+    if (now - lastMouseMoveActivityTime >= MOUSE_MOVE_ACTIVITY_THROTTLE_MS) {
+      lastMouseMoveActivityTime = now;
+      resetIdleTimer();
+    }
+  }, { capture: true, passive: true });
   
   // Performance optimization: Throttle statistics tracking to reduce overhead
   let lastMouseMoveTime = 0;
@@ -886,8 +898,8 @@ function resetIdleTimer() {
   }
 }
 
-// Activity = (1) mouse click or keyboard key in THIS window, OR (2) system-wide: any mouse/keyboard anywhere on PC (from main process).
-// (2) prevents "inactive" when user is working in another app (browser, IDE, etc.). No low/high activity - any event counts.
+// Activity = (1) mouse click, key press, or mouse move (hover) in THIS window, OR (2) system-wide from main, OR (3) fallback poll.
+// (2) and (3) prevent "inactive" when user is in another app. Single key/click/hover anywhere count as activity.
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
   if (!isTracking || pauseStartTime) return;
   const now = Date.now();
@@ -901,6 +913,37 @@ ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
     }
   }
 });
+
+// Fallback: poll system idle from renderer so we still detect activity if main's PowerShell monitor fails (e.g. 30+ users).
+// GetLastInputInfo counts keyboard and mouse (clicks + movement) system-wide. Idle < 30s = treat as active.
+let activityFallbackInterval = null;
+function startActivityFallbackPoll() {
+  if (activityFallbackInterval) return;
+  const POLL_MS = 5000;
+  const IDLE_ACTIVE_THRESHOLD_SEC = 30;
+  activityFallbackInterval = setInterval(async () => {
+    if (!isTracking || pauseStartTime || process.platform !== 'win32') return;
+    try {
+      const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
+      if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
+        const now = Date.now();
+        if (now - lastActivityTime > 50) {
+          lastActivityTime = now;
+          if (idleDoubleCheckTimer) {
+            clearTimeout(idleDoubleCheckTimer);
+            idleDoubleCheckTimer = null;
+          }
+        }
+      }
+    } catch (_) { /* ignore */ }
+  }, POLL_MS);
+}
+function stopActivityFallbackPoll() {
+  if (activityFallbackInterval) {
+    clearInterval(activityFallbackInterval);
+    activityFallbackInterval = null;
+  }
+}
 
 // Setup activity listeners when DOM is ready
 if (document.readyState === 'loading') {
@@ -2860,8 +2903,7 @@ async function startTracking() {
 
   // Start inactivity detection
   startIdleDetection();
-  
-  // Activity = only mouse click or keyboard key in this window; no system-activity fallback (avoids false inactivity)
+  startActivityFallbackPoll();
 
   // Start periodic captures (every 5-7 minutes)
   startPeriodicCaptures();
@@ -2904,6 +2946,7 @@ async function stopTracking() {
     clearTimeout(idleDoubleCheckTimer);
     idleDoubleCheckTimer = null;
   }
+  stopActivityFallbackPoll();
   if (captureInterval) {
     clearInterval(captureInterval);
     captureInterval = null;
@@ -3374,16 +3417,19 @@ async function resumeTracking() {
     startPeriodicCaptures();
   }
   
-  // Restart idle detection
-  if (!idleTimer) {
-    startIdleDetection();
+  // Always restart idle detection so the second (and later) inactivity periods are detected.
+  // When paused, we kept rescheduling checkIdle every second so idleTimer was never null,
+  // so we previously never called startIdleDetection() on resume; that chain can stop or
+  // be throttled when the overlay had focus, so the popup didn't show again.
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
   }
-  
-  // Clear any pending double-check
   if (idleDoubleCheckTimer) {
     clearTimeout(idleDoubleCheckTimer);
     idleDoubleCheckTimer = null;
   }
+  startIdleDetection();
   
   // Update status
   if (statusDisplay) {
@@ -3485,8 +3531,22 @@ function startPeriodicCaptures() {
     captureWatchdogInterval = null;
   }
   const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
+  const STUCK_CAPTURE_THRESHOLD_MS = 12 * 60 * 1000; // No successful capture in 12 min = stuck
   captureWatchdogInterval = setInterval(() => {
     if (!isTracking || pauseStartTime || !timeEntryId) return;
+    const now = Date.now();
+    const timeSinceLastCapture = now - lastCaptureTime;
+    // If capture is stuck (in progress or scheduled but no capture completed in 12+ min), restart loop
+    if (timeSinceLastCapture >= STUCK_CAPTURE_THRESHOLD_MS) {
+      console.warn(`Capture appears stuck (last capture ${Math.round(timeSinceLastCapture / 60000)} min ago) - restarting periodic captures`);
+      if (captureInProgress) captureInProgress = false;
+      if (captureTimeoutId) {
+        clearTimeout(captureTimeoutId);
+        captureTimeoutId = null;
+      }
+      startPeriodicCaptures();
+      return;
+    }
     if (captureTimeoutId !== null || captureInProgress) return; // Loop is running or capture in progress
     console.warn('Capture loop was lost (no scheduled capture) - restarting periodic captures');
     startPeriodicCaptures();
@@ -3835,68 +3895,100 @@ async function captureScreenshotAndCameraImpl() {
   }
 }
 
-// Helper function to upload a screenshot
+// Helper: run a promise with a timeout so API/network hangs don't block the capture loop
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label || 'Operation'} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+
+// Helper function to upload a screenshot (retries with backoff for API reliability with many users)
+const UPLOAD_TIMEOUT_MS = 60000; // 60s per attempt so rate-limited API can still succeed
+const UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000]; // exponential backoff
+
 async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   if (!screenshotBuffer || screenshotBuffer.length === 0) {
     throw new Error('Screenshot buffer is empty');
   }
 
-  // Save to temp file
   const screenshotPath = path.join(os.tmpdir(), `screenshot-${timestamp}-${screenIdentifier}.png`);
   fs.writeFileSync(screenshotPath, screenshotBuffer);
 
-  // Verify file was created
   if (!fs.existsSync(screenshotPath)) {
     throw new Error('Screenshot file was not created');
   }
 
   try {
-    // Upload screenshot
     const screenshotFileName = `screenshots/${currentUser.id}/${timestamp}-${screenIdentifier}-screenshot.png`;
     const screenshotFile = fs.readFileSync(screenshotPath);
-    const { data: screenshotData, error: screenshotError } = await supabase.storage
-      .from('screenshots')
-      .upload(screenshotFileName, screenshotFile, {
-        contentType: 'image/png',
-        upsert: false
-      });
+    let lastStorageError = null;
+    let screenshotData = null;
 
-    if (!screenshotError && screenshotData) {
-      // Insert screenshot record with retry logic
-      let retries = 3;
-      let insertError = null;
-      
-      while (retries > 0) {
-        const { error } = await supabase
+    for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        const uploadPromise = supabase.storage
           .from('screenshots')
-          .insert({
-            time_entry_id: timeEntryId,
-            storage_path: screenshotFileName,
-            type: 'screenshot',
-            taken_at: new Date().toISOString()
+          .upload(screenshotFileName, screenshotFile, {
+            contentType: 'image/png',
+            upsert: false
           });
-
-        if (!error) {
-          insertError = null;
+        const { data, error: screenshotError } = await withTimeout(
+          uploadPromise,
+          UPLOAD_TIMEOUT_MS,
+          'Screenshot storage upload'
+        );
+        if (!screenshotError && data) {
+          screenshotData = data;
+          lastStorageError = null;
           break;
-        } else {
-          insertError = error;
-          retries--;
-          if (retries > 0) {
-            console.warn(`Error inserting screenshot record, retrying... (${retries} attempts left):`, error);
-            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        lastStorageError = screenshotError;
+      } catch (err) {
+        lastStorageError = err;
+        console.warn(`Screenshot upload attempt ${attempt + 1} failed:`, err.message || err);
+      }
+      if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
+        const delay = UPLOAD_RETRY_DELAYS_MS[attempt];
+        console.log(`Retrying screenshot upload in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    if (screenshotData) {
+      let insertError = null;
+      for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
+        try {
+          const insertPromise = supabase
+            .from('screenshots')
+            .insert({
+              time_entry_id: timeEntryId,
+              storage_path: screenshotFileName,
+              type: 'screenshot',
+              taken_at: new Date().toISOString()
+            });
+          const { error } = await withTimeout(insertPromise, 15000, 'Screenshot record insert');
+          if (!error) {
+            insertError = null;
+            break;
           }
+          insertError = error;
+        } catch (err) {
+          insertError = err;
+        }
+        if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
+          await new Promise(resolve => setTimeout(resolve, UPLOAD_RETRY_DELAYS_MS[attempt]));
         }
       }
-
       if (insertError) {
         console.error('Error inserting screenshot record after retries:', insertError);
       }
-    } else if (screenshotError) {
-      console.warn('Error uploading screenshot:', screenshotError);
+    } else if (lastStorageError) {
+      console.warn('Error uploading screenshot after retries:', lastStorageError);
     }
   } finally {
-    // Clean up temp file
     if (fs.existsSync(screenshotPath)) {
       try {
         fs.unlinkSync(screenshotPath);
