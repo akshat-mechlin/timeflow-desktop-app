@@ -4,6 +4,13 @@ const screenshot = require('screenshot-desktop');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+let sharp;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  console.warn('sharp not available for screen comparer:', e.message);
+}
 
 // App version: from package.json with fallback (renderer require can fail when packaged)
 let appVersion;
@@ -161,7 +168,11 @@ let pausedDuration = 0; // Track paused time in current session
 let pauseStartTime = null; // When tracking was paused
 let isStoppingTracking = false; // Flag to prevent race conditions during stop
 let timerInterval = null;
-let captureInterval = null;
+let captureInterval = null; // Kept for clearInterval compatibility when stopping
+let captureTimeoutId = null; // setTimeout chain for reliable 5-7 min interval
+let lastCaptureTime = 0; // When we last ran capture (for catch-up and watchdog)
+let captureInProgress = false; // Prevents overlapping captures and watchdog restart during capture
+let captureWatchdogInterval = null; // Restarts capture loop if it was lost (e.g. after background throttle)
 let dailyResetCheckInterval = null;
 let idleTimer = null; // Timer for inactivity detection
 let idleDoubleCheckTimer = null; // Timer for double-checking inactivity
@@ -183,6 +194,19 @@ let selectedTaskId = null; // Currently selected task
 let cachedDisplays = null;
 let displayCacheTimestamp = 0;
 const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
+
+// Screen comparer: auto-stop when screen unchanged or black (content region only, taskbar excluded)
+const TASKBAR_HEIGHT_PX = 48; // Pixels to exclude from bottom for comparison (taskbar)
+const COMPARE_RESIZE_WIDTH = 64; // Downscale content to this width for hash
+const CONSECUTIVE_SAME_THRESHOLD = 2; // Auto-stop after this many identical content hashes
+const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark
+const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
+const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
+let lastContentHashForComparer = null;
+let consecutiveSameScreenCount = 0;
+// Camera comparer: same-image detection (only used when camera capture is on)
+let lastCameraContentHashForComparer = null;
+let consecutiveSameCameraCount = 0;
 
 // Capture Settings Manager
 let captureSettings = {
@@ -723,6 +747,15 @@ document.addEventListener('visibilitychange', async () => {
         statusDisplay.classList.remove('tracking');
       }
     }
+
+    // Catch-up: if we're tracking and last screenshot was too long ago (e.g. app was in background and timers were throttled), capture now and reschedule
+    if (isTracking && !pauseStartTime && timeEntryId && !captureInProgress) {
+      const timeSinceLastCapture = Date.now() - lastCaptureTime;
+      if (timeSinceLastCapture >= CAPTURE_INTERVAL_MIN_MS) {
+        console.log(`App visible: last capture ${Math.round(timeSinceLastCapture / 60000)} min ago - running catch-up capture`);
+        startPeriodicCaptures();
+      }
+    }
   }
 });
 
@@ -785,52 +818,43 @@ function stopScreenStateMonitoring() {
 }
 // Permission check button removed from UI - permissions checked automatically
 
-// Track mouse movements and keystrokes for statistics and reset idle timer
+// In-window activity: mouse click or keyboard key in the tracker window (resets inactivity timer). No mousemove, no "low/high" - any click/key counts.
 function setupActivityListeners() {
-  // Performance optimization: Throttle activity handlers to reduce overhead
-  let lastActivityCheck = 0;
-  const ACTIVITY_THROTTLE_MS = 100; // Throttle to max once per 100ms
-  
-  // Create a throttled version that logs activity for debugging
+  // Single click or key = activity (no throttle)
   const activityHandler = (eventType) => {
     return () => {
       if (isTracking && !pauseStartTime) {
-        const now = Date.now();
-        // Throttle activity checks to reduce CPU usage
-        if (now - lastActivityCheck >= ACTIVITY_THROTTLE_MS) {
-          resetIdleTimer();
-          lastActivityCheck = now;
-          
-          // Log occasionally for debugging (only every 5 seconds)
-          if (!activityHandler.lastLogTime || (now - activityHandler.lastLogTime) > 5000) {
-            console.log(`Activity detected: ${eventType}`);
-            activityHandler.lastLogTime = now;
-          }
+        resetIdleTimer();
+        if (!activityHandler.lastLogTime || (Date.now() - activityHandler.lastLogTime) > 5000) {
+          console.log(`Activity detected: ${eventType}`);
+          activityHandler.lastLogTime = Date.now();
         }
       }
     };
   };
-  
-  // Performance optimization: Only add listeners to document (not both document and window)
-  // This reduces the number of event listeners by half, improving performance
-  const mouseEvents = ['mousemove', 'mousedown', 'mouseup', 'click', 'wheel', 'contextmenu'];
-  mouseEvents.forEach(eventType => {
+
+  // Mouse clicks, keyboard keys, and mouse move (hover) count as activity - single key/click/hover = active
+  const mouseClickEvents = ['mousedown', 'mouseup', 'click'];
+  mouseClickEvents.forEach(eventType => {
     const handler = activityHandler(`mouse:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
   });
-  
-  // Keyboard events - only on document
-  const keyboardEvents = ['keydown', 'keyup', 'keypress'];
+
+  const keyboardEvents = ['keydown', 'keypress'];
   keyboardEvents.forEach(eventType => {
     const handler = activityHandler(`keyboard:${eventType}`);
     document.addEventListener(eventType, handler, { capture: true, passive: true });
   });
-  
-  // Also listen for focus events (user switching windows/apps)
-  window.addEventListener('focus', activityHandler('window:focus'), { capture: true, passive: true });
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && isTracking && !pauseStartTime) {
-      activityHandler('document:visible')();
+
+  // Mouse move (hover) in tracker window = activity; throttle to avoid spam (max once per 15s for idle reset)
+  let lastMouseMoveActivityTime = 0;
+  const MOUSE_MOVE_ACTIVITY_THROTTLE_MS = 15000;
+  document.addEventListener('mousemove', () => {
+    if (!isTracking || pauseStartTime) return;
+    const now = Date.now();
+    if (now - lastMouseMoveActivityTime >= MOUSE_MOVE_ACTIVITY_THROTTLE_MS) {
+      lastMouseMoveActivityTime = now;
+      resetIdleTimer();
     }
   }, { capture: true, passive: true });
   
@@ -856,22 +880,16 @@ function setupActivityListeners() {
   }, { capture: true, passive: true });
 }
 
-// Reset idle timer when activity is detected
+// Reset idle timer when activity is detected (mouse click or keyboard key only).
 function resetIdleTimer() {
-  if (!isTracking) return; // Don't reset if not tracking
-  
-  // Don't reset if paused (waiting for user to click Continue or Stop on modal)
+  if (!isTracking) return;
   if (pauseStartTime) return;
-  
-  // Update immediately (no debounce) to ensure activity is captured
+
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
-  
-  // Only update if it's been at least 50ms since last update (light debounce to avoid spam)
+  // Light 50ms debounce to avoid key-repeat spam; any single click/key still counts
   if (timeSinceLastUpdate > 50) {
     lastActivityTime = now;
-    
-    // Cancel any pending double-check if activity is detected
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
@@ -880,30 +898,52 @@ function resetIdleTimer() {
   }
 }
 
-// Listen for system-wide activity from main process
-// This is the PRIMARY method for detecting activity when user works in other apps
+// Activity = (1) mouse click, key press, or mouse move (hover) in THIS window, OR (2) system-wide from main, OR (3) fallback poll.
+// (2) and (3) prevent "inactive" when user is in another app. Single key/click/hover anywhere count as activity.
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
-  if (isTracking && !pauseStartTime) {
-    // Update lastActivityTime directly for system-wide activity
-    // Don't update if paused (waiting for user to click Continue or Stop on modal)
-    const now = Date.now();
-    const timeSinceLastUpdate = now - lastActivityTime;
-    const previousTime = lastActivityTime;
+  if (!isTracking || pauseStartTime) return;
+  const now = Date.now();
+  const timeSinceLastUpdate = now - lastActivityTime;
+  if (timeSinceLastUpdate > 50) {
     lastActivityTime = now;
-    
-    // Log system activity (this is critical for debugging)
-    if (timeSinceLastUpdate > 2000) { // Only log if it's been more than 2 seconds
-      console.log(`✓ System-wide activity detected: ${Math.floor(timeSinceLastUpdate / 1000)}s since last (idle: ${idleSeconds ? idleSeconds.toFixed(1) : 'N/A'}s)`);
-    }
-    
-    // Clear any pending double-check
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
-      console.log('System activity detected - cleared pending idle double-check');
+      console.log(`System activity (idle=${idleSeconds != null ? idleSeconds.toFixed(1) : '?'}s) - cancelled idle double-check`);
     }
   }
 });
+
+// Fallback: poll system idle from renderer so we still detect activity if main's PowerShell monitor fails (e.g. 30+ users).
+// GetLastInputInfo counts keyboard and mouse (clicks + movement) system-wide. Idle < 30s = treat as active.
+let activityFallbackInterval = null;
+function startActivityFallbackPoll() {
+  if (activityFallbackInterval) return;
+  const POLL_MS = 5000;
+  const IDLE_ACTIVE_THRESHOLD_SEC = 30;
+  activityFallbackInterval = setInterval(async () => {
+    if (!isTracking || pauseStartTime || process.platform !== 'win32') return;
+    try {
+      const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
+      if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
+        const now = Date.now();
+        if (now - lastActivityTime > 50) {
+          lastActivityTime = now;
+          if (idleDoubleCheckTimer) {
+            clearTimeout(idleDoubleCheckTimer);
+            idleDoubleCheckTimer = null;
+          }
+        }
+      }
+    } catch (_) { /* ignore */ }
+  }, POLL_MS);
+}
+function stopActivityFallbackPoll() {
+  if (activityFallbackInterval) {
+    clearInterval(activityFallbackInterval);
+    activityFallbackInterval = null;
+  }
+}
 
 // Setup activity listeners when DOM is ready
 if (document.readyState === 'loading') {
@@ -1779,6 +1819,14 @@ async function handleLogout() {
     if (captureInterval) {
       clearInterval(captureInterval);
       captureInterval = null;
+    }
+    if (captureTimeoutId) {
+      clearTimeout(captureTimeoutId);
+      captureTimeoutId = null;
+    }
+    if (captureWatchdogInterval) {
+      clearInterval(captureWatchdogInterval);
+      captureWatchdogInterval = null;
     }
     if (realTimeUpdateInterval) {
       clearInterval(realTimeUpdateInterval);
@@ -2744,6 +2792,11 @@ async function startTracking() {
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
   keystrokeCount = 0;
+  // Reset screen and camera comparer state so auto-stop uses fresh baseline
+  lastContentHashForComparer = null;
+  consecutiveSameScreenCount = 0;
+  lastCameraContentHashForComparer = null;
+  consecutiveSameCameraCount = 0;
 
   // Get profile
   const { data: profile } = await supabase
@@ -2850,48 +2903,9 @@ async function startTracking() {
 
   // Start inactivity detection
   startIdleDetection();
-  
-  // Also periodically sync with system activity (fallback)
-  // This ensures we don't miss activity even if IPC messages are delayed
-  if (systemActivitySyncInterval) {
-    clearInterval(systemActivitySyncInterval);
-  }
-  // Performance optimization: Adaptive system activity sync frequency
-  // Check more frequently when approaching idle threshold, less frequently when active
-  systemActivitySyncInterval = setInterval(() => {
-    // Request current system activity status from main process
-    if (isTracking && !pauseStartTime) {
-      ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        // Only update if system clearly shows user is active (idle < 2 minutes)
-        // This prevents the fallback from interfering with inactivity detection
-        if (idleSeconds !== null && idleSeconds < 2 * 60) {
-          // User is active (idle less than 2 minutes)
-          const now = Date.now();
-          const timeSinceLastUpdate = now - lastActivityTime;
-          // Update more frequently (every 2 seconds) to catch activity quickly
-          if (timeSinceLastUpdate > 2000) {
-            lastActivityTime = now;
-            // Log occasionally
-            if (timeSinceLastUpdate > 10000) {
-              console.log(`Fallback sync: System activity detected - idle=${idleSeconds.toFixed(1)}s, updated lastActivityTime`);
-            }
-            
-            // Clear any pending double-check
-            if (idleDoubleCheckTimer) {
-              clearTimeout(idleDoubleCheckTimer);
-              idleDoubleCheckTimer = null;
-              console.log('Fallback sync: Cleared pending idle double-check');
-            }
-          }
-        }
-      }).catch(err => {
-        // On error, don't update - rely on other activity detection methods
-        // The main activity listeners will catch real activity
-      });
-    }
-  }, 5000); // Optimized: Check every 5 seconds (reduced from 2 seconds for better performance)
+  startActivityFallbackPoll();
 
-  // Start periodic captures (every 30 seconds)
+  // Start periodic captures (every 5-7 minutes)
   startPeriodicCaptures();
 
   // Start real-time updates (every 30 seconds)
@@ -2932,9 +2946,18 @@ async function stopTracking() {
     clearTimeout(idleDoubleCheckTimer);
     idleDoubleCheckTimer = null;
   }
+  stopActivityFallbackPoll();
   if (captureInterval) {
     clearInterval(captureInterval);
     captureInterval = null;
+  }
+  if (captureTimeoutId) {
+    clearTimeout(captureTimeoutId);
+    captureTimeoutId = null;
+  }
+  if (captureWatchdogInterval) {
+    clearInterval(captureWatchdogInterval);
+    captureWatchdogInterval = null;
   }
   if (systemActivitySyncInterval) {
     clearInterval(systemActivitySyncInterval);
@@ -3291,85 +3314,25 @@ function startIdleDetection() {
 
     const now = Date.now();
     const timeSinceLastActivity = now - lastActivityTime;
-    
-    // Before checking threshold, verify system activity one more time
-    // This is a safety check to ensure we have the latest activity status
-    if (timeSinceLastActivity > IDLE_THRESHOLD - 10000) {
-      // Check system idle time directly before showing overlay
-      ipcRenderer.invoke('get-system-idle-time').then(idleSeconds => {
-        // Only reset if system clearly shows user is active (idle < 2 minutes)
-        // This prevents false positives while still allowing inactivity detection
-        if (idleSeconds !== null && idleSeconds < 2 * 60) {
-          // User is actually active - update lastActivityTime (2 minutes threshold)
-          lastActivityTime = Date.now();
-          console.log(`Safety check: System shows user is active (idle=${idleSeconds.toFixed(1)}s) - updating lastActivityTime`);
-          
-          // Clear any pending double-check
-          if (idleDoubleCheckTimer) {
-            clearTimeout(idleDoubleCheckTimer);
-            idleDoubleCheckTimer = null;
-            console.log('Safety check: Cleared pending idle double-check due to detected activity');
-          }
-        } else if (idleSeconds === null) {
-          // Can't determine system idle time - rely on lastActivityTime alone
-          // Don't reset lastActivityTime - let the threshold check proceed
-          console.log('Safety check: Cannot determine system idle time - relying on lastActivityTime');
-        }
-      }).catch(err => {
-        // On error, rely on lastActivityTime alone - don't reset it
-        console.log('Safety check: Error getting system idle time - relying on lastActivityTime');
-      });
-    }
-    
-    // Debug logging (only log when close to threshold)
+
     if (timeSinceLastActivity > IDLE_THRESHOLD - 10000 && timeSinceLastActivity < IDLE_THRESHOLD + 10000) {
-      console.log(`Idle check: ${Math.floor(timeSinceLastActivity / 1000)}s since last activity (threshold: ${IDLE_THRESHOLD / 1000}s)`);
-      console.log(`Last activity time: ${new Date(lastActivityTime).toLocaleTimeString()}, Current time: ${new Date(now).toLocaleTimeString()}`);
+      console.log(`Idle check: ${Math.floor(timeSinceLastActivity / 1000)}s since last mouse/keyboard activity (threshold: ${IDLE_THRESHOLD / 1000}s)`);
     }
-    
-    // Re-check time since last activity after potential update
-    const updatedTimeSinceLastActivity = Date.now() - lastActivityTime;
-    
-    // Check if user has been inactive for threshold
-    if (updatedTimeSinceLastActivity >= IDLE_THRESHOLD) {
-      // Only start double-check if we don't already have one pending
+
+    // Inactivity = no activity for 5 min. Activity = (A) mouse click/key in this window OR (B) system-wide mouse/key (main process). No low/high - any event counts.
+    if (timeSinceLastActivity >= IDLE_THRESHOLD) {
       if (!idleDoubleCheckTimer) {
-        console.log(`Idle threshold reached (${Math.floor(updatedTimeSinceLastActivity / 1000)}s), starting double-check...`);
-        
-      // Double-check: verify we're still inactive (prevent false positives)
-        const doubleCheckDelay = 3000; // Wait 3 seconds and check again (longer delay)
+        console.log(`Idle threshold reached (${Math.floor(timeSinceLastActivity / 1000)}s), starting double-check...`);
+        const doubleCheckDelay = 3000;
         idleDoubleCheckTimer = setTimeout(async () => {
-          // Clear the timer reference
           idleDoubleCheckTimer = null;
-          
-          // Re-check conditions
-          if (!isTracking || pauseStartTime) {
-            console.log('Tracking stopped or paused during double-check - cancelling');
-            return;
-          }
-          
-          // Final safety check - verify system idle time one more time
-          const finalIdleSeconds = await ipcRenderer.invoke('get-system-idle-time').catch(() => null);
-          
-          // Only prevent showing overlay if system clearly shows user is active (idle < 2 minutes)
-          if (finalIdleSeconds !== null && finalIdleSeconds < 2 * 60) {
-            // User is actually active - don't show overlay
-            lastActivityTime = Date.now();
-            console.log(`Final check: System shows user is active (idle=${finalIdleSeconds.toFixed(1)}s) - NOT showing overlay`);
-            return;
-          }
-          
-        const recheckTime = Date.now();
-        const recheckTimeSinceActivity = recheckTime - lastActivityTime;
-        
-          console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity, system idle: ${finalIdleSeconds !== null ? finalIdleSeconds.toFixed(1) : 'N/A'}s`);
-          
-          // Show overlay if still inactive after double-check
-          // If system idle time is available, require it to be >= 3 minutes (slightly less than 5 min threshold)
-          // If system idle time is unavailable, rely on lastActivityTime alone
-          const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD && 
-            (finalIdleSeconds === null || finalIdleSeconds >= 3 * 60);
-          
+          if (!isTracking || pauseStartTime) return;
+
+          const recheckTime = Date.now();
+          const recheckTimeSinceActivity = recheckTime - lastActivityTime;
+          console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity`);
+          const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD;
+
           if (shouldShowOverlay) {
           // Pause tracking (no time deduction here - deduction only on Stop)
           pauseStartTime = Date.now();
@@ -3382,6 +3345,10 @@ function startIdleDetection() {
           if (captureInterval) {
             clearInterval(captureInterval);
             captureInterval = null;
+          }
+          if (captureTimeoutId) {
+            clearTimeout(captureTimeoutId);
+            captureTimeoutId = null;
           }
 
           // Sync current duration to DB (no deduction - time unchanged)
@@ -3428,12 +3395,13 @@ function startIdleDetection() {
 // Resume tracking after inactivity (called when user clicks Continue)
 async function resumeTracking() {
   if (!isTracking || !pauseStartTime) return;
-  
+
   const now = Date.now();
-  // No time deduction on Continue - leave duration unchanged, just resume and sync
+  // Exclude time while inactivity modal was open from tracked time (don't add it when they click Continue)
+  pausedDuration += now - pauseStartTime;
   pauseStartTime = null;
-  
-  // Sync current duration to DB (no reduction)
+
+  // Sync current duration to DB (duration = up to last activity, no time added for modal-open period)
   await syncCurrentDuration();
   
   // Reset activity time
@@ -3449,16 +3417,19 @@ async function resumeTracking() {
     startPeriodicCaptures();
   }
   
-  // Restart idle detection
-  if (!idleTimer) {
-    startIdleDetection();
+  // Always restart idle detection so the second (and later) inactivity periods are detected.
+  // When paused, we kept rescheduling checkIdle every second so idleTimer was never null,
+  // so we previously never called startIdleDetection() on resume; that chain can stop or
+  // be throttled when the overlay had focus, so the popup didn't show again.
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
   }
-  
-  // Clear any pending double-check
   if (idleDoubleCheckTimer) {
     clearTimeout(idleDoubleCheckTimer);
     idleDoubleCheckTimer = null;
   }
+  startIdleDetection();
   
   // Update status
   if (statusDisplay) {
@@ -3510,33 +3481,152 @@ function updateDayCycleDisplay() {
 }
 
 
+// Capture interval: 5-7 minutes (user expectation). Min used for catch-up threshold.
+const CAPTURE_INTERVAL_MIN_MS = 5 * 60 * 1000;
+const CAPTURE_INTERVAL_MAX_MS = 7 * 60 * 1000;
+
+function getNextCaptureDelayMs() {
+  return CAPTURE_INTERVAL_MIN_MS + Math.floor(Math.random() * (CAPTURE_INTERVAL_MAX_MS - CAPTURE_INTERVAL_MIN_MS + 1));
+}
+
+function scheduleNextCapture() {
+  if (!isTracking || pauseStartTime || !timeEntryId) return;
+  const delay = getNextCaptureDelayMs();
+  captureTimeoutId = setTimeout(() => {
+    captureTimeoutId = null;
+    if (isTracking && timeEntryId) {
+      captureScreenshotAndCamera()
+        .then(() => { scheduleNextCapture(); })
+        .catch(err => {
+          console.warn('Periodic capture failed, will retry on next interval:', err);
+          scheduleNextCapture();
+        });
+    }
+  }, delay);
+  console.log(`Next screenshot scheduled in ${Math.round(delay / 60000)} min`);
+}
+
 function startPeriodicCaptures() {
-  // Clear any existing interval to prevent duplicates
+  // Clear any existing interval/timeout to prevent duplicates
   if (captureInterval) {
     clearInterval(captureInterval);
     captureInterval = null;
   }
-
-  const CAPTURE_INTERVAL = 5 * 60 * 1000; // 5 minutes (300 seconds)
+  if (captureTimeoutId) {
+    clearTimeout(captureTimeoutId);
+    captureTimeoutId = null;
+  }
 
   // Capture immediately on start
-  captureScreenshotAndCamera().catch(err => {
-    console.warn('Initial capture failed, will retry on next interval:', err);
-  });
+  captureScreenshotAndCamera()
+    .then(() => { scheduleNextCapture(); })
+    .catch(err => {
+      console.warn('Initial capture failed, will retry on next interval:', err);
+      scheduleNextCapture();
+    });
 
-  // Then capture every 5 minutes - always capture when tracking is active
-  captureInterval = setInterval(() => {
-    if (isTracking && timeEntryId) {
-      // Always attempt capture - don't skip even if paused
-      captureScreenshotAndCamera().catch(err => {
-        console.warn('Periodic capture failed, will retry on next interval:', err);
-      });
-    } else if (isTracking && !timeEntryId) {
-      console.warn('Skipping capture: tracking active but no timeEntryId yet');
+  // Start watchdog: restart capture loop if it was lost (e.g. after app was in background and timers throttled)
+  if (captureWatchdogInterval) {
+    clearInterval(captureWatchdogInterval);
+    captureWatchdogInterval = null;
+  }
+  const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
+  const STUCK_CAPTURE_THRESHOLD_MS = 12 * 60 * 1000; // No successful capture in 12 min = stuck
+  captureWatchdogInterval = setInterval(() => {
+    if (!isTracking || pauseStartTime || !timeEntryId) return;
+    const now = Date.now();
+    const timeSinceLastCapture = now - lastCaptureTime;
+    // If capture is stuck (in progress or scheduled but no capture completed in 12+ min), restart loop
+    if (timeSinceLastCapture >= STUCK_CAPTURE_THRESHOLD_MS) {
+      console.warn(`Capture appears stuck (last capture ${Math.round(timeSinceLastCapture / 60000)} min ago) - restarting periodic captures`);
+      if (captureInProgress) captureInProgress = false;
+      if (captureTimeoutId) {
+        clearTimeout(captureTimeoutId);
+        captureTimeoutId = null;
+      }
+      startPeriodicCaptures();
+      return;
     }
-  }, CAPTURE_INTERVAL);
-  
-  console.log('Periodic captures started - will capture every 5 minutes');
+    if (captureTimeoutId !== null || captureInProgress) return; // Loop is running or capture in progress
+    console.warn('Capture loop was lost (no scheduled capture) - restarting periodic captures');
+    startPeriodicCaptures();
+  }, WATCHDOG_MS);
+
+  console.log('Periodic captures started - will capture every 5-7 minutes (after each capture completes)');
+}
+
+/**
+ * Get a hash of the screenshot content region (excludes taskbar) for "same image" comparison.
+ * Returns null if sharp is unavailable or processing fails.
+ */
+async function getContentHashFromBuffer(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return null;
+  try {
+    const image = sharp(buffer);
+    const meta = await image.metadata();
+    const w = meta.width || 0;
+    const h = meta.height || 0;
+    if (w < 10 || h <= TASKBAR_HEIGHT_PX) return null;
+    const contentHeight = Math.max(10, h - TASKBAR_HEIGHT_PX);
+    const raw = await image
+      .extract({ left: 0, top: 0, width: w, height: contentHeight })
+      .resize(COMPARE_RESIZE_WIDTH, null, { withoutEnlargement: true })
+      .grayscale()
+      .raw()
+      .toBuffer();
+    return crypto.createHash('sha256').update(raw).digest('hex');
+  } catch (err) {
+    console.warn('Screen comparer: getContentHashFromBuffer failed', err.message);
+    return null;
+  }
+}
+
+/**
+ * Returns true if the screenshot appears to be a black (or near-black) screen.
+ * Uses a downscaled sample to avoid high memory use.
+ */
+async function isBlackScreenBuffer(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return false;
+  try {
+    const { data: raw, info } = await sharp(buffer)
+      .resize(100, 100, { fit: 'inside' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const channels = info.channels || 3;
+    const pixelCount = Math.floor(raw.length / channels);
+    let darkCount = 0;
+    for (let i = 0; i < raw.length; i += channels) {
+      const r = raw[i];
+      const g = raw[i + 1];
+      const b = raw[i + 2];
+      const luminance = (0.299 * r + 0.587 * g + 0.114 * b);
+      if (luminance < BLACK_LUMINANCE_THRESHOLD) darkCount++;
+    }
+    const darkRatio = darkCount / pixelCount;
+    return darkRatio >= BLACK_DARK_PIXEL_RATIO;
+  } catch (err) {
+    console.warn('Screen comparer: isBlackScreenBuffer failed', err.message);
+    return false;
+  }
+}
+
+/**
+ * Hash of full image for "same camera image" comparison (e.g. something covering lens).
+ * Used only when camera capture is enabled. Returns null if sharp unavailable or fails.
+ */
+async function getCameraImageHash(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return null;
+  try {
+    const raw = await sharp(buffer)
+      .resize(COMPARE_RESIZE_WIDTH, COMPARE_RESIZE_WIDTH, { fit: 'fill' })
+      .grayscale()
+      .raw()
+      .toBuffer();
+    return crypto.createHash('sha256').update(raw).digest('hex');
+  } catch (err) {
+    console.warn('Screen comparer: getCameraImageHash failed', err.message);
+    return null;
+  }
 }
 
 async function captureScreenshotAndCamera() {
@@ -3550,6 +3640,16 @@ async function captureScreenshotAndCamera() {
     return;
   }
 
+  captureInProgress = true;
+  lastCaptureTime = Date.now();
+  try {
+    await captureScreenshotAndCameraImpl();
+  } finally {
+    captureInProgress = false;
+  }
+}
+
+async function captureScreenshotAndCameraImpl() {
   // Check if screenshot capture is enabled
   console.log('🔍 Checking screenshot capture setting:', captureSettings.enableScreenshotCapture);
   if (!captureSettings.enableScreenshotCapture) {
@@ -3653,6 +3753,41 @@ async function captureScreenshotAndCamera() {
             const source = sources[i];
             const screenshotBuffer = await captureScreenshotWithElectron(source.id);
             if (screenshotBuffer) {
+              // Screen comparer: on first screen, check black and unchanged then maybe auto-stop
+              if (i === 0 && sharp) {
+                const black = await isBlackScreenBuffer(screenshotBuffer);
+                if (black) {
+                  console.log('Screen comparer: black screen detected - stopping tracker');
+                  await stopTracking();
+                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
+                  await ipcRenderer.invoke('show-overlay', {
+                    title: 'Black screen',
+                    message: 'Your screen appears off or black. Tracking has been stopped.',
+                    icon: '🖥️',
+                    isStopped: true
+                  });
+                  return;
+                }
+                const contentHash = await getContentHashFromBuffer(screenshotBuffer);
+                if (contentHash !== null) {
+                  if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
+                  else consecutiveSameScreenCount = 0;
+                  lastContentHashForComparer = contentHash;
+                  const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
+                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                    console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
+                    await stopTracking();
+                    if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
+                    await ipcRenderer.invoke('show-overlay', {
+                      title: 'Screen unchanged',
+                      message: 'Your screen has not changed. Tracking has been stopped.',
+                      icon: '🖥️',
+                      isStopped: true
+                    });
+                    return;
+                  }
+                }
+              }
               await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
               screensCaptured++;
             }
@@ -3682,7 +3817,43 @@ async function captureScreenshotAndCamera() {
               cachedDisplays = displays;
               displayCacheTimestamp = Date.now();
             }
-            
+
+            // Screen comparer: on first screen only, check black and unchanged then maybe auto-stop
+            if (i === 0 && sharp) {
+              const black = await isBlackScreenBuffer(screenshotBuffer);
+              if (black) {
+                console.log('Screen comparer: black screen detected - stopping tracker');
+                await stopTracking();
+                if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
+                await ipcRenderer.invoke('show-overlay', {
+                  title: 'Black screen',
+                  message: 'Your screen appears off or black. Tracking has been stopped.',
+                  icon: '🖥️',
+                  isStopped: true
+                });
+                return;
+              }
+              const contentHash = await getContentHashFromBuffer(screenshotBuffer);
+              if (contentHash !== null) {
+                if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
+                else consecutiveSameScreenCount = 0;
+                lastContentHashForComparer = contentHash;
+                const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
+                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                  console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
+                  await stopTracking();
+                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
+                  await ipcRenderer.invoke('show-overlay', {
+                    title: 'Screen unchanged',
+                    message: 'Your screen has not changed. Tracking has been stopped.',
+                    icon: '🖥️',
+                    isStopped: true
+                  });
+                  return;
+                }
+              }
+            }
+
             await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
             screensCaptured++;
             console.log(`✓ Captured screen ${i + 1}/${displays.length}: ${display.name || `Screen ${i}`}`);
@@ -3724,68 +3895,100 @@ async function captureScreenshotAndCamera() {
   }
 }
 
-// Helper function to upload a screenshot
+// Helper: run a promise with a timeout so API/network hangs don't block the capture loop
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label || 'Operation'} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+
+// Helper function to upload a screenshot (retries with backoff for API reliability with many users)
+const UPLOAD_TIMEOUT_MS = 60000; // 60s per attempt so rate-limited API can still succeed
+const UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000]; // exponential backoff
+
 async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   if (!screenshotBuffer || screenshotBuffer.length === 0) {
     throw new Error('Screenshot buffer is empty');
   }
 
-  // Save to temp file
   const screenshotPath = path.join(os.tmpdir(), `screenshot-${timestamp}-${screenIdentifier}.png`);
   fs.writeFileSync(screenshotPath, screenshotBuffer);
 
-  // Verify file was created
   if (!fs.existsSync(screenshotPath)) {
     throw new Error('Screenshot file was not created');
   }
 
   try {
-    // Upload screenshot
     const screenshotFileName = `screenshots/${currentUser.id}/${timestamp}-${screenIdentifier}-screenshot.png`;
     const screenshotFile = fs.readFileSync(screenshotPath);
-    const { data: screenshotData, error: screenshotError } = await supabase.storage
-      .from('screenshots')
-      .upload(screenshotFileName, screenshotFile, {
-        contentType: 'image/png',
-        upsert: false
-      });
+    let lastStorageError = null;
+    let screenshotData = null;
 
-    if (!screenshotError && screenshotData) {
-      // Insert screenshot record with retry logic
-      let retries = 3;
-      let insertError = null;
-      
-      while (retries > 0) {
-        const { error } = await supabase
+    for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        const uploadPromise = supabase.storage
           .from('screenshots')
-          .insert({
-            time_entry_id: timeEntryId,
-            storage_path: screenshotFileName,
-            type: 'screenshot',
-            taken_at: new Date().toISOString()
+          .upload(screenshotFileName, screenshotFile, {
+            contentType: 'image/png',
+            upsert: false
           });
-
-        if (!error) {
-          insertError = null;
+        const { data, error: screenshotError } = await withTimeout(
+          uploadPromise,
+          UPLOAD_TIMEOUT_MS,
+          'Screenshot storage upload'
+        );
+        if (!screenshotError && data) {
+          screenshotData = data;
+          lastStorageError = null;
           break;
-        } else {
-          insertError = error;
-          retries--;
-          if (retries > 0) {
-            console.warn(`Error inserting screenshot record, retrying... (${retries} attempts left):`, error);
-            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        lastStorageError = screenshotError;
+      } catch (err) {
+        lastStorageError = err;
+        console.warn(`Screenshot upload attempt ${attempt + 1} failed:`, err.message || err);
+      }
+      if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
+        const delay = UPLOAD_RETRY_DELAYS_MS[attempt];
+        console.log(`Retrying screenshot upload in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+
+    if (screenshotData) {
+      let insertError = null;
+      for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
+        try {
+          const insertPromise = supabase
+            .from('screenshots')
+            .insert({
+              time_entry_id: timeEntryId,
+              storage_path: screenshotFileName,
+              type: 'screenshot',
+              taken_at: new Date().toISOString()
+            });
+          const { error } = await withTimeout(insertPromise, 15000, 'Screenshot record insert');
+          if (!error) {
+            insertError = null;
+            break;
           }
+          insertError = error;
+        } catch (err) {
+          insertError = err;
+        }
+        if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
+          await new Promise(resolve => setTimeout(resolve, UPLOAD_RETRY_DELAYS_MS[attempt]));
         }
       }
-
       if (insertError) {
         console.error('Error inserting screenshot record after retries:', insertError);
       }
-    } else if (screenshotError) {
-      console.warn('Error uploading screenshot:', screenshotError);
+    } else if (lastStorageError) {
+      console.warn('Error uploading screenshot after retries:', lastStorageError);
     }
   } finally {
-    // Clean up temp file
     if (fs.existsSync(screenshotPath)) {
       try {
         fs.unlinkSync(screenshotPath);
@@ -4037,7 +4240,46 @@ async function captureCamera() {
             resolve();
             return;
           }
-          
+
+          // Camera comparer: only when we're actually capturing camera (we're already in captureCamera)
+          if (sharp) {
+            const cameraBlack = await isBlackScreenBuffer(buffer);
+            if (cameraBlack) {
+              console.log('Screen comparer: camera image is black - stopping tracker');
+              await stopTracking();
+              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera is black';
+              await ipcRenderer.invoke('show-overlay', {
+                title: 'Camera black',
+                message: 'Your camera image appears black. Tracking has been stopped.',
+                icon: '📷',
+                isStopped: true
+              });
+              resolve();
+              return;
+            }
+            // Same camera image check (e.g. something covering lens - same frame every time)
+            const cameraHash = await getCameraImageHash(buffer);
+            if (cameraHash !== null) {
+              if (cameraHash === lastCameraContentHashForComparer) consecutiveSameCameraCount++;
+              else consecutiveSameCameraCount = 0;
+              lastCameraContentHashForComparer = cameraHash;
+              const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
+              if (consecutiveSameCameraCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                console.log('Screen comparer: camera image unchanged for consecutive captures - stopping tracker');
+                await stopTracking();
+                if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera unchanged';
+                await ipcRenderer.invoke('show-overlay', {
+                  title: 'Camera unchanged',
+                  message: 'Your camera image has not changed. Tracking has been stopped.',
+                  icon: '📷',
+                  isStopped: true
+                });
+                resolve();
+                return;
+              }
+            }
+          }
+
           const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
           fs.writeFileSync(cameraPath, buffer);
 
@@ -4298,11 +4540,12 @@ function startRealTimeUpdates() {
 // Helper function to sync current duration to Supabase
 async function syncCurrentDuration() {
   if (!isTracking || !timeEntryId || !sessionStartTime) return false;
-  
+
   try {
-    // Calculate current session duration accurately
+    // When paused (inactivity modal open), use pause time as "now" so we don't count time while modal is open
     const now = Date.now();
-    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    const effectiveNow = pauseStartTime || now;
+    let sessionDuration = Math.floor((effectiveNow - sessionStartTime.getTime()) / 1000);
     sessionDuration -= Math.floor(pausedDuration / 1000);
     if (sessionDuration < 0) sessionDuration = 0;
     
