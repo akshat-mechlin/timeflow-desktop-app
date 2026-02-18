@@ -171,6 +171,7 @@ let timerInterval = null;
 let captureInterval = null; // Kept for clearInterval compatibility when stopping
 let captureTimeoutId = null; // setTimeout chain for reliable 5-7 min interval
 let lastCaptureTime = 0; // When we last ran capture (for catch-up and watchdog)
+let cameraSkippedDueToInUse = false; // When true, next capture interval is shortened so we retry camera soon (e.g. after Teams call ends)
 let captureInProgress = false; // Prevents overlapping captures and watchdog restart during capture
 let captureWatchdogInterval = null; // Restarts capture loop if it was lost (e.g. after background throttle)
 let dailyResetCheckInterval = null;
@@ -197,11 +198,14 @@ const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
 
 // Screen comparer: auto-stop when screen unchanged or black (content region only, taskbar excluded)
 const TASKBAR_HEIGHT_PX = 48; // Pixels to exclude from bottom for comparison (taskbar)
-const COMPARE_RESIZE_WIDTH = 64; // Downscale content to this width for hash
-const CONSECUTIVE_SAME_THRESHOLD = 2; // Auto-stop after this many identical content hashes
+const COMPARE_RESIZE_WIDTH = 48; // Downscale content for hash (smaller = more tolerant of tiny differences)
+const CONSECUTIVE_SAME_THRESHOLD = 1; // Auto-stop after 2 consecutive identical screens (1 = trigger when current matches previous)
 const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark
 const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
 const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
+const SINGLE_COLOR_STDDEV_THRESHOLD = 14; // If R,G,B stddev all below this, image is one solid color (camera covered e.g. tape)
+// Only compare last 2 screens (and trigger "screen unchanged") when user is active; if inactive, let inactivity overlay handle it
+const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
 let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
 // Camera comparer: same-image detection and black → visible (shutter removed) detection
@@ -1452,10 +1456,7 @@ function showCameraPermissionRequiredModal() {
     ? steps.camera.join('\n• ')
     : 'Privacy → Camera → Allow desktop apps to access your camera';
   const message =
-    'The tracker cannot start because camera access is disabled in Windows.\n\n' +
-    'To fix this:\n\n' +
-    '• ' + cameraSteps + '\n\n' +
-    'After turning the setting ON, click "Start Tracking" below to try again. You may need to restart the app.';
+    'The tracker cannot start because camera access is disabled in Windows.';
   const modal = document.getElementById('camera-detection-modal');
   if (!modal) {
     alert('Camera access required\n\n' + message);
@@ -2897,6 +2898,7 @@ async function startTracking() {
   lastCameraContentHashForComparer = null;
   consecutiveSameCameraCount = 0;
   lastCameraWasBlack = false;
+  cameraSkippedDueToInUse = false;
 
   // Get profile
   const { data: profile } = await supabase
@@ -3589,9 +3591,14 @@ function getNextCaptureDelayMs() {
   return CAPTURE_INTERVAL_MIN_MS + Math.floor(Math.random() * (CAPTURE_INTERVAL_MAX_MS - CAPTURE_INTERVAL_MIN_MS + 1));
 }
 
+const CAMERA_RETRY_AFTER_IN_USE_MS = 90 * 1000; // When camera was in use (e.g. Teams), retry capture in 90s so we resume when call ends
+
 function scheduleNextCapture() {
   if (!isTracking || pauseStartTime || !timeEntryId) return;
-  const delay = getNextCaptureDelayMs();
+  // If camera was skipped last cycle (e.g. in use by Teams), schedule next capture sooner so we retry when call ends
+  const delay = cameraSkippedDueToInUse ? CAMERA_RETRY_AFTER_IN_USE_MS : getNextCaptureDelayMs();
+  const isCameraRetry = cameraSkippedDueToInUse;
+  if (cameraSkippedDueToInUse) cameraSkippedDueToInUse = false;
   captureTimeoutId = setTimeout(() => {
     captureTimeoutId = null;
     if (isTracking && timeEntryId) {
@@ -3603,7 +3610,7 @@ function scheduleNextCapture() {
         });
     }
   }, delay);
-  console.log(`Next screenshot scheduled in ${Math.round(delay / 60000)} min`);
+  console.log(isCameraRetry ? 'Next capture in 90s (camera was in use – retry when call ends)' : `Next capture in ${Math.round(delay / 60000)} min`);
 }
 
 function startPeriodicCaptures() {
@@ -3631,7 +3638,7 @@ function startPeriodicCaptures() {
     captureWatchdogInterval = null;
   }
   const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
-  const STUCK_CAPTURE_THRESHOLD_MS = 12 * 60 * 1000; // No successful capture in 12 min = stuck
+  const STUCK_CAPTURE_THRESHOLD_MS = 8 * 60 * 1000; // No successful capture in 8 min = stuck (was 12 – restart sooner)
   captureWatchdogInterval = setInterval(() => {
     if (!isTracking || pauseStartTime || !timeEntryId) return;
     const now = Date.now();
@@ -3706,6 +3713,44 @@ async function isBlackScreenBuffer(buffer) {
     return darkRatio >= BLACK_DARK_PIXEL_RATIO;
   } catch (err) {
     console.warn('Screen comparer: isBlackScreenBuffer failed', err.message);
+    return false;
+  }
+}
+
+/**
+ * Returns true if the image is effectively a single solid color (any color).
+ * Used to detect camera covered by tape or similar – tape can be blue, black, red, etc.
+ */
+async function isSingleColorBuffer(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return false;
+  try {
+    const { data: raw, info } = await sharp(buffer)
+      .resize(80, 80, { fit: 'inside' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const channels = info.channels || 3;
+    const n = Math.floor(raw.length / channels);
+    if (n < 10) return false;
+    let sumR = 0, sumG = 0, sumB = 0;
+    for (let i = 0; i < raw.length; i += channels) {
+      sumR += raw[i];
+      sumG += raw[i + 1];
+      sumB += raw[i + 2];
+    }
+    const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+    let varR = 0, varG = 0, varB = 0;
+    for (let i = 0; i < raw.length; i += channels) {
+      varR += (raw[i] - meanR) ** 2;
+      varG += (raw[i + 1] - meanG) ** 2;
+      varB += (raw[i + 2] - meanB) ** 2;
+    }
+    const stddevR = Math.sqrt(varR / n);
+    const stddevG = Math.sqrt(varG / n);
+    const stddevB = Math.sqrt(varB / n);
+    const maxStddev = Math.max(stddevR, stddevG, stddevB);
+    return maxStddev < SINGLE_COLOR_STDDEV_THRESHOLD;
+  } catch (err) {
+    console.warn('Screen comparer: isSingleColorBuffer failed', err.message);
     return false;
   }
 }
@@ -3874,7 +3919,8 @@ async function captureScreenshotAndCameraImpl() {
                   else consecutiveSameScreenCount = 0;
                   lastContentHashForComparer = contentHash;
                   const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                  const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
+                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
                     console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
                     await stopTracking();
                     if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
@@ -3939,7 +3985,8 @@ async function captureScreenshotAndCameraImpl() {
                 else consecutiveSameScreenCount = 0;
                 lastContentHashForComparer = contentHash;
                 const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
+                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
                   console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
                   await stopTracking();
                   if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
@@ -4307,7 +4354,7 @@ async function captureCamera() {
             return;
           }
 
-          // Camera comparer: compare current shot with last; detect black, unchanged, and shutter-removed
+          // Camera comparer: compare current shot with last; detect black, single color (covered), unchanged, shutter-removed
           if (sharp) {
             const cameraBlack = await isBlackScreenBuffer(buffer);
             if (cameraBlack) {
@@ -4318,6 +4365,20 @@ async function captureCamera() {
               await ipcRenderer.invoke('show-overlay', {
                 title: 'Camera black',
                 message: 'Your camera image appears black. Tracking has been stopped.',
+                icon: '📷',
+                isStopped: true
+              });
+              resolve();
+              return;
+            }
+            const cameraSingleColor = await isSingleColorBuffer(buffer);
+            if (cameraSingleColor) {
+              console.log('Screen comparer: camera shows single color (covered e.g. tape) - stopping tracker');
+              await stopTracking();
+              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
+              await ipcRenderer.invoke('show-overlay', {
+                title: 'Camera covered',
+                message: 'Your camera appears covered (e.g. tape or lens cap). Tracking has been stopped.',
                 icon: '📷',
                 isStopped: true
               });
@@ -4447,9 +4508,9 @@ async function captureCamera() {
     });
     
     if (errorName === 'NotReadableError' || errorMessage.includes('Could not start video source')) {
-      // Camera is likely in use by another application
+      // Camera in use (e.g. Teams) – next capture will be scheduled sooner so we resume when call ends
       console.warn('Camera is in use or unavailable:', errorMessage);
-      // Continue tracking without camera - don't log as error
+      cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
       // User disabled camera in Windows mid-session – stop tracking to prevent abuse
       console.warn('Camera permission revoked during tracking – stopping tracker:', errorMessage);

@@ -212,14 +212,17 @@ ipcMain.handle('close-window', () => {
   }
 });
 
+// PowerShell: run hidden to avoid windows and reduce RAM/CPU (packaged app)
+const PS_HIDDEN = 'powershell -WindowStyle Hidden -NoProfile -NonInteractive';
+const EXEC_OPTS = { timeout: 2000, maxBuffer: 64 * 1024, windowsHide: true };
+
 // Handler to get current system idle time
 ipcMain.handle('get-system-idle-time', () => {
   if (process.platform === 'win32') {
     return new Promise((resolve) => {
       const { exec } = require('child_process');
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
-      
-      exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
+      const psCommand = `${PS_HIDDEN} -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
+      exec(psCommand, EXEC_OPTS, (error, stdout, stderr) => {
         if (error) {
           console.error('PowerShell error in get-system-idle-time:', error.message);
           resolve(null);
@@ -291,12 +294,9 @@ ipcMain.handle('check-screen-off', async () => {
 
   try {
     const { exec } = require('child_process');
-    // Check if screen is off using PowerShell
-    // This checks the display state using WMI
-    const psCommand = `powershell -Command "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams; foreach ($monitor in $monitors) { if ($monitor.Active -eq $false) { Write-Output 'OFF'; exit } }; Write-Output 'ON'"`;
-    
+    const psCommand = `${PS_HIDDEN} -Command "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams; foreach ($monitor in $monitors) { if ($monitor.Active -eq $false) { Write-Output 'OFF'; exit } }; Write-Output 'ON'"`;
     return new Promise((resolve) => {
-      exec(psCommand, { timeout: 2000 }, (error, stdout, stderr) => {
+      exec(psCommand, EXEC_OPTS, (error, stdout, stderr) => {
         if (error || stderr) {
           // If we can't determine, assume screen is on (safer)
           resolve(false);
@@ -322,18 +322,14 @@ function startSystemActivityMonitoring() {
 
   if (process.platform === 'win32') {
     const { exec } = require('child_process');
-    const path = require('path');
     let lastIdleTime = 0;
     let consecutiveActiveChecks = 0;
     let checkCount = 0;
-    
-    // Monitor system activity every 1 second for more responsive detection
+    const ACTIVITY_CHECK_MS = 10000; // 10s – was 1s; fewer PowerShell spawns = less RAM/CPU and no window flash
+    const psIdleCommand = `${PS_HIDDEN} -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
     systemActivityMonitor = setInterval(() => {
       checkCount++;
-      // Use inline PowerShell command for better reliability (works in packaged app)
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
-      
-      exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
+      exec(psIdleCommand, EXEC_OPTS, (error, stdout, stderr) => {
         if (error) {
           console.error('Error checking system activity:', error.message);
           return;
@@ -402,7 +398,7 @@ function startSystemActivityMonitoring() {
           console.error('Error parsing system activity:', e);
         }
       });
-    }, 1000); // Check every 1 second for more responsive detection
+    }, ACTIVITY_CHECK_MS);
   }
 }
 
@@ -761,19 +757,13 @@ function setupUserSwitchDetection() {
     getCurrentSessionId().then(sessionId => {
       if (lastSessionId !== null && sessionId !== lastSessionId) {
         console.log('👤 User switched - stopping tracker');
-        console.log(`Session changed: ${lastSessionId} -> ${sessionId}`);
         if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
-          mainWindow.webContents.send('system-event', { 
-            type: 'user-switched',
-            reason: 'Windows user was switched'
-          });
+          mainWindow.webContents.send('system-event', { type: 'user-switched', reason: 'Windows user was switched' });
         }
         lastSessionId = sessionId;
       }
-    }).catch(err => {
-      // Silently handle errors (session ID check might fail occasionally)
-    });
-  }, 2000);
+    }).catch(() => {});
+  }, 30000); // 30s – user switch rare; fewer PowerShell spawns
 }
 
 // Get current Windows session ID
@@ -785,10 +775,8 @@ function getCurrentSessionId() {
     }
 
     const { exec } = require('child_process');
-    // Get session ID using PowerShell
-    const psCommand = `powershell -Command "Get-Process -Id $PID | Select-Object -ExpandProperty SessionId"`;
-    
-    exec(psCommand, { timeout: 1000 }, (error, stdout, stderr) => {
+    const psCommand = `${PS_HIDDEN} -Command "Get-Process -Id $PID | Select-Object -ExpandProperty SessionId"`;
+    exec(psCommand, { ...EXEC_OPTS, timeout: 1000, maxBuffer: 4096 }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
         return;
