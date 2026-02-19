@@ -202,8 +202,16 @@ const COMPARE_RESIZE_WIDTH = 48; // Downscale content for hash (smaller = more t
 const CONSECUTIVE_SAME_THRESHOLD = 1; // Auto-stop after 2 consecutive identical screens (1 = trigger when current matches previous)
 const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark
 const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
+const WHITE_LUMINANCE_MIN = 220; // Pixel luminance at or above this = white (camera covered with white tape etc.)
+const WHITE_PIXEL_RATIO = 0.90; // If this fraction of pixels is white, treat as white / camera covered
 const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
-const SINGLE_COLOR_STDDEV_THRESHOLD = 14; // If R,G,B stddev all below this, image is one solid color (camera covered e.g. tape)
+const SINGLE_COLOR_STDDEV_THRESHOLD = 26; // If max R,G,B stddev below this, image is one solid color (dark or light tape)
+const SINGLE_COLOR_DOMINANT_RATIO = 0.88; // If this fraction of pixels is within SINGLE_COLOR_TOLERANCE of median color, treat as covered
+const SINGLE_COLOR_TOLERANCE = 28; // Max per-channel distance from median to count as "same color" (catches light gradients)
+// Low-detail / gradient: tape with 2+ colors (e.g. white + blue) – each small region is nearly solid
+const LOW_DETAIL_BLOCK_SIZE = 16; // Pixels per block (image resized then split into blocks)
+const LOW_DETAIL_SMOOTH_STDDEV = 38; // Block with max(R,G,B) stddev below this = "smooth" (no texture)
+const LOW_DETAIL_SMOOTH_BLOCK_RATIO = 0.82; // If this fraction of blocks are smooth, treat as covered (gradient/tape)
 // Only compare last 2 screens (and trigger "screen unchanged") when user is active; if inactive, let inactivity overlay handle it
 const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
 let lastContentHashForComparer = null;
@@ -2832,6 +2840,12 @@ async function startTracking() {
     return;
   }
 
+  // On Windows, run a one-off screenshot so screenshot-desktop can copy its .bat to temp if needed
+  // (avoids ENOENT after user clears temp files – the package copies screenCapture_*.bat to temp on first use)
+  if (process.platform === 'win32') {
+    screenshot({ format: 'png' }).catch(() => {});
+  }
+
   // When camera capture is enabled, require Windows camera permission and a detected device
   if (captureSettings.enableCameraCapture) {
     const cameraPermission = await checkCameraPermission();
@@ -3718,8 +3732,36 @@ async function isBlackScreenBuffer(buffer) {
 }
 
 /**
+ * Returns true if the image is mostly white (e.g. camera covered with white tape/paper).
+ */
+async function isWhiteScreenBuffer(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return false;
+  try {
+    const { data: raw, info } = await sharp(buffer)
+      .resize(100, 100, { fit: 'inside' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const channels = info.channels || 3;
+    const pixelCount = Math.floor(raw.length / channels);
+    let whiteCount = 0;
+    for (let i = 0; i < raw.length; i += channels) {
+      const r = raw[i];
+      const g = raw[i + 1];
+      const b = raw[i + 2];
+      const luminance = (0.299 * r + 0.587 * g + 0.114 * b);
+      if (luminance >= WHITE_LUMINANCE_MIN) whiteCount++;
+    }
+    return (whiteCount / pixelCount) >= WHITE_PIXEL_RATIO;
+  } catch (err) {
+    console.warn('Screen comparer: isWhiteScreenBuffer failed', err.message);
+    return false;
+  }
+}
+
+/**
  * Returns true if the image is effectively a single solid color (any color).
- * Used to detect camera covered by tape or similar – tape can be blue, black, red, etc.
+ * Detects camera covered by tape – dark, light, white, or any single color including
+ * light blue/grey/teal (with slight gradient) by using both stddev and dominant-color coverage.
  */
 async function isSingleColorBuffer(buffer) {
   if (!sharp || !buffer || buffer.length === 0) return false;
@@ -3731,12 +3773,29 @@ async function isSingleColorBuffer(buffer) {
     const channels = info.channels || 3;
     const n = Math.floor(raw.length / channels);
     if (n < 10) return false;
+    const rArr = [], gArr = [], bArr = [];
+    for (let i = 0; i < raw.length; i += channels) {
+      rArr.push(raw[i]);
+      gArr.push(raw[i + 1]);
+      bArr.push(raw[i + 2]);
+    }
+    rArr.sort((a, b) => a - b);
+    gArr.sort((a, b) => a - b);
+    bArr.sort((a, b) => a - b);
+    const mid = Math.floor(n / 2);
+    const medR = n % 2 ? rArr[mid] : (rArr[mid - 1] + rArr[mid]) / 2;
+    const medG = n % 2 ? gArr[mid] : (gArr[mid - 1] + gArr[mid]) / 2;
+    const medB = n % 2 ? bArr[mid] : (bArr[mid - 1] + bArr[mid]) / 2;
+    let nearCount = 0;
     let sumR = 0, sumG = 0, sumB = 0;
     for (let i = 0; i < raw.length; i += channels) {
-      sumR += raw[i];
-      sumG += raw[i + 1];
-      sumB += raw[i + 2];
+      const r = raw[i], g = raw[i + 1], b = raw[i + 2];
+      sumR += r; sumG += g; sumB += b;
+      const dr = Math.abs(r - medR), dg = Math.abs(g - medG), db = Math.abs(b - medB);
+      if (dr <= SINGLE_COLOR_TOLERANCE && dg <= SINGLE_COLOR_TOLERANCE && db <= SINGLE_COLOR_TOLERANCE) nearCount++;
     }
+    const dominantRatio = nearCount / n;
+    if (dominantRatio >= SINGLE_COLOR_DOMINANT_RATIO) return true;
     const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
     let varR = 0, varG = 0, varB = 0;
     for (let i = 0; i < raw.length; i += channels) {
@@ -3744,13 +3803,65 @@ async function isSingleColorBuffer(buffer) {
       varG += (raw[i + 1] - meanG) ** 2;
       varB += (raw[i + 2] - meanB) ** 2;
     }
-    const stddevR = Math.sqrt(varR / n);
-    const stddevG = Math.sqrt(varG / n);
-    const stddevB = Math.sqrt(varB / n);
-    const maxStddev = Math.max(stddevR, stddevG, stddevB);
+    const maxStddev = Math.max(Math.sqrt(varR / n), Math.sqrt(varG / n), Math.sqrt(varB / n));
     return maxStddev < SINGLE_COLOR_STDDEV_THRESHOLD;
   } catch (err) {
     console.warn('Screen comparer: isSingleColorBuffer failed', err.message);
+    return false;
+  }
+}
+
+/**
+ * Returns true if the image has very low detail (smooth gradient or few colors, e.g. tape with white + blue).
+ * Splits into small blocks; if most blocks have low color variance, the frame is "smooth" → likely covered.
+ */
+async function isLowDetailBuffer(buffer) {
+  if (!sharp || !buffer || buffer.length === 0) return false;
+  try {
+    const size = 80; // resize to 80x80 so 5x5 blocks of 16x16
+    const { data: raw, info } = await sharp(buffer)
+      .resize(size, size, { fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const channels = info.channels || 3;
+    const blockSize = LOW_DETAIL_BLOCK_SIZE;
+    const blocksX = Math.floor(size / blockSize);
+    const blocksY = Math.floor(size / blockSize);
+    let smoothCount = 0;
+    let totalBlocks = 0;
+    for (let by = 0; by < blocksY; by++) {
+      for (let bx = 0; bx < blocksX; bx++) {
+        const rArr = [], gArr = [], bArr = [];
+        for (let py = by * blockSize; py < (by + 1) * blockSize && py < size; py++) {
+          for (let px = bx * blockSize; px < (bx + 1) * blockSize && px < size; px++) {
+            const i = (py * size + px) * channels;
+            rArr.push(raw[i]);
+            gArr.push(raw[i + 1]);
+            bArr.push(raw[i + 2]);
+          }
+        }
+        const n = rArr.length;
+        if (n < 4) continue;
+        totalBlocks++;
+        let sumR = 0, sumG = 0, sumB = 0;
+        for (let i = 0; i < n; i++) {
+          sumR += rArr[i]; sumG += gArr[i]; sumB += bArr[i];
+        }
+        const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
+        let varR = 0, varG = 0, varB = 0;
+        for (let i = 0; i < n; i++) {
+          varR += (rArr[i] - meanR) ** 2;
+          varG += (gArr[i] - meanG) ** 2;
+          varB += (bArr[i] - meanB) ** 2;
+        }
+        const maxStddev = Math.max(Math.sqrt(varR / n), Math.sqrt(varG / n), Math.sqrt(varB / n));
+        if (maxStddev < LOW_DETAIL_SMOOTH_STDDEV) smoothCount++;
+      }
+    }
+    if (totalBlocks < 4) return false;
+    return (smoothCount / totalBlocks) >= LOW_DETAIL_SMOOTH_BLOCK_RATIO;
+  } catch (err) {
+    console.warn('Screen comparer: isLowDetailBuffer failed', err.message);
     return false;
   }
 }
@@ -4371,6 +4482,20 @@ async function captureCamera() {
               resolve();
               return;
             }
+            const cameraWhite = await isWhiteScreenBuffer(buffer);
+            if (cameraWhite) {
+              console.log('Screen comparer: camera image is white (covered) - stopping tracker');
+              await stopTracking();
+              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
+              await ipcRenderer.invoke('show-overlay', {
+                title: 'Camera covered',
+                message: 'Your camera appears covered (e.g. white tape or paper). Tracking has been stopped.',
+                icon: '📷',
+                isStopped: true
+              });
+              resolve();
+              return;
+            }
             const cameraSingleColor = await isSingleColorBuffer(buffer);
             if (cameraSingleColor) {
               console.log('Screen comparer: camera shows single color (covered e.g. tape) - stopping tracker');
@@ -4379,6 +4504,20 @@ async function captureCamera() {
               await ipcRenderer.invoke('show-overlay', {
                 title: 'Camera covered',
                 message: 'Your camera appears covered (e.g. tape or lens cap). Tracking has been stopped.',
+                icon: '📷',
+                isStopped: true
+              });
+              resolve();
+              return;
+            }
+            const cameraLowDetail = await isLowDetailBuffer(buffer);
+            if (cameraLowDetail) {
+              console.log('Screen comparer: camera shows low detail (gradient/few colors e.g. tape) - stopping tracker');
+              await stopTracking();
+              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
+              await ipcRenderer.invoke('show-overlay', {
+                title: 'Camera covered',
+                message: 'Your camera appears covered (e.g. tape with multiple colors). Tracking has been stopped.',
                 icon: '📷',
                 isStopped: true
               });

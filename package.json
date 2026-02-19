@@ -32,7 +32,7 @@
   "build": {
     "appId": "com.tracker.electron",
     "productName": "TimeFlow",
-    "asarUnpack": ["**/node_modules/sharp/**"],
+    "asarUnpack": ["**/node_modules/sharp/**", "**/node_modules/screenshot-desktop/lib/win32/**"],
     "directories": {
       "output": "release",
       "buildResources": "build"
