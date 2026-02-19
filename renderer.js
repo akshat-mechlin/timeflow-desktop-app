@@ -930,15 +930,14 @@ ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
   }
 });
 
-// Fallback: poll system idle from renderer so we still detect activity if main's PowerShell monitor fails (e.g. 30+ users).
-// GetLastInputInfo counts keyboard and mouse (clicks + movement) system-wide. Idle < 30s = treat as active.
+// Fallback: poll system idle from renderer so we still detect activity if main's monitor misses (cross-platform via Electron).
 let activityFallbackInterval = null;
 function startActivityFallbackPoll() {
   if (activityFallbackInterval) return;
   const POLL_MS = 5000;
   const IDLE_ACTIVE_THRESHOLD_SEC = 30;
   activityFallbackInterval = setInterval(async () => {
-    if (!isTracking || pauseStartTime || process.platform !== 'win32') return;
+    if (!isTracking || pauseStartTime) return;
     try {
       const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
       if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
