@@ -27,8 +27,8 @@ try {
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
-const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
+const supabaseUrl = 'https://ljhnrsejkjtbsabumonk.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqaG5yc2Vqa2p0YnNhYnVtb25rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk1NDA5NTksImV4cCI6MjA4NTExNjk1OX0.CJ2xmJMJFr0-Pg5irL3d70QRkRpTcfiJ61wSalabaJ8';
 
 console.log('Initializing Supabase client...');
 console.log('Supabase URL:', supabaseUrl);
@@ -3896,11 +3896,12 @@ async function captureScreenshotAndCamera() {
   }
 
   captureInProgress = true;
-  lastCaptureTime = Date.now();
   try {
     await captureScreenshotAndCameraImpl();
   } finally {
     captureInProgress = false;
+    // Mark cycle complete so watchdog and catch-up use "last completed" time, not start time
+    lastCaptureTime = Date.now();
   }
 }
 
@@ -4162,9 +4163,11 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-// Helper function to upload a screenshot (single attempt – no retries to avoid duplicate screenshots for same timestamp)
+const CAMERA_UPLOAD_TIMEOUT_MS = 45000; // 45s – avoid capture loop hanging on slow API
 const UPLOAD_TIMEOUT_MS = 60000; // 60s so rate-limited API can still succeed
+const UPLOAD_RETRY_DELAY_MS = 1000; // Delay before single retry (screenshot and camera): first try, one retry, then exit
 
+// Screenshot: first attempt, one retry on failure, then exit (no further retries to avoid data inconsistency)
 async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   if (!screenshotBuffer || screenshotBuffer.length === 0) {
     throw new Error('Screenshot buffer is empty');
@@ -4194,7 +4197,37 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
     );
 
     if (screenshotError) {
-      console.warn('Screenshot upload failed:', screenshotError.message || screenshotError);
+      // Single retry only: first attempt failed, try once more then exit
+      console.warn('Screenshot upload failed, retrying once:', screenshotError.message || screenshotError);
+      await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+      let retryData = null;
+      let retryError = null;
+      try {
+        const retry = await withTimeout(
+          supabase.storage.from('screenshots').upload(screenshotFileName, screenshotFile, { contentType: 'image/png', upsert: false }),
+          UPLOAD_TIMEOUT_MS,
+          'Screenshot upload retry'
+        );
+        retryData = retry && retry.data;
+        retryError = retry && retry.error;
+      } catch (e) {
+        retryError = e;
+      }
+      if (retryError) {
+        console.warn('Screenshot upload retry failed, skipping this capture:', retryError.message || retryError);
+        return;
+      }
+      if (retryData) {
+        const { error: insertError } = await supabase
+          .from('screenshots')
+          .insert({
+            time_entry_id: timeEntryId,
+            storage_path: screenshotFileName,
+            type: 'screenshot',
+            taken_at: new Date().toISOString()
+          });
+        if (insertError) console.error('Error inserting screenshot record:', insertError);
+      }
       return;
     }
 
@@ -4570,28 +4603,35 @@ async function captureCamera() {
           const cameraFile = fs.readFileSync(cameraPath);
           
           console.log(`Uploading camera capture to screenshots bucket: ${cameraFileName}`);
-          const { data: cameraData, error: cameraError } = await supabase.storage
-            .from('screenshots')
-            .upload(cameraFileName, cameraFile, {
+          let uploadResult = await withTimeout(
+            supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
               contentType: 'image/png',
               upsert: false
-            });
+            }),
+            CAMERA_UPLOAD_TIMEOUT_MS,
+            'Camera storage upload'
+          ).catch(err => ({ data: null, error: err }));
+          let cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
+          let cameraError = uploadResult ? uploadResult.error : null;
 
+          // Single retry only: if first attempt failed, try once more then exit
           if (cameraError) {
-            console.error('Error uploading camera capture:', cameraError);
-            console.error('Error details:', JSON.stringify(cameraError, null, 2));
-            
-            // Check if it's a bucket/path issue
-            if (cameraError.message && (cameraError.message.includes('bucket') || cameraError.message.includes('not found'))) {
-              console.error('❌ Storage bucket issue - check if "screenshots" bucket exists in Supabase Storage');
-            }
-            if (cameraError.message && cameraError.message.includes('policy')) {
-              console.error('❌ Storage policy issue - check RLS policies for screenshots bucket (camera folder)');
-            }
-            if (cameraError.message && cameraError.message.includes('permission')) {
-              console.error('❌ Storage permission issue - check storage policies allow uploads to screenshots/camera/{user_id}/*');
-            }
-            
+            console.warn('Camera upload failed, retrying once:', cameraError.message || cameraError);
+            await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+            uploadResult = await withTimeout(
+              supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
+                contentType: 'image/png',
+                upsert: false
+              }),
+              CAMERA_UPLOAD_TIMEOUT_MS,
+              'Camera storage upload retry'
+            ).catch(err => ({ data: null, error: err }));
+            cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
+            cameraError = uploadResult ? uploadResult.error : null;
+          }
+          if (cameraError) {
+            console.warn('Camera upload retry failed, skipping this capture:', cameraError.message || cameraError);
+            try { fs.unlinkSync(cameraPath); } catch (_) {}
             resolve();
             return;
           }
@@ -4645,9 +4685,11 @@ async function captureCamera() {
       stack: error.stack
     });
     
-    if (errorName === 'NotReadableError' || errorMessage.includes('Could not start video source')) {
-      // Camera in use (e.g. Teams) – next capture will be scheduled sooner so we resume when call ends
-      console.warn('Camera is in use or unavailable:', errorMessage);
+    const likelyInUse = errorName === 'NotReadableError' ||
+      /Could not start video source|in use|resource.*busy|device.*busy|overconstrained|timeout/i.test(errorMessage);
+    if (likelyInUse) {
+      // Camera in use (e.g. Teams/video call) – next capture in 90s so we resume when call ends
+      console.warn('Camera is in use or temporarily unavailable:', errorMessage);
       cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
       // User disabled camera in Windows mid-session – stop tracking to prevent abuse
@@ -4663,10 +4705,6 @@ async function captureCamera() {
       return;
     } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
       console.warn('No camera device found:', errorMessage);
-      // Continue tracking without camera
-    } else if (errorMessage.includes('timeout')) {
-      console.warn('Camera capture timeout:', errorMessage);
-      // Continue tracking without camera
     } else {
       // Other errors - log but continue
       console.warn('Camera capture error (continuing without camera):', errorName, errorMessage);
