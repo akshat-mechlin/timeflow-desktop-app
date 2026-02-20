@@ -27,8 +27,8 @@ try {
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
-const supabaseUrl = 'https://ljhnrsejkjtbsabumonk.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqaG5yc2Vqa2p0YnNhYnVtb25rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk1NDA5NTksImV4cCI6MjA4NTExNjk1OX0.CJ2xmJMJFr0-Pg5irL3d70QRkRpTcfiJ61wSalabaJ8';
+const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
 
 console.log('Initializing Supabase client...');
 console.log('Supabase URL:', supabaseUrl);
@@ -3604,13 +3604,9 @@ function getNextCaptureDelayMs() {
   return CAPTURE_INTERVAL_MIN_MS + Math.floor(Math.random() * (CAPTURE_INTERVAL_MAX_MS - CAPTURE_INTERVAL_MIN_MS + 1));
 }
 
-const CAMERA_RETRY_AFTER_IN_USE_MS = 90 * 1000; // When camera was in use (e.g. Teams), retry capture in 90s so we resume when call ends
-
 function scheduleNextCapture() {
   if (!isTracking || pauseStartTime || !timeEntryId) return;
-  // If camera was skipped last cycle (e.g. in use by Teams), schedule next capture sooner so we retry when call ends
-  const delay = cameraSkippedDueToInUse ? CAMERA_RETRY_AFTER_IN_USE_MS : getNextCaptureDelayMs();
-  const isCameraRetry = cameraSkippedDueToInUse;
+  const delay = getNextCaptureDelayMs(); // 5–7 min for all cycles (including after camera was in use)
   if (cameraSkippedDueToInUse) cameraSkippedDueToInUse = false;
   captureTimeoutId = setTimeout(() => {
     captureTimeoutId = null;
@@ -3623,7 +3619,7 @@ function scheduleNextCapture() {
         });
     }
   }, delay);
-  console.log(isCameraRetry ? 'Next capture in 90s (camera was in use – retry when call ends)' : `Next capture in ${Math.round(delay / 60000)} min`);
+  console.log(`Next capture in ${Math.round(delay / 60000)} min`);
 }
 
 function startPeriodicCaptures() {
