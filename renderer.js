@@ -2605,20 +2605,8 @@ async function checkCameraPermission() {
       // Continue anyway, might still work
     }
 
-    // Try to get camera access with a longer timeout (10 seconds)
-    // This gives more time for camera initialization, especially if it's being used by another app
-    const stream = await Promise.race([
-      navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        } 
-      }),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Camera access timeout')), 10000)
-      )
-    ]);
+    // Try to get camera access (uses same fallback as capture for Windows 11 / HP TrueVision)
+    const stream = await getCameraStreamWithFallback(10000);
     
     // If successful, stop the stream immediately
     if (stream && stream.getTracks) {
@@ -2673,20 +2661,9 @@ async function checkCameraDevice() {
       return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
     }
 
-    // Try to access the camera to verify it's actually available
+    // Try to access the camera to verify it's actually available (fallback for Windows 11 / HP TrueVision)
     try {
-      const stream = await Promise.race([
-        navigator.mediaDevices.getUserMedia({ 
-          video: { 
-            facingMode: 'user',
-            width: { ideal: 640 },
-            height: { ideal: 480 }
-          } 
-        }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Camera access timeout')), 5000)
-        )
-      ]);
+      const stream = await getCameraStreamWithFallback(5000);
       
       // If successful, stop the stream immediately
       if (stream && stream.getTracks) {
@@ -4319,6 +4296,54 @@ async function captureScreenshotWithElectron(sourceId) {
   }
 }
 
+// Get camera stream with fallbacks for Windows 11 (e.g. HP TrueVision not reporting facingMode).
+// Tries: (1) facingMode 'user', (2) each video device by deviceId, (3) video: true.
+async function getCameraStreamWithFallback(timeoutMs) {
+  const timeout = timeoutMs || 10000;
+  const baseConstraints = {
+    width: { ideal: 640, max: 1280 },
+    height: { ideal: 480, max: 720 }
+  };
+
+  const tryGetUserMedia = (constraints) =>
+    Promise.race([
+      navigator.mediaDevices.getUserMedia(constraints),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Camera access timeout')), timeout))
+    ]);
+
+  try {
+    const stream = await tryGetUserMedia({
+      video: { ...baseConstraints, facingMode: 'user' }
+    });
+    if (stream) return stream;
+  } catch (firstErr) {
+    const isOverconstrained = firstErr.name === 'OverconstrainedError' || (firstErr.message && firstErr.message.includes('Constraint'));
+    const isNotFound = firstErr.name === 'NotFoundError' || firstErr.name === 'DevicesNotFoundError';
+    if (!isOverconstrained && !isNotFound) throw firstErr;
+
+    console.warn('Camera (facingMode user) failed, trying by deviceId (Windows 11 fallback):', firstErr.message || firstErr.name);
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoInputs = devices.filter(d => d.kind === 'videoinput');
+  for (const device of videoInputs) {
+    if (!device.deviceId) continue;
+    try {
+      const stream = await tryGetUserMedia({
+        video: { ...baseConstraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
+      });
+      if (stream) {
+        console.log('Camera obtained by deviceId (e.g. HP TrueVision on Windows 11):', device.label || device.deviceId);
+        return stream;
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+
+  return tryGetUserMedia({ video: true });
+}
+
 async function captureCamera() {
   // Always attempt camera capture if tracking is active
   if (!isTracking) {
@@ -4344,15 +4369,7 @@ async function captureCamera() {
   try {
     console.log('Starting camera capture...');
     
-    // Get camera stream - only when we need to capture
-    // Use more lenient constraints to avoid conflicts
-    stream = await navigator.mediaDevices.getUserMedia({ 
-      video: { 
-        width: { ideal: 640, max: 1280 },
-        height: { ideal: 480, max: 720 },
-        facingMode: 'user'
-      } 
-    });
+    stream = await getCameraStreamWithFallback(10000);
     
     console.log('Camera stream obtained');
     
