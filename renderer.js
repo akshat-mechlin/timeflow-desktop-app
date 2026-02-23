@@ -200,26 +200,55 @@ const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
 const TASKBAR_HEIGHT_PX = 48; // Pixels to exclude from bottom for comparison (taskbar)
 const COMPARE_RESIZE_WIDTH = 48; // Downscale content for hash (smaller = more tolerant of tiny differences)
 const CONSECUTIVE_SAME_THRESHOLD = 1; // Auto-stop after 2 consecutive identical screens (1 = trigger when current matches previous)
-const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark
+const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark (screen only)
 const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
-const WHITE_LUMINANCE_MIN = 220; // Pixel luminance at or above this = white (camera covered with white tape etc.)
-const WHITE_PIXEL_RATIO = 0.90; // If this fraction of pixels is white, treat as white / camera covered
 const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
-const SINGLE_COLOR_STDDEV_THRESHOLD = 26; // If max R,G,B stddev below this, image is one solid color (dark or light tape)
-const SINGLE_COLOR_DOMINANT_RATIO = 0.88; // If this fraction of pixels is within SINGLE_COLOR_TOLERANCE of median color, treat as covered
-const SINGLE_COLOR_TOLERANCE = 28; // Max per-channel distance from median to count as "same color" (catches light gradients)
-// Low-detail / gradient: tape with 2+ colors (e.g. white + blue) – each small region is nearly solid
-const LOW_DETAIL_BLOCK_SIZE = 16; // Pixels per block (image resized then split into blocks)
-const LOW_DETAIL_SMOOTH_STDDEV = 38; // Block with max(R,G,B) stddev below this = "smooth" (no texture)
-const LOW_DETAIL_SMOOTH_BLOCK_RATIO = 0.82; // If this fraction of blocks are smooth, treat as covered (gradient/tape)
 // Only compare last 2 screens (and trigger "screen unchanged") when user is active; if inactive, let inactivity overlay handle it
 const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
 let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
-// Camera comparer: same-image detection and black → visible (shutter removed) detection
-let lastCameraContentHashForComparer = null;
-let consecutiveSameCameraCount = 0;
-let lastCameraWasBlack = false; // true if previous camera frame was black (lens covered)
+// Face detection: lightweight check on start and every 5–7 min (no tape/black logic)
+const FACE_API_WEIGHTS_BASE = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+let faceApiModelsLoaded = false;
+let faceApiLoadPromise = null;
+
+async function loadFaceApiModels() {
+  if (faceApiModelsLoaded) return true;
+  if (faceApiLoadPromise) return faceApiLoadPromise;
+  faceApiLoadPromise = (async () => {
+    if (typeof faceapi === 'undefined') {
+      console.warn('Face detection: face-api not loaded (script missing or blocked)');
+      return false;
+    }
+    try {
+      await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_WEIGHTS_BASE);
+      faceApiModelsLoaded = true;
+      console.log('Face detection: tiny face detector loaded');
+      return true;
+    } catch (err) {
+      console.warn('Face detection: failed to load models', err.message);
+      return false;
+    }
+  })();
+  return faceApiLoadPromise;
+}
+
+/**
+ * Returns true if at least one face is detected in the canvas. Minimal CPU: runs only when needed.
+ */
+async function detectFaceInCanvas(canvas) {
+  if (!canvas || canvas.width < 10 || canvas.height < 10) return false;
+  const loaded = await loadFaceApiModels();
+  if (!loaded) return true; // allow when models unavailable (e.g. offline)
+  try {
+    const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.4 });
+    const detections = await faceapi.detectAllFaces(canvas, opts);
+    return detections && detections.length > 0;
+  } catch (err) {
+    console.warn('Face detection: detect failed', err.message);
+    return true; // do not block on detection errors
+  }
+}
 
 // Capture Settings Manager
 let captureSettings = {
@@ -1386,15 +1415,16 @@ function showCameraDetectionModal(customMessage, reason) {
   }
   
   const defaultMessage = 'No camera device detected. Please connect a camera to start tracking.';
-  if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : '📷';
+  if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : (reason === 'face' ? '👤' : '📷');
   if (cameraTitle) {
     if (reason === 'screenshot') cameraTitle.textContent = 'Screenshot access required';
+    else if (reason === 'face') cameraTitle.textContent = 'Employee not detected';
     else if (reason === 'permission' || (customMessage && customMessage.includes('Allow desktop apps'))) cameraTitle.textContent = 'Camera access required';
     else cameraTitle.textContent = 'Camera Required';
   }
   cameraMessage.textContent = customMessage || defaultMessage;
   
-  if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : 'Retry';
+  if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : (reason === 'face' ? 'OK' : 'Retry');
   
   // Setup retry button based on reason
   if (retryBtn) {
@@ -1423,6 +1453,10 @@ function showCameraDetectionModal(customMessage, reason) {
         } else {
           cameraMessage.textContent = (result.error || 'Screenshot access is still not allowed.') + '\n\nEnable screen recording in Windows Settings → Privacy, then click Start Tracking again.';
         }
+      };
+    } else if (reason === 'face') {
+      retryBtn.onclick = () => {
+        hideCameraDetectionModal();
       };
     } else {
       retryBtn.onclick = async () => {
@@ -2839,6 +2873,15 @@ async function startTracking() {
     console.log('Camera capture is disabled for this user - skipping camera device check');
   }
 
+  // Face check when camera is enabled: do not start unless a face is detected
+  if (captureSettings.enableCameraCapture) {
+    const faceDetected = await checkFaceBeforeStart();
+    if (!faceDetected) {
+      showCameraDetectionModal('Employee not detected. Please ensure your face is visible in the camera.', 'face');
+      return;
+    }
+  }
+
   // CRITICAL: Always check day cycle FIRST before starting tracking
   // This ensures we never start tracking with old day's data
   const newDayCycle = getCurrentDayCycle();
@@ -2882,12 +2925,9 @@ async function startTracking() {
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
   keystrokeCount = 0;
-  // Reset screen and camera comparer state so auto-stop uses fresh baseline
+  // Reset screen comparer state so auto-stop uses fresh baseline
   lastContentHashForComparer = null;
   consecutiveSameScreenCount = 0;
-  lastCameraContentHashForComparer = null;
-  consecutiveSameCameraCount = 0;
-  lastCameraWasBlack = false;
   cameraSkippedDueToInUse = false;
 
   // Get profile
@@ -3703,160 +3743,6 @@ async function isBlackScreenBuffer(buffer) {
   }
 }
 
-/**
- * Returns true if the image is mostly white (e.g. camera covered with white tape/paper).
- */
-async function isWhiteScreenBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return false;
-  try {
-    const { data: raw, info } = await sharp(buffer)
-      .resize(100, 100, { fit: 'inside' })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const channels = info.channels || 3;
-    const pixelCount = Math.floor(raw.length / channels);
-    let whiteCount = 0;
-    for (let i = 0; i < raw.length; i += channels) {
-      const r = raw[i];
-      const g = raw[i + 1];
-      const b = raw[i + 2];
-      const luminance = (0.299 * r + 0.587 * g + 0.114 * b);
-      if (luminance >= WHITE_LUMINANCE_MIN) whiteCount++;
-    }
-    return (whiteCount / pixelCount) >= WHITE_PIXEL_RATIO;
-  } catch (err) {
-    console.warn('Screen comparer: isWhiteScreenBuffer failed', err.message);
-    return false;
-  }
-}
-
-/**
- * Returns true if the image is effectively a single solid color (any color).
- * Detects camera covered by tape – dark, light, white, or any single color including
- * light blue/grey/teal (with slight gradient) by using both stddev and dominant-color coverage.
- */
-async function isSingleColorBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return false;
-  try {
-    const { data: raw, info } = await sharp(buffer)
-      .resize(80, 80, { fit: 'inside' })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const channels = info.channels || 3;
-    const n = Math.floor(raw.length / channels);
-    if (n < 10) return false;
-    const rArr = [], gArr = [], bArr = [];
-    for (let i = 0; i < raw.length; i += channels) {
-      rArr.push(raw[i]);
-      gArr.push(raw[i + 1]);
-      bArr.push(raw[i + 2]);
-    }
-    rArr.sort((a, b) => a - b);
-    gArr.sort((a, b) => a - b);
-    bArr.sort((a, b) => a - b);
-    const mid = Math.floor(n / 2);
-    const medR = n % 2 ? rArr[mid] : (rArr[mid - 1] + rArr[mid]) / 2;
-    const medG = n % 2 ? gArr[mid] : (gArr[mid - 1] + gArr[mid]) / 2;
-    const medB = n % 2 ? bArr[mid] : (bArr[mid - 1] + bArr[mid]) / 2;
-    let nearCount = 0;
-    let sumR = 0, sumG = 0, sumB = 0;
-    for (let i = 0; i < raw.length; i += channels) {
-      const r = raw[i], g = raw[i + 1], b = raw[i + 2];
-      sumR += r; sumG += g; sumB += b;
-      const dr = Math.abs(r - medR), dg = Math.abs(g - medG), db = Math.abs(b - medB);
-      if (dr <= SINGLE_COLOR_TOLERANCE && dg <= SINGLE_COLOR_TOLERANCE && db <= SINGLE_COLOR_TOLERANCE) nearCount++;
-    }
-    const dominantRatio = nearCount / n;
-    if (dominantRatio >= SINGLE_COLOR_DOMINANT_RATIO) return true;
-    const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
-    let varR = 0, varG = 0, varB = 0;
-    for (let i = 0; i < raw.length; i += channels) {
-      varR += (raw[i] - meanR) ** 2;
-      varG += (raw[i + 1] - meanG) ** 2;
-      varB += (raw[i + 2] - meanB) ** 2;
-    }
-    const maxStddev = Math.max(Math.sqrt(varR / n), Math.sqrt(varG / n), Math.sqrt(varB / n));
-    return maxStddev < SINGLE_COLOR_STDDEV_THRESHOLD;
-  } catch (err) {
-    console.warn('Screen comparer: isSingleColorBuffer failed', err.message);
-    return false;
-  }
-}
-
-/**
- * Returns true if the image has very low detail (smooth gradient or few colors, e.g. tape with white + blue).
- * Splits into small blocks; if most blocks have low color variance, the frame is "smooth" → likely covered.
- */
-async function isLowDetailBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return false;
-  try {
-    const size = 80; // resize to 80x80 so 5x5 blocks of 16x16
-    const { data: raw, info } = await sharp(buffer)
-      .resize(size, size, { fit: 'fill' })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const channels = info.channels || 3;
-    const blockSize = LOW_DETAIL_BLOCK_SIZE;
-    const blocksX = Math.floor(size / blockSize);
-    const blocksY = Math.floor(size / blockSize);
-    let smoothCount = 0;
-    let totalBlocks = 0;
-    for (let by = 0; by < blocksY; by++) {
-      for (let bx = 0; bx < blocksX; bx++) {
-        const rArr = [], gArr = [], bArr = [];
-        for (let py = by * blockSize; py < (by + 1) * blockSize && py < size; py++) {
-          for (let px = bx * blockSize; px < (bx + 1) * blockSize && px < size; px++) {
-            const i = (py * size + px) * channels;
-            rArr.push(raw[i]);
-            gArr.push(raw[i + 1]);
-            bArr.push(raw[i + 2]);
-          }
-        }
-        const n = rArr.length;
-        if (n < 4) continue;
-        totalBlocks++;
-        let sumR = 0, sumG = 0, sumB = 0;
-        for (let i = 0; i < n; i++) {
-          sumR += rArr[i]; sumG += gArr[i]; sumB += bArr[i];
-        }
-        const meanR = sumR / n, meanG = sumG / n, meanB = sumB / n;
-        let varR = 0, varG = 0, varB = 0;
-        for (let i = 0; i < n; i++) {
-          varR += (rArr[i] - meanR) ** 2;
-          varG += (gArr[i] - meanG) ** 2;
-          varB += (bArr[i] - meanB) ** 2;
-        }
-        const maxStddev = Math.max(Math.sqrt(varR / n), Math.sqrt(varG / n), Math.sqrt(varB / n));
-        if (maxStddev < LOW_DETAIL_SMOOTH_STDDEV) smoothCount++;
-      }
-    }
-    if (totalBlocks < 4) return false;
-    return (smoothCount / totalBlocks) >= LOW_DETAIL_SMOOTH_BLOCK_RATIO;
-  } catch (err) {
-    console.warn('Screen comparer: isLowDetailBuffer failed', err.message);
-    return false;
-  }
-}
-
-/**
- * Hash of full image for "same camera image" comparison (e.g. something covering lens).
- * Used only when camera capture is enabled. Returns null if sharp unavailable or fails.
- */
-async function getCameraImageHash(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return null;
-  try {
-    const raw = await sharp(buffer)
-      .resize(COMPARE_RESIZE_WIDTH, COMPARE_RESIZE_WIDTH, { fit: 'fill' })
-      .grayscale()
-      .raw()
-      .toBuffer();
-    return crypto.createHash('sha256').update(raw).digest('hex');
-  } catch (err) {
-    console.warn('Screen comparer: getCameraImageHash failed', err.message);
-    return null;
-  }
-}
-
 async function captureScreenshotAndCamera() {
   // Always attempt capture if tracking is active - don't skip due to pause
   if (!isTracking) {
@@ -4344,6 +4230,54 @@ async function getCameraStreamWithFallback(timeoutMs) {
   return tryGetUserMedia({ video: true });
 }
 
+/** One-off face check before starting tracker. Returns true if face detected or camera disabled. Releases stream. */
+async function checkFaceBeforeStart() {
+  if (!captureSettings.enableCameraCapture) return true;
+  let stream = null;
+  let video = null;
+  try {
+    stream = await getCameraStreamWithFallback(8000);
+    video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.muted = true;
+    video.setAttribute('playsinline', 'true');
+    video.style.position = 'fixed';
+    video.style.top = '-9999px';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    document.body.appendChild(video);
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Video timeout')), 5000);
+      video.addEventListener('loadedmetadata', () => {
+        clearTimeout(t);
+        video.play().then(() => setTimeout(resolve, 250)).catch(reject);
+      }, { once: true });
+      video.onerror = () => { clearTimeout(t); reject(new Error('Video error')); };
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const hasFace = await detectFaceInCanvas(canvas);
+    return hasFace;
+  } catch (err) {
+    console.warn('Face check before start failed:', err.message);
+    return true; // do not block start on errors
+  } finally {
+    if (stream && stream.getTracks) stream.getTracks().forEach(t => { t.stop(); });
+    if (video) {
+      try {
+        video.pause();
+        video.srcObject = null;
+        if (video.parentNode) video.parentNode.removeChild(video);
+      } catch (_) {}
+    }
+  }
+}
+
 async function captureCamera() {
   // Always attempt camera capture if tracking is active
   if (!isTracking) {
@@ -4456,6 +4390,29 @@ async function captureCamera() {
     
     console.log(`Camera frame captured: ${canvas.width}x${canvas.height}`);
 
+    // Face check every 5–7 min: stop tracker if no face detected
+    const faceDetected = await detectFaceInCanvas(canvas);
+    if (!faceDetected) {
+      console.log('Face detection: no face in camera - stopping tracker');
+      if (stream && stream.getTracks) {
+        stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
+      }
+      if (video) {
+        try { video.pause(); video.srcObject = null; if (video.parentNode) video.parentNode.removeChild(video); } catch (_) {}
+      }
+      video = null;
+      stream = null;
+      await stopTracking();
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Employee not detected';
+      await ipcRenderer.invoke('show-overlay', {
+        title: 'Employee not detected',
+        message: 'No face was detected in the camera. Tracking has been stopped.',
+        icon: '👤',
+        isStopped: true
+      });
+      return;
+    }
+
     // CRITICAL: Release camera IMMEDIATELY after capturing frame
     // Stop all tracks first
     if (stream && stream.getTracks) {
@@ -4508,96 +4465,6 @@ async function captureCamera() {
             console.error('Buffer is empty - camera capture failed');
             resolve();
             return;
-          }
-
-          // Camera comparer: compare current shot with last; detect black, single color (covered), unchanged, shutter-removed
-          if (sharp) {
-            const cameraBlack = await isBlackScreenBuffer(buffer);
-            if (cameraBlack) {
-              lastCameraWasBlack = true;
-              console.log('Screen comparer: camera image is black - stopping tracker');
-              await stopTracking();
-              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera is black';
-              await ipcRenderer.invoke('show-overlay', {
-                title: 'Camera black',
-                message: 'Your camera image appears black. Tracking has been stopped.',
-                icon: '📷',
-                isStopped: true
-              });
-              resolve();
-              return;
-            }
-            const cameraWhite = await isWhiteScreenBuffer(buffer);
-            if (cameraWhite) {
-              console.log('Screen comparer: camera image is white (covered) - stopping tracker');
-              await stopTracking();
-              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
-              await ipcRenderer.invoke('show-overlay', {
-                title: 'Camera covered',
-                message: 'Your camera appears covered (e.g. white tape or paper). Tracking has been stopped.',
-                icon: '📷',
-                isStopped: true
-              });
-              resolve();
-              return;
-            }
-            const cameraSingleColor = await isSingleColorBuffer(buffer);
-            if (cameraSingleColor) {
-              console.log('Screen comparer: camera shows single color (covered e.g. tape) - stopping tracker');
-              await stopTracking();
-              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
-              await ipcRenderer.invoke('show-overlay', {
-                title: 'Camera covered',
-                message: 'Your camera appears covered (e.g. tape or lens cap). Tracking has been stopped.',
-                icon: '📷',
-                isStopped: true
-              });
-              resolve();
-              return;
-            }
-            const cameraLowDetail = await isLowDetailBuffer(buffer);
-            if (cameraLowDetail) {
-              console.log('Screen comparer: camera shows low detail (gradient/few colors e.g. tape) - stopping tracker');
-              await stopTracking();
-              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered';
-              await ipcRenderer.invoke('show-overlay', {
-                title: 'Camera covered',
-                message: 'Your camera appears covered (e.g. tape with multiple colors). Tracking has been stopped.',
-                icon: '📷',
-                isStopped: true
-              });
-              resolve();
-              return;
-            }
-            // Last frame was black but current is visible = user removed shutter; reset comparer baseline
-            if (lastCameraWasBlack) {
-              console.log('Screen comparer: camera visible again (shutter removed) - resetting baseline');
-              lastCameraContentHashForComparer = null;
-              consecutiveSameCameraCount = 0;
-              lastCameraWasBlack = false;
-            }
-            // Same camera image check (e.g. something covering lens - same frame every time)
-            const cameraHash = await getCameraImageHash(buffer);
-            if (cameraHash !== null) {
-              if (cameraHash === lastCameraContentHashForComparer) consecutiveSameCameraCount++;
-              else consecutiveSameCameraCount = 0;
-              lastCameraContentHashForComparer = cameraHash;
-              const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-              if (consecutiveSameCameraCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
-                console.log('Screen comparer: camera image unchanged for consecutive captures - stopping tracker');
-                await stopTracking();
-                if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera unchanged';
-                await ipcRenderer.invoke('show-overlay', {
-                  title: 'Camera unchanged',
-                  message: 'Your camera image has not changed. Tracking has been stopped.',
-                  icon: '📷',
-                  isStopped: true
-                });
-                resolve();
-                return;
-              }
-            }
-            lastCameraWasBlack = false; // current frame is not black
           }
 
           const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
