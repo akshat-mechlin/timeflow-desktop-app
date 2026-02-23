@@ -212,6 +212,17 @@ const FACE_API_WEIGHTS_BASE = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/fac
 let faceApiModelsLoaded = false;
 let faceApiLoadPromise = null;
 
+// Run once at load: Electron needs browser DOM for face-api (avoids "Illegal constructor" in any renderer)
+(function patchFaceApiEnv() {
+  if (typeof faceapi === 'undefined' || !faceapi.env || typeof faceapi.env.monkeyPatch !== 'function') return;
+  try {
+    faceapi.env.monkeyPatch({
+      createCanvasElement: () => document.createElement('canvas'),
+      createImageElement: () => document.createElement('img')
+    });
+  } catch (_) {}
+})();
+
 async function loadFaceApiModels() {
   if (faceApiModelsLoaded) return true;
   if (faceApiLoadPromise) return faceApiLoadPromise;
@@ -1415,10 +1426,10 @@ function showCameraDetectionModal(customMessage, reason) {
   }
   
   const defaultMessage = 'No camera device detected. Please connect a camera to start tracking.';
-  if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : (reason === 'face' ? '👤' : '📷');
+  if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : '📷';
   if (cameraTitle) {
     if (reason === 'screenshot') cameraTitle.textContent = 'Screenshot access required';
-    else if (reason === 'face') cameraTitle.textContent = 'Employee not detected';
+    else if (reason === 'face') cameraTitle.textContent = 'Camera covered or blur';
     else if (reason === 'permission' || (customMessage && customMessage.includes('Allow desktop apps'))) cameraTitle.textContent = 'Camera access required';
     else cameraTitle.textContent = 'Camera Required';
   }
@@ -2877,7 +2888,7 @@ async function startTracking() {
   if (captureSettings.enableCameraCapture) {
     const faceDetected = await checkFaceBeforeStart();
     if (!faceDetected) {
-      showCameraDetectionModal('Employee not detected. Please ensure your face is visible in the camera.', 'face');
+      showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
       return;
     }
   }
@@ -4403,11 +4414,11 @@ async function captureCamera() {
       video = null;
       stream = null;
       await stopTracking();
-      if (statusDisplay) statusDisplay.textContent = 'Stopped: Employee not detected';
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered or blur';
       await ipcRenderer.invoke('show-overlay', {
-        title: 'Employee not detected',
-        message: 'No face was detected in the camera. Tracking has been stopped.',
-        icon: '👤',
+        title: 'Camera covered or blur',
+        message: 'Your camera appears covered or blurry. Tracking has been stopped.',
+        icon: '📷',
         isStopped: true
       });
       return;
