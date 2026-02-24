@@ -766,6 +766,10 @@ document.addEventListener('visibilitychange', async () => {
     console.log('👁️ App became hidden - checking if screen is off...');
     await checkScreenOffAndStop();
   } else if (!document.hidden && currentUser) {
+    // App became visible - sync duration immediately (timers are throttled when hidden, so DB may be behind)
+    if (isTracking && timeEntryId && sessionStartTime) {
+      syncCurrentDuration().catch(err => console.error('Visibility sync failed:', err));
+    }
     // App became visible - validate day cycle
     console.log('🔄 App became visible - validating day cycle...');
     const newDayCycle = getCurrentDayCycle();
@@ -3451,7 +3455,7 @@ function startIdleDetection() {
 
     // Don't check if already paused
     if (pauseStartTime) {
-      idleTimer = setTimeout(checkIdle, 1000);
+      idleTimer = setTimeout(checkIdle, 5000);
       return;
     }
 
@@ -3517,8 +3521,8 @@ function startIdleDetection() {
       // User must click Continue (resume, no deduction) or Stop (deduct 5 min and stop).
     }
     
-    // Schedule next check
-    idleTimer = setTimeout(checkIdle, 1000);
+    // Schedule next check (5s is enough - idle threshold is 5 min; reduces CPU load)
+    idleTimer = setTimeout(checkIdle, 5000);
   }
 
   // Clear any existing idle timer before starting a new one
@@ -3531,8 +3535,8 @@ function startIdleDetection() {
     idleDoubleCheckTimer = null;
   }
   
-  // Start checking
-  idleTimer = setTimeout(checkIdle, 1000);
+  // Start checking every 5s (was 1s - reduces load without affecting 5-min idle detection)
+  idleTimer = setTimeout(checkIdle, 5000);
 }
 
 // Resume tracking after inactivity (called when user clicks Continue)
@@ -4647,7 +4651,7 @@ function startRealTimeUpdates() {
     realTimeUpdateInterval = null;
   }
   
-  // Performance optimization: Update duration in database every 2 minutes (reduced frequency)
+  // Sync every 1 minute so user time is never lost (2 min was causing reported 4h -> 2-3h when app was in background or under load)
   // Use baseDurationAtSessionStart to prevent double-counting
   realTimeUpdateInterval = setInterval(async () => {
     // Double-check isTracking and isStoppingTracking to prevent race conditions
@@ -4746,7 +4750,18 @@ function startRealTimeUpdates() {
         duration: totalDuration
       });
     }
-  }, 120000); // Optimized: Every 2 minutes (reduced from 1 minute for better performance)
+  }, 60000); // Every 1 minute - ensures time is never lost when app is in background or under load
+  // First sync after 30s so we don't wait a full minute for initial persist
+  setTimeout(() => {
+    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartTime) return;
+    const now = Date.now();
+    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    sessionDuration -= Math.floor(pausedDuration / 1000);
+    if (sessionDuration < 0) sessionDuration = 0;
+    const totalDuration = baseDurationAtSessionStart + sessionDuration;
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, { duration: totalDuration, timeEntryId: timeEntryId });
+    if (isOnline) syncCurrentDuration().catch(() => {});
+  }, 30000);
 }
 
 // Helper function to sync current duration to Supabase
