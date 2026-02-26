@@ -209,6 +209,10 @@ let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
 // Face detection: lightweight check on start and every 5–7 min (no tape/black logic)
 const FACE_API_WEIGHTS_BASE = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+// Higher inputSize = better for distant/small faces; 224 is a balance (128 was too strict at distance). Same tiny model, no extra download.
+// On very weak systems, try 160 for slightly less CPU while still better than 128.
+const FACE_DETECTOR_INPUT_SIZE = 224;
+const FACE_DETECTOR_SCORE_THRESHOLD = 0.35; // Slightly lenient so farther/partial faces still count
 let faceApiModelsLoaded = false;
 let faceApiLoadPromise = null;
 
@@ -246,13 +250,17 @@ async function loadFaceApiModels() {
 
 /**
  * Returns true if at least one face is detected in the canvas. Minimal CPU: runs only when needed.
+ * Uses inputSize 224 + lower scoreThreshold to improve detection when user is at a distance.
  */
 async function detectFaceInCanvas(canvas) {
   if (!canvas || canvas.width < 10 || canvas.height < 10) return false;
   const loaded = await loadFaceApiModels();
   if (!loaded) return true; // allow when models unavailable (e.g. offline)
   try {
-    const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.4 });
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize: FACE_DETECTOR_INPUT_SIZE,
+      scoreThreshold: FACE_DETECTOR_SCORE_THRESHOLD
+    });
     const detections = await faceapi.detectAllFaces(canvas, opts);
     return detections && detections.length > 0;
   } catch (err) {
