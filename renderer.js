@@ -27,8 +27,8 @@ try {
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
-const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
+const supabaseUrl = 'https://ljhnrsejkjtbsabumonk.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqaG5yc2Vqa2p0YnNhYnVtb25rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk1NDA5NTksImV4cCI6MjA4NTExNjk1OX0.CJ2xmJMJFr0-Pg5irL3d70QRkRpTcfiJ61wSalabaJ8';
 
 console.log('Initializing Supabase client...');
 console.log('Supabase URL:', supabaseUrl);
@@ -207,67 +207,6 @@ const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "uncha
 const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
 let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
-// Face detection: lightweight check on start and every 5–7 min (no tape/black logic)
-const FACE_API_WEIGHTS_BASE = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
-// Higher inputSize = better for distant/small faces; 224 is a balance (128 was too strict at distance). Same tiny model, no extra download.
-// On very weak systems, try 160 for slightly less CPU while still better than 128.
-const FACE_DETECTOR_INPUT_SIZE = 224;
-const FACE_DETECTOR_SCORE_THRESHOLD = 0.35; // Slightly lenient so farther/partial faces still count
-let faceApiModelsLoaded = false;
-let faceApiLoadPromise = null;
-
-// Run once at load: Electron needs browser DOM for face-api (avoids "Illegal constructor" in any renderer)
-(function patchFaceApiEnv() {
-  if (typeof faceapi === 'undefined' || !faceapi.env || typeof faceapi.env.monkeyPatch !== 'function') return;
-  try {
-    faceapi.env.monkeyPatch({
-      createCanvasElement: () => document.createElement('canvas'),
-      createImageElement: () => document.createElement('img')
-    });
-  } catch (_) {}
-})();
-
-async function loadFaceApiModels() {
-  if (faceApiModelsLoaded) return true;
-  if (faceApiLoadPromise) return faceApiLoadPromise;
-  faceApiLoadPromise = (async () => {
-    if (typeof faceapi === 'undefined') {
-      console.warn('Face detection: face-api not loaded (script missing or blocked)');
-      return false;
-    }
-    try {
-      await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_WEIGHTS_BASE);
-      faceApiModelsLoaded = true;
-      console.log('Face detection: tiny face detector loaded');
-      return true;
-    } catch (err) {
-      console.warn('Face detection: failed to load models', err.message);
-      return false;
-    }
-  })();
-  return faceApiLoadPromise;
-}
-
-/**
- * Returns true if at least one face is detected in the canvas. Minimal CPU: runs only when needed.
- * Uses inputSize 224 + lower scoreThreshold to improve detection when user is at a distance.
- */
-async function detectFaceInCanvas(canvas) {
-  if (!canvas || canvas.width < 10 || canvas.height < 10) return false;
-  const loaded = await loadFaceApiModels();
-  if (!loaded) return true; // allow when models unavailable (e.g. offline)
-  try {
-    const opts = new faceapi.TinyFaceDetectorOptions({
-      inputSize: FACE_DETECTOR_INPUT_SIZE,
-      scoreThreshold: FACE_DETECTOR_SCORE_THRESHOLD
-    });
-    const detections = await faceapi.detectAllFaces(canvas, opts);
-    return detections && detections.length > 0;
-  } catch (err) {
-    console.warn('Face detection: detect failed', err.message);
-    return true; // do not block on detection errors
-  }
-}
 
 // Capture Settings Manager
 let captureSettings = {
@@ -1441,13 +1380,12 @@ function showCameraDetectionModal(customMessage, reason) {
   if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : '📷';
   if (cameraTitle) {
     if (reason === 'screenshot') cameraTitle.textContent = 'Screenshot access required';
-    else if (reason === 'face') cameraTitle.textContent = 'Camera covered or blur';
     else if (reason === 'permission' || (customMessage && customMessage.includes('Allow desktop apps'))) cameraTitle.textContent = 'Camera access required';
     else cameraTitle.textContent = 'Camera Required';
   }
   cameraMessage.textContent = customMessage || defaultMessage;
   
-  if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : (reason === 'face' ? 'OK' : 'Retry');
+  if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : 'Retry';
   
   // Setup retry button based on reason
   if (retryBtn) {
@@ -1476,10 +1414,6 @@ function showCameraDetectionModal(customMessage, reason) {
         } else {
           cameraMessage.textContent = (result.error || 'Screenshot access is still not allowed.') + '\n\nEnable screen recording in Windows Settings → Privacy, then click Start Tracking again.';
         }
-      };
-    } else if (reason === 'face') {
-      retryBtn.onclick = () => {
-        hideCameraDetectionModal();
       };
     } else {
       retryBtn.onclick = async () => {
@@ -2896,15 +2830,6 @@ async function startTracking() {
     console.log('Camera capture is disabled for this user - skipping camera device check');
   }
 
-  // Face check when camera is enabled: do not start unless a face is detected
-  if (captureSettings.enableCameraCapture) {
-    const faceDetected = await checkFaceBeforeStart();
-    if (!faceDetected) {
-      showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
-      return;
-    }
-  }
-
   // CRITICAL: Always check day cycle FIRST before starting tracking
   // This ensures we never start tracking with old day's data
   const newDayCycle = getCurrentDayCycle();
@@ -4253,54 +4178,6 @@ async function getCameraStreamWithFallback(timeoutMs) {
   return tryGetUserMedia({ video: true });
 }
 
-/** One-off face check before starting tracker. Returns true if face detected or camera disabled. Releases stream. */
-async function checkFaceBeforeStart() {
-  if (!captureSettings.enableCameraCapture) return true;
-  let stream = null;
-  let video = null;
-  try {
-    stream = await getCameraStreamWithFallback(8000);
-    video = document.createElement('video');
-    video.srcObject = stream;
-    video.autoplay = true;
-    video.muted = true;
-    video.setAttribute('playsinline', 'true');
-    video.style.position = 'fixed';
-    video.style.top = '-9999px';
-    video.style.left = '-9999px';
-    video.style.width = '1px';
-    video.style.height = '1px';
-    video.style.opacity = '0';
-    document.body.appendChild(video);
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Video timeout')), 5000);
-      video.addEventListener('loadedmetadata', () => {
-        clearTimeout(t);
-        video.play().then(() => setTimeout(resolve, 250)).catch(reject);
-      }, { once: true });
-      video.onerror = () => { clearTimeout(t); reject(new Error('Video error')); };
-    });
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-    const hasFace = await detectFaceInCanvas(canvas);
-    return hasFace;
-  } catch (err) {
-    console.warn('Face check before start failed:', err.message);
-    return true; // do not block start on errors
-  } finally {
-    if (stream && stream.getTracks) stream.getTracks().forEach(t => { t.stop(); });
-    if (video) {
-      try {
-        video.pause();
-        video.srcObject = null;
-        if (video.parentNode) video.parentNode.removeChild(video);
-      } catch (_) {}
-    }
-  }
-}
-
 async function captureCamera() {
   // Always attempt camera capture if tracking is active
   if (!isTracking) {
@@ -4412,29 +4289,6 @@ async function captureCamera() {
     }
     
     console.log(`Camera frame captured: ${canvas.width}x${canvas.height}`);
-
-    // Face check every 5–7 min: stop tracker if no face detected
-    const faceDetected = await detectFaceInCanvas(canvas);
-    if (!faceDetected) {
-      console.log('Face detection: no face in camera - stopping tracker');
-      if (stream && stream.getTracks) {
-        stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
-      }
-      if (video) {
-        try { video.pause(); video.srcObject = null; if (video.parentNode) video.parentNode.removeChild(video); } catch (_) {}
-      }
-      video = null;
-      stream = null;
-      await stopTracking();
-      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered or blur';
-      await ipcRenderer.invoke('show-overlay', {
-        title: 'Camera covered or blur',
-        message: 'Your camera appears covered or blurry. Tracking has been stopped.',
-        icon: '📷',
-        isStopped: true
-      });
-      return;
-    }
 
     // CRITICAL: Release camera IMMEDIATELY after capturing frame
     // Stop all tracks first
