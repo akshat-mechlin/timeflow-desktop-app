@@ -27,8 +27,8 @@ try {
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
 // Initialize Supabase client - Hardcoded credentials
-const supabaseUrl = 'https://ljhnrsejkjtbsabumonk.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqaG5yc2Vqa2p0YnNhYnVtb25rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk1NDA5NTksImV4cCI6MjA4NTExNjk1OX0.CJ2xmJMJFr0-Pg5irL3d70QRkRpTcfiJ61wSalabaJ8';
+const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
 
 console.log('Initializing Supabase client...');
 console.log('Supabase URL:', supabaseUrl);
