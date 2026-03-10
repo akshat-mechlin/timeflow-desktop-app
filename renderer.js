@@ -208,6 +208,10 @@ const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity thresh
 let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
 
+// Camera capture: always output at this size (single photo, no video)
+const CAMERA_CAPTURE_WIDTH = 1920;
+const CAMERA_CAPTURE_HEIGHT = 1080;
+
 // Capture Settings Manager
 let captureSettings = {
   enableScreenshotCapture: true, // Default to enabled
@@ -1384,7 +1388,7 @@ function showCameraDetectionModal(customMessage, reason) {
     else cameraTitle.textContent = 'Camera Required';
   }
   cameraMessage.textContent = customMessage || defaultMessage;
-  
+
   if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : 'Retry';
   
   // Setup retry button based on reason
@@ -4131,23 +4135,23 @@ async function captureScreenshotWithElectron(sourceId) {
 }
 
 // Get camera stream with fallbacks for Windows 11 (e.g. HP TrueVision not reporting facingMode).
-// Tries: (1) facingMode 'user', (2) each video device by deviceId, (3) video: true.
+// Requests 1920x1080; falls back to deviceId then video:true if needed.
 async function getCameraStreamWithFallback(timeoutMs) {
   const timeout = timeoutMs || 10000;
-  const baseConstraints = {
-    width: { ideal: 640, max: 1280 },
-    height: { ideal: 480, max: 720 }
+  const constraints = {
+    width: { ideal: CAMERA_CAPTURE_WIDTH },
+    height: { ideal: CAMERA_CAPTURE_HEIGHT }
   };
 
-  const tryGetUserMedia = (constraints) =>
+  const tryGetUserMedia = (opts) =>
     Promise.race([
-      navigator.mediaDevices.getUserMedia(constraints),
+      navigator.mediaDevices.getUserMedia(opts),
       new Promise((_, reject) => setTimeout(() => reject(new Error('Camera access timeout')), timeout))
     ]);
 
   try {
     const stream = await tryGetUserMedia({
-      video: { ...baseConstraints, facingMode: 'user' }
+      video: { ...constraints, facingMode: 'user' }
     });
     if (stream) return stream;
   } catch (firstErr) {
@@ -4164,7 +4168,7 @@ async function getCameraStreamWithFallback(timeoutMs) {
     if (!device.deviceId) continue;
     try {
       const stream = await tryGetUserMedia({
-        video: { ...baseConstraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
+        video: { ...constraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
       });
       if (stream) {
         console.log('Camera obtained by deviceId (e.g. HP TrueVision on Windows 11):', device.label || device.deviceId);
@@ -4175,7 +4179,7 @@ async function getCameraStreamWithFallback(timeoutMs) {
     }
   }
 
-  return tryGetUserMedia({ video: true });
+  return tryGetUserMedia({ video: { ...constraints } });
 }
 
 async function captureCamera() {
@@ -4189,24 +4193,16 @@ async function captureCamera() {
     return;
   }
   
-  // Check if camera capture is enabled
-  console.log('🔍 Checking camera capture setting:', captureSettings.enableCameraCapture);
   if (!captureSettings.enableCameraCapture) {
-    console.log('❌ Camera capture is disabled for this user - skipping camera');
+    console.log('Camera capture is disabled - skipping');
     return;
   }
-  console.log('✅ Camera capture is enabled - proceeding with camera capture');
 
   let stream = null;
   let video = null;
 
   try {
-    console.log('Starting camera capture...');
-    
     stream = await getCameraStreamWithFallback(10000);
-    
-    console.log('Camera stream obtained');
-    
     video = document.createElement('video');
     video.srcObject = stream;
     video.autoplay = true;
@@ -4226,8 +4222,8 @@ async function captureCamera() {
     // Wait for video to be ready and capture immediately
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error('Video load timeout after 5 seconds'));
-      }, 5000); // Increased timeout to 5 seconds for reliability
+        reject(new Error('Camera capture timeout'));
+      }, 6000);
 
       const onLoadedMetadata = () => {
         clearTimeout(timeout);
@@ -4264,96 +4260,51 @@ async function captureCamera() {
       };
     });
 
-    // Create canvas and capture frame immediately
     const canvas = document.createElement('canvas');
-    const videoWidth = video.videoWidth || 640;
-    const videoHeight = video.videoHeight || 480;
-    canvas.width = videoWidth;
-    canvas.height = videoHeight;
+    const srcW = video.videoWidth || 640;
+    const srcH = video.videoHeight || 480;
+    canvas.width = CAMERA_CAPTURE_WIDTH;
+    canvas.height = CAMERA_CAPTURE_HEIGHT;
     const ctx = canvas.getContext('2d');
-    
-    // Verify video has valid dimensions before drawing
-    if (videoWidth <= 0 || videoHeight <= 0) {
-      throw new Error(`Invalid video dimensions: ${videoWidth}x${videoHeight}`);
-    }
-    
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    
-    // Verify canvas has content
-    const imageData = ctx.getImageData(0, 0, Math.min(10, canvas.width), Math.min(10, canvas.height));
-    const hasContent = imageData.data.some(pixel => pixel !== 0);
-    
-    if (!hasContent) {
-      console.warn('Canvas appears to be empty - video might not have rendered yet');
-      // Still proceed, might be a false positive
-    }
-    
-    console.log(`Camera frame captured: ${canvas.width}x${canvas.height}`);
+    ctx.drawImage(video, 0, 0, srcW, srcH, 0, 0, CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT);
 
-    // CRITICAL: Release camera IMMEDIATELY after capturing frame
-    // Stop all tracks first
     if (stream && stream.getTracks) {
-      const tracks = stream.getTracks();
-      tracks.forEach(track => {
-        try {
-          track.stop(); // This releases the camera hardware
-          track.enabled = false;
-        } catch (e) {
-          // Ignore errors when stopping
-        }
-      });
+      stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
     }
-
-    // Clear video element references immediately
     if (video) {
       try {
         video.pause();
         video.srcObject = null;
-        video.load(); // Reset video element
-        
-        // Remove from DOM if it was added
-        if (video.parentNode) {
-          video.parentNode.removeChild(video);
-        }
-      } catch (e) {
-        // Ignore errors
-      }
-      video = null;
+        if (video.parentNode) video.parentNode.removeChild(video);
+      } catch (_) {}
     }
-
-    // Clear stream reference
+    video = null;
     stream = null;
+
+    console.log(`Camera shot captured: ${srcW}x${srcH} -> ${CAMERA_CAPTURE_WIDTH}x${CAMERA_CAPTURE_HEIGHT}`);
 
     // Convert canvas to buffer (camera is already released at this point)
     return new Promise((resolve) => {
       canvas.toBlob(async (blob) => {
         if (!blob) {
-          console.error('Canvas toBlob returned null - canvas might be empty');
+          console.error('Canvas toBlob returned null');
           resolve();
           return;
         }
-        
         try {
-          console.log(`Converting canvas to blob: ${blob.size} bytes`);
           const arrayBuffer = await blob.arrayBuffer();
           const buffer = Buffer.from(arrayBuffer);
-          
           if (buffer.length === 0) {
-            console.error('Buffer is empty - camera capture failed');
+            console.error('Camera capture buffer empty');
             resolve();
             return;
           }
-
           const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
           fs.writeFileSync(cameraPath, buffer);
-
-          // Verify file was created
           if (!fs.existsSync(cameraPath)) {
             throw new Error('Camera file was not created');
           }
-          
-          const fileStats = fs.statSync(cameraPath);
-          console.log(`Camera file created: ${cameraPath} (${fileStats.size} bytes)`);
+          console.log(`Camera file created: ${cameraPath} (${buffer.length} bytes)`);
 
           // Upload camera capture to screenshots bucket in camera folder
           const cameraFileName = `camera/${currentUser.id}/${Date.now()}-camera.png`;
@@ -4394,7 +4345,7 @@ async function captureCamera() {
           }
 
           if (cameraData) {
-            console.log('Camera capture uploaded successfully:', cameraData.path);
+            console.log('Camera capture uploaded:', cameraData.path);
             
             // Insert screenshot record with type 'camera'
             const { error: insertError } = await supabase
@@ -4406,27 +4357,12 @@ async function captureCamera() {
                 taken_at: new Date().toISOString()
               });
 
-            if (insertError) {
-              console.error('Error inserting camera record:', insertError);
-            } else {
-              console.log('Camera record inserted successfully');
-            }
-          } else {
-            console.warn('Camera upload returned no data');
+            if (insertError) console.error('Error inserting camera record:', insertError);
+            else console.log('Camera record inserted successfully');
           }
-
-          // Clean up temp file
-          try {
-          fs.unlinkSync(cameraPath);
-            console.log('Camera temp file cleaned up');
-          } catch (unlinkError) {
-            console.warn('Error deleting temp camera file:', unlinkError);
-          }
-          
-          resolve();
+          try { fs.unlinkSync(cameraPath); } catch (_) {}
         } catch (error) {
           console.error('Error processing camera capture:', error);
-          console.error('Error stack:', error.stack);
           resolve();
         }
       }, 'image/png', 0.95); // Use 0.95 quality to reduce file size

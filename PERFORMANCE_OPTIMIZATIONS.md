@@ -56,11 +56,7 @@
 - **Impact**: Prevents excessive DOM updates
 - **Location**: `startTimer()` function
 
-### 10. **Face detection tuned for distance + weak systems** ✅
-- **Model**: Still TinyFaceDetector only (no heavier Ssd/Mtcnn), same weights, no extra download
-- **inputSize**: 224 (was 128) for better detection when user is at a distance; on very weak systems set `FACE_DETECTOR_INPUT_SIZE` to 160 in `renderer.js`
-- **scoreThreshold**: 0.35 (was 0.4) so farther/partial faces still count
-- **Location**: `detectFaceInCanvas()`, constants `FACE_DETECTOR_INPUT_SIZE`, `FACE_DETECTOR_SCORE_THRESHOLD`
+### 10. **Camera capture (no face detection)**
 
 ## 📊 Performance Impact Summary
 
