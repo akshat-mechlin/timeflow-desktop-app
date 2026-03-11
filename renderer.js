@@ -196,17 +196,9 @@ let cachedDisplays = null;
 let displayCacheTimestamp = 0;
 const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
 
-// Screen comparer: auto-stop when screen unchanged or black (content region only, taskbar excluded)
-const TASKBAR_HEIGHT_PX = 48; // Pixels to exclude from bottom for comparison (taskbar)
-const COMPARE_RESIZE_WIDTH = 48; // Downscale content for hash (smaller = more tolerant of tiny differences)
-const CONSECUTIVE_SAME_THRESHOLD = 1; // Auto-stop after 2 consecutive identical screens (1 = trigger when current matches previous)
+// Screen comparer: auto-stop when screen is black (content region only)
 const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark (screen only)
 const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
-const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
-// Only compare last 2 screens (and trigger "screen unchanged") when user is active; if inactive, let inactivity overlay handle it
-const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
-let lastContentHashForComparer = null;
-let consecutiveSameScreenCount = 0;
 
 // Camera capture: always output at this size (single photo, no video)
 const CAMERA_CAPTURE_WIDTH = 1920;
@@ -2877,9 +2869,6 @@ async function startTracking() {
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
   keystrokeCount = 0;
-  // Reset screen comparer state so auto-stop uses fresh baseline
-  lastContentHashForComparer = null;
-  consecutiveSameScreenCount = 0;
   cameraSkippedDueToInUse = false;
 
   // Get profile
@@ -3641,32 +3630,6 @@ function startPeriodicCaptures() {
 }
 
 /**
- * Get a hash of the screenshot content region (excludes taskbar) for "same image" comparison.
- * Returns null if sharp is unavailable or processing fails.
- */
-async function getContentHashFromBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return null;
-  try {
-    const image = sharp(buffer);
-    const meta = await image.metadata();
-    const w = meta.width || 0;
-    const h = meta.height || 0;
-    if (w < 10 || h <= TASKBAR_HEIGHT_PX) return null;
-    const contentHeight = Math.max(10, h - TASKBAR_HEIGHT_PX);
-    const raw = await image
-      .extract({ left: 0, top: 0, width: w, height: contentHeight })
-      .resize(COMPARE_RESIZE_WIDTH, null, { withoutEnlargement: true })
-      .grayscale()
-      .raw()
-      .toBuffer();
-    return crypto.createHash('sha256').update(raw).digest('hex');
-  } catch (err) {
-    console.warn('Screen comparer: getContentHashFromBuffer failed', err.message);
-    return null;
-  }
-}
-
-/**
  * Returns true if the screenshot appears to be a black (or near-black) screen.
  * Uses a downscaled sample to avoid high memory use.
  */
@@ -3820,7 +3783,7 @@ async function captureScreenshotAndCameraImpl() {
             const source = sources[i];
             const screenshotBuffer = await captureScreenshotWithElectron(source.id);
             if (screenshotBuffer) {
-              // Screen comparer: on first screen, check black and unchanged then maybe auto-stop
+              // Screen comparer: on first screen, check black then maybe auto-stop
               if (i === 0 && sharp) {
                 const black = await isBlackScreenBuffer(screenshotBuffer);
                 if (black) {
@@ -3834,26 +3797,6 @@ async function captureScreenshotAndCameraImpl() {
                     isStopped: true
                   });
                   return;
-                }
-                const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-                if (contentHash !== null) {
-                  if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                  else consecutiveSameScreenCount = 0;
-                  lastContentHashForComparer = contentHash;
-                  const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                  const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                    console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
-                    await stopTracking();
-                    if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                    await ipcRenderer.invoke('show-overlay', {
-                      title: 'Screen unchanged',
-                      message: 'Your screen has not changed. Tracking has been stopped.',
-                      icon: '🖥️',
-                      isStopped: true
-                    });
-                    return;
-                  }
                 }
               }
               await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
@@ -3886,7 +3829,7 @@ async function captureScreenshotAndCameraImpl() {
               displayCacheTimestamp = Date.now();
             }
 
-            // Screen comparer: on first screen only, check black and unchanged then maybe auto-stop
+            // Screen comparer: on first screen only, check black then maybe auto-stop
             if (i === 0 && sharp) {
               const black = await isBlackScreenBuffer(screenshotBuffer);
               if (black) {
@@ -3900,26 +3843,6 @@ async function captureScreenshotAndCameraImpl() {
                   isStopped: true
                 });
                 return;
-              }
-              const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-              if (contentHash !== null) {
-                if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                else consecutiveSameScreenCount = 0;
-                lastContentHashForComparer = contentHash;
-                const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                  console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
-                  await stopTracking();
-                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                  await ipcRenderer.invoke('show-overlay', {
-                    title: 'Screen unchanged',
-                    message: 'Your screen has not changed. Tracking has been stopped.',
-                    icon: '🖥️',
-                    isStopped: true
-                  });
-                  return;
-                }
               }
             }
 
