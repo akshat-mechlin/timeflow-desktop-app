@@ -12,17 +12,19 @@ try {
   console.warn('sharp not available for screen comparer:', e.message);
 }
 
-// App version: from package.json with fallback (renderer require can fail when packaged)
-let appVersion;
-let TRACKER_VERSION;
+// App version: single source of truth so UI and backend always show/send "1.6.1 - Beta" (package.json may be stripped in builds)
+const APP_VERSION_DISPLAY = '1.6.1 - Beta';
+let appVersion = APP_VERSION_DISPLAY;
+let TRACKER_VERSION = APP_VERSION_DISPLAY;
 try {
   const pkg = require(path.join(__dirname, 'package.json'));
-  appVersion = pkg && pkg.version ? String(pkg.version).trim() : '0.0.0';
-  TRACKER_VERSION = appVersion;
+  if (pkg && pkg.version && String(pkg.version).trim() === APP_VERSION_DISPLAY) {
+    appVersion = String(pkg.version).trim();
+    TRACKER_VERSION = appVersion;
+  }
+  // else keep APP_VERSION_DISPLAY so built app still shows "1.6.1 - Beta"
 } catch (e) {
   console.warn('Could not read version from package.json:', e.message);
-  appVersion = '0.0.0';
-  TRACKER_VERSION = '0.0.0';
 }
 const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
 
@@ -1132,6 +1134,12 @@ let minimumRequiredVersion = null;
 let downloadUrl = null;
 let forceUpdate = false;
 
+// Normalize version string for allowed-list matching: "1.6.1 - Beta" and "1.6.1-beta" both become "1.6.1-beta"
+function normalizeVersionForAllowedMatch(version) {
+  if (typeof version !== 'string' || !version) return '';
+  return version.trim().toLowerCase().replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 // Compare version strings (e.g., "1.4.0" vs "1.3.0")
 function compareVersions(version1, version2) {
   const v1parts = version1.split('.').map(Number);
@@ -1185,53 +1193,36 @@ async function checkAppVersion() {
       };
     }
 
-    const rawRequired = requiredFromDb;
-    const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
-    const parts = requiredStr.split('.').filter(Boolean);
-    if (parts.length === 1) parts.push('0', '0');
-    else if (parts.length === 2) parts.push('0');
-    minimumRequiredVersion = parts.slice(0, 3).map(p => (parseInt(p, 10) || 0).toString()).join('.');
+    // Read all values as comma-separated string; if current version matches ANY of them, allow
+    const requiredStr = typeof requiredFromDb === 'string' ? requiredFromDb.trim() : String(requiredFromDb);
+    const allowedVersions = requiredStr.split(',').map(s => s.trim()).filter(Boolean);
+    const currentNormalized = normalizeVersionForAllowedMatch(TRACKER_VERSION);
 
-    if (!minimumRequiredVersion || !/^\d+\.\d+\.\d+$/.test(minimumRequiredVersion)) {
-      console.error('❌ tracker_required_version invalid format:', rawRequired);
-      isVersionValid = false;
-      versionCheckComplete = true;
-      return {
-        valid: false,
-        reason: 'version_check_skipped',
-        minimumVersion: '',
-        currentVersion: TRACKER_VERSION,
-        downloadUrl: null,
-        downloadUrls: null,
-        forceUpdate: true
-      };
+    for (const allowed of allowedVersions) {
+      const allowedNormalized = normalizeVersionForAllowedMatch(allowed);
+      if (allowedNormalized && currentNormalized === allowedNormalized) {
+        console.log(`✓ Version OK: ${TRACKER_VERSION} matches allowed "${allowed}"`);
+        isVersionValid = true;
+        versionCheckComplete = true;
+        return { valid: true, reason: 'version_valid' };
+      }
     }
 
-    console.log(`📋 Required version (from DB): ${minimumRequiredVersion}`);
+    minimumRequiredVersion = allowedVersions[0] || requiredStr;
+    console.log(`📋 Allowed versions (from DB): ${allowedVersions.join(', ')}`);
     console.log(`📋 Current tracker version: ${TRACKER_VERSION}`);
-
-    const versionComparison = compareVersions(TRACKER_VERSION, minimumRequiredVersion);
-
-    // Exact match only: if not equal, show update modal (no "equal or greater" logic)
-    if (versionComparison !== 0) {
-      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} !== ${minimumRequiredVersion} (exact match required) — showing update modal`);
-      isVersionValid = false;
-      versionCheckComplete = true;
-      return {
-        valid: false,
-        reason: 'version_outdated',
-        minimumVersion: minimumRequiredVersion,
-        currentVersion: TRACKER_VERSION,
-        downloadUrl: downloadUrl || null,
-        downloadUrls: null,
-        forceUpdate: true
-      };
-    }
-
-    console.log(`✓ Version OK: exact match ${TRACKER_VERSION}`);
-    isVersionValid = true;
+    console.warn(`❌ Version not in allowed list — showing update modal`);
+    isVersionValid = false;
     versionCheckComplete = true;
-    return { valid: true, reason: 'version_valid' };
+    return {
+      valid: false,
+      reason: 'version_outdated',
+      minimumVersion: minimumRequiredVersion,
+      currentVersion: TRACKER_VERSION,
+      downloadUrl: downloadUrl || null,
+      downloadUrls: null,
+      forceUpdate: true
+    };
   } catch (error) {
     console.error('❌ Error checking app version:', error);
     isVersionValid = false;
