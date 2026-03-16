@@ -212,51 +212,19 @@ ipcMain.handle('close-window', () => {
   }
 });
 
-// Handler to get current system idle time
+// PowerShell: run hidden to avoid windows and reduce RAM/CPU (packaged app)
+const PS_HIDDEN = 'powershell -WindowStyle Hidden -NoProfile -NonInteractive';
+const EXEC_OPTS = { timeout: 2000, maxBuffer: 64 * 1024, windowsHide: true };
+
+// Handler to get current system idle time (cross-platform via Electron; no PowerShell dependency)
 ipcMain.handle('get-system-idle-time', () => {
-  if (process.platform === 'win32') {
-    return new Promise((resolve) => {
-      const { exec } = require('child_process');
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
-      
-      exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
-        if (error) {
-          console.error('PowerShell error in get-system-idle-time:', error.message);
-          resolve(null);
-          return;
-        }
-        if (stderr) {
-          console.error('PowerShell stderr in get-system-idle-time:', stderr);
-          resolve(null);
-          return;
-        }
-        if (!stdout) {
-          resolve(null);
-          return;
-        }
-        try {
-          const trimmed = stdout.trim();
-          // Check if output is a valid number (not "True", "False", "ERROR", or other non-numeric)
-          if (trimmed === 'True' || trimmed === 'False' || trimmed === 'ERROR' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false' || trimmed.toLowerCase() === 'error') {
-            console.warn('PowerShell returned non-numeric value:', trimmed);
-            resolve(null);
-            return;
-          }
-          const idleSeconds = parseFloat(trimmed);
-          if (isNaN(idleSeconds) || idleSeconds < 0) {
-            console.warn('Invalid idle time from PowerShell:', trimmed);
-            resolve(null);
-            return;
-          }
-          resolve(idleSeconds);
-        } catch (e) {
-          console.error('Error parsing idle time:', e);
-          resolve(null);
-        }
-      });
-    });
+  try {
+    const idleSeconds = powerMonitor.getSystemIdleTime();
+    return typeof idleSeconds === 'number' && idleSeconds >= 0 ? idleSeconds : null;
+  } catch (e) {
+    console.error('get-system-idle-time failed:', e.message);
+    return null;
   }
-  return null;
 });
 
 ipcMain.handle('set-is-tracking', (event, value) => {
@@ -291,12 +259,9 @@ ipcMain.handle('check-screen-off', async () => {
 
   try {
     const { exec } = require('child_process');
-    // Check if screen is off using PowerShell
-    // This checks the display state using WMI
-    const psCommand = `powershell -Command "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams; foreach ($monitor in $monitors) { if ($monitor.Active -eq $false) { Write-Output 'OFF'; exit } }; Write-Output 'ON'"`;
-    
+    const psCommand = `${PS_HIDDEN} -Command "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams; foreach ($monitor in $monitors) { if ($monitor.Active -eq $false) { Write-Output 'OFF'; exit } }; Write-Output 'ON'"`;
     return new Promise((resolve) => {
-      exec(psCommand, { timeout: 2000 }, (error, stdout, stderr) => {
+      exec(psCommand, EXEC_OPTS, (error, stdout, stderr) => {
         if (error || stderr) {
           // If we can't determine, assume screen is on (safer)
           resolve(false);
@@ -312,98 +277,59 @@ ipcMain.handle('check-screen-off', async () => {
   }
 });
 
-// System-wide activity monitoring for Windows
+// System-wide activity monitoring (cross-platform via Electron powerMonitor; works when app is minimized)
 function startSystemActivityMonitoring() {
   if (systemActivityMonitor) {
     return; // Already monitoring
   }
 
-  console.log('Starting system-wide activity monitoring...');
+  console.log('Starting system-wide activity monitoring (all platforms)...');
 
-  if (process.platform === 'win32') {
-    const { exec } = require('child_process');
-    const path = require('path');
-    let lastIdleTime = 0;
-    let consecutiveActiveChecks = 0;
-    let checkCount = 0;
-    
-    // Monitor system activity every 1 second for more responsive detection
-    systemActivityMonitor = setInterval(() => {
-      checkCount++;
-      // Use inline PowerShell command for better reliability (works in packaged app)
-      const psCommand = `powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class LastInput { [DllImport(\\\"user32.dll\\\")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii); [DllImport(\\\"kernel32.dll\\\")] public static extern uint GetTickCount(); [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; } }'; $lastInput = New-Object LastInput+LASTINPUTINFO; $lastInput.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lastInput); $result = [LastInput]::GetLastInputInfo([ref]$lastInput); if ($result) { $tickCount = [LastInput]::GetTickCount(); $idleTime = ($tickCount - $lastInput.dwTime) / 1000; Write-Output $idleTime } else { Write-Output 'ERROR' }"`;
-      
-      exec(psCommand, { timeout: 1500 }, (error, stdout, stderr) => {
-        if (error) {
-          console.error('Error checking system activity:', error.message);
-          return;
-        }
-        if (stderr) {
-          console.error('PowerShell stderr:', stderr);
-          return;
-        }
-        if (!stdout || !mainWindow || mainWindow.isDestroyed()) {
-          return;
-        }
-        
-          try {
-          const trimmed = stdout.trim();
-          // Check if output is a valid number (not "True", "False", "ERROR", or other non-numeric)
-          if (trimmed === 'True' || trimmed === 'False' || trimmed === 'ERROR' || trimmed === '' || trimmed.toLowerCase() === 'true' || trimmed.toLowerCase() === 'false' || trimmed.toLowerCase() === 'error') {
-            console.warn('PowerShell returned non-numeric value in monitoring:', trimmed);
-            return;
-          }
-          const idleSeconds = parseFloat(trimmed);
-          if (isNaN(idleSeconds) || idleSeconds < 0) {
-            console.warn('Invalid idle time from PowerShell:', trimmed);
-            return;
-          }
-          
-          // More aggressive activity detection:
-          // 1. If idle time is less than 20 seconds, user is definitely active
-          // 2. If idle time decreased (user became active) - very sensitive (0.05s threshold)
-          // 3. If idle time is stable but low (< 10s), user is active
-          // 4. If idle time is decreasing, user is active
-          const isActive = idleSeconds < 20 || 
-                          (lastIdleTime > 0 && idleSeconds < lastIdleTime - 0.05) ||
-                          (idleSeconds < 10 && lastIdleTime < 10) ||
-                          (lastIdleTime > 0 && idleSeconds < lastIdleTime);
-          
-          // Log every 30 checks for debugging (every 30 seconds, less spam)
-          if (checkCount % 30 === 0) {
-            console.log(`System activity check #${checkCount}: idle=${idleSeconds.toFixed(1)}s, lastIdle=${lastIdleTime.toFixed(1)}s, active=${isActive}`);
-          }
-              
-              if (isActive) {
-                consecutiveActiveChecks++;
-            // Send activity signal on every active check (with idle time info)
-            try {
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('system-activity-detected', idleSeconds);
-                // Log every 10 seconds for debugging (less spam)
-                if (consecutiveActiveChecks % 10 === 0) {
-                  console.log(`✓ System activity: idle=${idleSeconds.toFixed(1)}s (active for ${consecutiveActiveChecks} checks)`);
-                }
-              } else {
-                console.warn('Cannot send system-activity-detected: mainWindow is null or destroyed');
-              }
-            } catch (sendError) {
-              console.error('Error sending system-activity-detected:', sendError);
+  let lastIdleTime = 0;
+  let consecutiveActiveChecks = 0;
+  let checkCount = 0;
+  const ACTIVITY_CHECK_MS = 10000; // 10s – balance between responsiveness and CPU
+
+  systemActivityMonitor = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    try {
+      const idleSeconds = powerMonitor.getSystemIdleTime();
+      if (typeof idleSeconds !== 'number' || idleSeconds < 0) return;
+
+      // Same activity logic as before: idle < 20s = active; or idle decreasing = recent input
+      const isActive = idleSeconds < 20 ||
+        (lastIdleTime > 0 && idleSeconds < lastIdleTime - 0.05) ||
+        (idleSeconds < 10 && lastIdleTime < 10) ||
+        (lastIdleTime > 0 && idleSeconds < lastIdleTime);
+
+      if (checkCount % 30 === 0) {
+        console.log(`System activity check #${checkCount}: idle=${idleSeconds.toFixed(1)}s, lastIdle=${lastIdleTime.toFixed(1)}s, active=${isActive}`);
+      }
+
+      if (isActive) {
+        consecutiveActiveChecks++;
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('system-activity-detected', idleSeconds);
+            if (consecutiveActiveChecks % 10 === 0) {
+              console.log(`✓ System activity: idle=${idleSeconds.toFixed(1)}s (active for ${consecutiveActiveChecks} checks)`);
             }
-          } else {
-            if (consecutiveActiveChecks > 0) {
-              console.log(`✗ System activity stopped: idle=${idleSeconds.toFixed(1)}s (was active for ${consecutiveActiveChecks} checks)`);
-            }
-            consecutiveActiveChecks = 0;
-              }
-              
-              lastIdleTime = idleSeconds;
-          } catch (e) {
-          console.error('Error parsing system activity:', e);
+          }
+        } catch (sendError) {
+          console.error('Error sending system-activity-detected:', sendError);
         }
-      });
-    }, 1000); // Check every 1 second for more responsive detection
-  }
+      } else {
+        if (consecutiveActiveChecks > 0) {
+          console.log(`✗ System activity stopped: idle=${idleSeconds.toFixed(1)}s (was active for ${consecutiveActiveChecks} checks)`);
+        }
+        consecutiveActiveChecks = 0;
+      }
+
+      lastIdleTime = idleSeconds;
+    } catch (e) {
+      console.error('Error in system activity check:', e.message);
+    }
+  }, ACTIVITY_CHECK_MS);
 }
 
 function stopSystemActivityMonitoring() {
@@ -761,19 +687,13 @@ function setupUserSwitchDetection() {
     getCurrentSessionId().then(sessionId => {
       if (lastSessionId !== null && sessionId !== lastSessionId) {
         console.log('👤 User switched - stopping tracker');
-        console.log(`Session changed: ${lastSessionId} -> ${sessionId}`);
         if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
-          mainWindow.webContents.send('system-event', { 
-            type: 'user-switched',
-            reason: 'Windows user was switched'
-          });
+          mainWindow.webContents.send('system-event', { type: 'user-switched', reason: 'Windows user was switched' });
         }
         lastSessionId = sessionId;
       }
-    }).catch(err => {
-      // Silently handle errors (session ID check might fail occasionally)
-    });
-  }, 2000);
+    }).catch(() => {});
+  }, 30000); // 30s – user switch rare; fewer PowerShell spawns
 }
 
 // Get current Windows session ID
@@ -785,10 +705,8 @@ function getCurrentSessionId() {
     }
 
     const { exec } = require('child_process');
-    // Get session ID using PowerShell
-    const psCommand = `powershell -Command "Get-Process -Id $PID | Select-Object -ExpandProperty SessionId"`;
-    
-    exec(psCommand, { timeout: 1000 }, (error, stdout, stderr) => {
+    const psCommand = `${PS_HIDDEN} -Command "Get-Process -Id $PID | Select-Object -ExpandProperty SessionId"`;
+    exec(psCommand, { ...EXEC_OPTS, timeout: 1000, maxBuffer: 4096 }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
         return;

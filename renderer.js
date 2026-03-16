@@ -171,6 +171,7 @@ let timerInterval = null;
 let captureInterval = null; // Kept for clearInterval compatibility when stopping
 let captureTimeoutId = null; // setTimeout chain for reliable 5-7 min interval
 let lastCaptureTime = 0; // When we last ran capture (for catch-up and watchdog)
+let cameraSkippedDueToInUse = false; // When true, next capture interval is shortened so we retry camera soon (e.g. after Teams call ends)
 let captureInProgress = false; // Prevents overlapping captures and watchdog restart during capture
 let captureWatchdogInterval = null; // Restarts capture loop if it was lost (e.g. after background throttle)
 let dailyResetCheckInterval = null;
@@ -197,16 +198,76 @@ const DISPLAY_CACHE_DURATION = 5 * 60 * 1000; // Cache for 5 minutes
 
 // Screen comparer: auto-stop when screen unchanged or black (content region only, taskbar excluded)
 const TASKBAR_HEIGHT_PX = 48; // Pixels to exclude from bottom for comparison (taskbar)
-const COMPARE_RESIZE_WIDTH = 64; // Downscale content to this width for hash
-const CONSECUTIVE_SAME_THRESHOLD = 2; // Auto-stop after this many identical content hashes
-const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark
+const COMPARE_RESIZE_WIDTH = 48; // Downscale content for hash (smaller = more tolerant of tiny differences)
+const CONSECUTIVE_SAME_THRESHOLD = 1; // Auto-stop after 2 consecutive identical screens (1 = trigger when current matches previous)
+const BLACK_LUMINANCE_THRESHOLD = 25; // Pixel luminance below this = dark (screen only)
 const BLACK_DARK_PIXEL_RATIO = 0.92; // If this fraction of sampled pixels is dark, treat as black screen
 const SCREEN_COMPARER_COOLDOWN_MS = 2 * 60 * 1000; // Don't auto-stop for "unchanged" in first 2 minutes
+// Only compare last 2 screens (and trigger "screen unchanged") when user is active; if inactive, let inactivity overlay handle it
+const ACTIVE_FOR_SCREEN_COMPARE_MS = 5 * 60 * 1000; // Same as inactivity threshold – if no activity in 5 min, don't trigger "unchanged"
 let lastContentHashForComparer = null;
 let consecutiveSameScreenCount = 0;
-// Camera comparer: same-image detection (only used when camera capture is on)
-let lastCameraContentHashForComparer = null;
-let consecutiveSameCameraCount = 0;
+// Face detection: lightweight check on start and every 5–7 min (no tape/black logic)
+const FACE_API_WEIGHTS_BASE = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+// Higher inputSize = better for distant/small faces; 224 is a balance (128 was too strict at distance). Same tiny model, no extra download.
+// On very weak systems, try 160 for slightly less CPU while still better than 128.
+const FACE_DETECTOR_INPUT_SIZE = 224;
+const FACE_DETECTOR_SCORE_THRESHOLD = 0.35; // Slightly lenient so farther/partial faces still count
+let faceApiModelsLoaded = false;
+let faceApiLoadPromise = null;
+
+// Run once at load: Electron needs browser DOM for face-api (avoids "Illegal constructor" in any renderer)
+(function patchFaceApiEnv() {
+  if (typeof faceapi === 'undefined' || !faceapi.env || typeof faceapi.env.monkeyPatch !== 'function') return;
+  try {
+    faceapi.env.monkeyPatch({
+      createCanvasElement: () => document.createElement('canvas'),
+      createImageElement: () => document.createElement('img')
+    });
+  } catch (_) {}
+})();
+
+async function loadFaceApiModels() {
+  if (faceApiModelsLoaded) return true;
+  if (faceApiLoadPromise) return faceApiLoadPromise;
+  faceApiLoadPromise = (async () => {
+    if (typeof faceapi === 'undefined') {
+      console.warn('Face detection: face-api not loaded (script missing or blocked)');
+      return false;
+    }
+    try {
+      await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_WEIGHTS_BASE);
+      faceApiModelsLoaded = true;
+      console.log('Face detection: tiny face detector loaded');
+      return true;
+    } catch (err) {
+      console.warn('Face detection: failed to load models', err.message);
+      return false;
+    }
+  })();
+  return faceApiLoadPromise;
+}
+
+/**
+ * Returns true if at least one face is detected in the canvas. Minimal CPU: runs only when needed.
+ * Uses inputSize 224 + lower scoreThreshold to improve detection when user is at a distance.
+ */
+async function detectFaceInCanvas(canvas) {
+  if (!canvas || canvas.width < 10 || canvas.height < 10) return false;
+  const loaded = await loadFaceApiModels();
+  if (!loaded) return true; // allow when models unavailable (e.g. offline)
+  try {
+    const opts = new faceapi.TinyFaceDetectorOptions({
+      inputSize: FACE_DETECTOR_INPUT_SIZE,
+      scoreThreshold: FACE_DETECTOR_SCORE_THRESHOLD
+    });
+    const detections = await faceapi.detectAllFaces(canvas, opts);
+    return detections && detections.length > 0;
+  } catch (err) {
+    console.warn('Face detection: detect failed', err.message);
+    return true; // do not block on detection errors
+  }
+}
 
 // Capture Settings Manager
 let captureSettings = {
@@ -215,6 +276,9 @@ let captureSettings = {
   settingsChannel: null,
   refreshInterval: null
 };
+
+// Last permission check result - used so tracker cannot start without camera/screenshot when required
+let lastPermissionCheck = null;
 
 // Initialize capture settings from user profile
 async function initializeCaptureSettings(userId) {
@@ -710,6 +774,10 @@ document.addEventListener('visibilitychange', async () => {
     console.log('👁️ App became hidden - checking if screen is off...');
     await checkScreenOffAndStop();
   } else if (!document.hidden && currentUser) {
+    // App became visible - sync duration immediately (timers are throttled when hidden, so DB may be behind)
+    if (isTracking && timeEntryId && sessionStartTime) {
+      syncCurrentDuration().catch(err => console.error('Visibility sync failed:', err));
+    }
     // App became visible - validate day cycle
     console.log('🔄 App became visible - validating day cycle...');
     const newDayCycle = getCurrentDayCycle();
@@ -914,15 +982,14 @@ ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
   }
 });
 
-// Fallback: poll system idle from renderer so we still detect activity if main's PowerShell monitor fails (e.g. 30+ users).
-// GetLastInputInfo counts keyboard and mouse (clicks + movement) system-wide. Idle < 30s = treat as active.
+// Fallback: poll system idle from renderer so we still detect activity if main's monitor misses (cross-platform via Electron).
 let activityFallbackInterval = null;
 function startActivityFallbackPoll() {
   if (activityFallbackInterval) return;
   const POLL_MS = 5000;
   const IDLE_ACTIVE_THRESHOLD_SEC = 30;
   activityFallbackInterval = setInterval(async () => {
-    if (!isTracking || pauseStartTime || process.platform !== 'win32') return;
+    if (!isTracking || pauseStartTime) return;
     try {
       const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
       if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
@@ -1354,39 +1421,77 @@ function showUpdateRequiredModal(versionInfo) {
   });
 }
 
-// Show camera detection modal
-function showCameraDetectionModal() {
+// Show camera/screenshot permission modal (same style as overlay: gradient, icon, title, message, buttons)
+// customMessage: body text; reason: 'device' | 'permission' | 'screenshot' for behavior and button labels
+function showCameraDetectionModal(customMessage, reason) {
   const cameraModal = document.getElementById('camera-detection-modal');
   const cameraMessage = document.getElementById('camera-message');
   const cameraTitle = document.getElementById('camera-modal-title');
+  const cameraIcon = document.getElementById('camera-modal-icon');
   const retryBtn = document.getElementById('camera-retry-btn');
   const closeCameraModalBtn = document.getElementById('close-camera-modal-btn');
   
   if (!cameraModal || !cameraMessage) {
     console.error('Camera detection modal elements not found');
-    // Fallback to alert if modal elements don't exist
-    alert('No camera device detected. Please connect a camera to start tracking.');
+    alert(customMessage || 'No camera device detected. Please connect a camera to start tracking.');
     return;
   }
   
-  // Update modal content
+  const defaultMessage = 'No camera device detected. Please connect a camera to start tracking.';
+  if (cameraIcon) cameraIcon.textContent = reason === 'screenshot' ? '🖥️' : '📷';
   if (cameraTitle) {
-    cameraTitle.textContent = 'Camera Required';
+    if (reason === 'screenshot') cameraTitle.textContent = 'Screenshot access required';
+    else if (reason === 'face') cameraTitle.textContent = 'Camera covered or blur';
+    else if (reason === 'permission' || (customMessage && customMessage.includes('Allow desktop apps'))) cameraTitle.textContent = 'Camera access required';
+    else cameraTitle.textContent = 'Camera Required';
   }
-  cameraMessage.textContent = 'No camera device detected. Please connect a camera to start tracking.';
+  cameraMessage.textContent = customMessage || defaultMessage;
   
-  // Setup retry button
+  if (retryBtn) retryBtn.textContent = (reason === 'permission' || reason === 'screenshot') ? 'Start Tracking' : (reason === 'face' ? 'OK' : 'Retry');
+  
+  // Setup retry button based on reason
   if (retryBtn) {
-    retryBtn.onclick = async () => {
-      const cameraCheck = await checkCameraDevice();
-      if (cameraCheck.detected) {
+    if (reason === 'permission') {
+      retryBtn.onclick = async () => {
+        const result = await checkCameraPermission();
+        if (result.granted) {
+          hideCameraDetectionModal();
+          if (lastPermissionCheck) lastPermissionCheck.cameraOk = true;
+          updateStartButtonState();
+          await startTracking();
+        } else {
+          cameraMessage.textContent =
+            'Camera access is still not allowed.\n\n' +
+            'Please turn ON "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then click Retry again. You may need to restart the app.';
+        }
+      };
+    } else if (reason === 'screenshot') {
+      retryBtn.onclick = async () => {
+        const result = await checkScreenshotPermission();
+        if (result.granted) {
+          hideCameraDetectionModal();
+          if (lastPermissionCheck) lastPermissionCheck.screenshotOk = true;
+          updateStartButtonState();
+          await startTracking();
+        } else {
+          cameraMessage.textContent = (result.error || 'Screenshot access is still not allowed.') + '\n\nEnable screen recording in Windows Settings → Privacy, then click Start Tracking again.';
+        }
+      };
+    } else if (reason === 'face') {
+      retryBtn.onclick = () => {
         hideCameraDetectionModal();
-        // Retry starting tracking
-        await startTracking();
-      } else {
-        cameraMessage.textContent = cameraCheck.error || 'No camera device detected. Please connect a camera to start tracking.';
-      }
-    };
+      };
+    } else {
+      retryBtn.onclick = async () => {
+        const cameraCheck = await checkCameraDevice();
+        if (cameraCheck.detected) {
+          hideCameraDetectionModal();
+          await startTracking();
+        } else {
+          cameraMessage.textContent = cameraCheck.error || defaultMessage;
+        }
+      };
+    }
   }
   
   // Setup close button
@@ -1396,12 +1501,51 @@ function showCameraDetectionModal() {
     };
   }
   
-  // Show modal
+  // Force modal visible and on top (in case .hidden or parent hides it)
   cameraModal.classList.remove('hidden');
+  cameraModal.style.display = 'flex';
+  cameraModal.style.visibility = 'visible';
+  cameraModal.style.zIndex = '100000';
+  cameraModal.style.pointerEvents = 'auto';
   
-  // Block all interactions
+  // Block background interactions
   document.body.style.pointerEvents = 'none';
   cameraModal.style.pointerEvents = 'auto';
+}
+
+// Show camera permission dialog (same style as "Camera black" overlay: gradient, icon, title, message, Start Tracking + Close)
+function showCameraPermissionRequiredModal() {
+  const steps = getOSInstructions();
+  const cameraSteps = (steps && steps.camera)
+    ? steps.camera.join('\n• ')
+    : 'Privacy → Camera → Allow desktop apps to access your camera';
+  const message =
+    'The tracker cannot start because camera access is disabled in Windows.';
+  const modal = document.getElementById('camera-detection-modal');
+  if (!modal) {
+    alert('Camera access required\n\n' + message);
+    return;
+  }
+  showCameraDetectionModal(message, 'permission');
+}
+
+// Show screenshot permission dialog (same style: gradient, icon, title, message, Start Tracking + Close)
+function showScreenshotPermissionRequiredModal() {
+  const steps = getOSInstructions();
+  const screenshotSteps = (steps && steps.screenshot)
+    ? steps.screenshot.join('\n• ')
+    : 'Privacy → Screen recording → Allow desktop apps to record screen';
+  const message =
+    'The tracker cannot start because screenshot/screen recording access is disabled or not allowed.\n\n' +
+    'To fix this:\n\n' +
+    '• ' + screenshotSteps + '\n\n' +
+    'After enabling, click "Start Tracking" below to try again. You may need to restart the app.';
+  const modal = document.getElementById('camera-detection-modal');
+  if (!modal) {
+    alert('Screenshot access required\n\n' + message);
+    return;
+  }
+  showCameraDetectionModal(message, 'screenshot');
 }
 
 // Hide camera detection modal
@@ -1409,7 +1553,9 @@ function hideCameraDetectionModal() {
   const cameraModal = document.getElementById('camera-detection-modal');
   if (cameraModal) {
     cameraModal.classList.add('hidden');
-    // Restore interactions
+    cameraModal.style.display = '';
+    cameraModal.style.visibility = '';
+    cameraModal.style.zIndex = '';
     document.body.style.pointerEvents = 'auto';
   }
 }
@@ -2149,17 +2295,26 @@ function updateTaskDisplay() {
   }
 }
 
-// Update start button state based on selections
+// Update start button state based on selections (permission does not disable button so user can click and see error dialog)
 function updateStartButtonState() {
-  if (selectedProjectId && selectedTaskId && !isTracking) {
-    startBtn.disabled = false;
-    startBtn.title = 'Start Tracking';
-  } else if (isTracking) {
+  if (isTracking) {
     startBtn.disabled = true;
-  } else {
+    return;
+  }
+  if (!selectedProjectId || !selectedTaskId) {
     startBtn.disabled = true;
     startBtn.title = 'Please select a project and task to start tracking';
+    return;
   }
+  // Keep Start button enabled so user can click and get the error popup; set tooltip when permission is missing
+  if (captureSettings.enableCameraCapture && lastPermissionCheck && !lastPermissionCheck.cameraOk) {
+    startBtn.title = 'Enable camera access in Windows Settings (Privacy → Camera) to start tracking';
+  } else if (lastPermissionCheck && !lastPermissionCheck.screenshotOk) {
+    startBtn.title = 'Please enable screenshot permission to start tracking';
+  } else {
+    startBtn.title = 'Start Tracking';
+  }
+  startBtn.disabled = false;
 }
 
 /**
@@ -2507,20 +2662,8 @@ async function checkCameraPermission() {
       // Continue anyway, might still work
     }
 
-    // Try to get camera access with a longer timeout (10 seconds)
-    // This gives more time for camera initialization, especially if it's being used by another app
-    const stream = await Promise.race([
-      navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          facingMode: 'user',
-          width: { ideal: 640 },
-          height: { ideal: 480 }
-        } 
-      }),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Camera access timeout')), 10000)
-      )
-    ]);
+    // Try to get camera access (uses same fallback as capture for Windows 11 / HP TrueVision)
+    const stream = await getCameraStreamWithFallback(10000);
     
     // If successful, stop the stream immediately
     if (stream && stream.getTracks) {
@@ -2550,14 +2693,12 @@ async function checkCameraPermission() {
       // Camera might be in use by another application
       return { granted: true, error: 'Camera may be in use by another application, but permission appears granted' };
     } else if (error.message && error.message.includes('timeout')) {
-      // Timeout usually means permission is granted but camera is slow/unavailable
-      // Allow tracking to proceed since permission is likely granted
-      return { granted: true, error: 'Camera access timeout - permission appears granted but camera may be slow or in use. You can proceed with tracking.' };
+      // Timeout: could be permission denied (e.g. Windows dialog not shown) or camera slow - treat as not granted so user sees the modal
+      return { granted: false, error: 'Camera access failed (timeout). Please enable camera in Windows Settings → Privacy → Camera.' };
     } else {
-      // For other errors, assume permission might be granted but there's a technical issue
-      // This allows the user to proceed if they know permission is granted
-      console.warn('Camera check returned error, but permission may still be granted:', errorDetails);
-      return { granted: true, error: `Camera check warning: ${error.message || error.name || 'Unknown error'}. Permission may still be granted.` };
+      // Any other error (e.g. SecurityError when Windows blocks): show permission modal so user knows what to fix
+      console.warn('Camera check failed:', errorDetails);
+      return { granted: false, error: error.message || 'Camera access denied. Please allow camera in your system settings.' };
     }
   }
 }
@@ -2577,20 +2718,9 @@ async function checkCameraDevice() {
       return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
     }
 
-    // Try to access the camera to verify it's actually available
+    // Try to access the camera to verify it's actually available (fallback for Windows 11 / HP TrueVision)
     try {
-      const stream = await Promise.race([
-        navigator.mediaDevices.getUserMedia({ 
-          video: { 
-            facingMode: 'user',
-            width: { ideal: 640 },
-            height: { ideal: 480 }
-          } 
-        }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Camera access timeout')), 5000)
-        )
-      ]);
+      const stream = await getCameraStreamWithFallback(5000);
       
       // If successful, stop the stream immediately
       if (stream && stream.getTracks) {
@@ -2602,13 +2732,17 @@ async function checkCameraDevice() {
       
       return { detected: true };
     } catch (accessError) {
-      // If we can enumerate devices but can't access, it might be permission or device in use
-      // But we know the device exists, so return detected: true
       if (accessError.name === 'NotFoundError' || accessError.name === 'DevicesNotFoundError') {
         return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
       }
-      // For other errors (permission, in use, etc.), device exists but can't access
-      // We'll still consider it detected since the hardware exists
+      // Windows "Allow desktop apps to access your camera" off → NotAllowedError
+      if (accessError.name === 'NotAllowedError' || accessError.name === 'PermissionDeniedError') {
+        return {
+          detected: false,
+          error: 'Camera access is blocked. Please enable "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then restart the app.'
+        };
+      }
+      // For other errors (e.g. in use), device exists but can't access
       return { detected: true, warning: 'Camera device found but may be in use or requires permission.' };
     }
   } catch (error) {
@@ -2712,15 +2846,11 @@ async function checkAllPermissions() {
   // Allow starting if camera permission appears granted (even with warnings)
   // This handles cases where permission is granted but camera check has technical issues
   const cameraOk = cameraResult.granted || (cameraResult.error && cameraResult.error.includes('may still be granted'));
-  const permissionsOk = cameraOk && screenshotResult.granted;
-  
+  lastPermissionCheck = { cameraOk, screenshotOk: screenshotResult.granted };
+
   // Update start button state (will check both permissions and project/task selection)
   updateStartButtonState();
-  
-  if (!permissionsOk) {
-    startBtn.title = 'Please enable camera and screenshot permissions to start tracking';
-  }
-  
+
   return {
     camera: cameraResult.granted,
     screenshot: screenshotResult.granted
@@ -2736,17 +2866,43 @@ async function startTracking() {
     return;
   }
 
-  // Check if camera device is detected before starting tracking
-  // Skip camera check if camera capture is disabled for this user
+  // Check screenshot permission first – show same-style popup if missing
+  const screenshotResult = await checkScreenshotPermission();
+  if (!screenshotResult.granted) {
+    showScreenshotPermissionRequiredModal();
+    return;
+  }
+
+  // On Windows, run a one-off screenshot so screenshot-desktop can copy its .bat to temp if needed
+  // (avoids ENOENT after user clears temp files – the package copies screenCapture_*.bat to temp on first use)
+  if (process.platform === 'win32') {
+    screenshot({ format: 'png' }).catch(() => {});
+  }
+
+  // When camera capture is enabled, require Windows camera permission and a detected device
   if (captureSettings.enableCameraCapture) {
+    const cameraPermission = await checkCameraPermission();
+    if (!cameraPermission.granted) {
+      showCameraPermissionRequiredModal();
+      return;
+    }
     console.log('Camera capture is enabled - checking for camera device...');
     const cameraCheck = await checkCameraDevice();
     if (!cameraCheck.detected) {
-      showCameraDetectionModal();
+      showCameraDetectionModal(cameraCheck.error);
       return;
     }
   } else {
     console.log('Camera capture is disabled for this user - skipping camera device check');
+  }
+
+  // Face check when camera is enabled: do not start unless a face is detected
+  if (captureSettings.enableCameraCapture) {
+    const faceDetected = await checkFaceBeforeStart();
+    if (!faceDetected) {
+      showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
+      return;
+    }
   }
 
   // CRITICAL: Always check day cycle FIRST before starting tracking
@@ -2792,11 +2948,10 @@ async function startTracking() {
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
   keystrokeCount = 0;
-  // Reset screen and camera comparer state so auto-stop uses fresh baseline
+  // Reset screen comparer state so auto-stop uses fresh baseline
   lastContentHashForComparer = null;
   consecutiveSameScreenCount = 0;
-  lastCameraContentHashForComparer = null;
-  consecutiveSameCameraCount = 0;
+  cameraSkippedDueToInUse = false;
 
   // Get profile
   const { data: profile } = await supabase
@@ -3308,7 +3463,7 @@ function startIdleDetection() {
 
     // Don't check if already paused
     if (pauseStartTime) {
-      idleTimer = setTimeout(checkIdle, 1000);
+      idleTimer = setTimeout(checkIdle, 5000);
       return;
     }
 
@@ -3374,8 +3529,8 @@ function startIdleDetection() {
       // User must click Continue (resume, no deduction) or Stop (deduct 5 min and stop).
     }
     
-    // Schedule next check
-    idleTimer = setTimeout(checkIdle, 1000);
+    // Schedule next check (5s is enough - idle threshold is 5 min; reduces CPU load)
+    idleTimer = setTimeout(checkIdle, 5000);
   }
 
   // Clear any existing idle timer before starting a new one
@@ -3388,8 +3543,8 @@ function startIdleDetection() {
     idleDoubleCheckTimer = null;
   }
   
-  // Start checking
-  idleTimer = setTimeout(checkIdle, 1000);
+  // Start checking every 5s (was 1s - reduces load without affecting 5-min idle detection)
+  idleTimer = setTimeout(checkIdle, 5000);
 }
 
 // Resume tracking after inactivity (called when user clicks Continue)
@@ -3491,7 +3646,8 @@ function getNextCaptureDelayMs() {
 
 function scheduleNextCapture() {
   if (!isTracking || pauseStartTime || !timeEntryId) return;
-  const delay = getNextCaptureDelayMs();
+  const delay = getNextCaptureDelayMs(); // 5–7 min for all cycles (including after camera was in use)
+  if (cameraSkippedDueToInUse) cameraSkippedDueToInUse = false;
   captureTimeoutId = setTimeout(() => {
     captureTimeoutId = null;
     if (isTracking && timeEntryId) {
@@ -3503,7 +3659,7 @@ function scheduleNextCapture() {
         });
     }
   }, delay);
-  console.log(`Next screenshot scheduled in ${Math.round(delay / 60000)} min`);
+  console.log(`Next capture in ${Math.round(delay / 60000)} min`);
 }
 
 function startPeriodicCaptures() {
@@ -3531,7 +3687,7 @@ function startPeriodicCaptures() {
     captureWatchdogInterval = null;
   }
   const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
-  const STUCK_CAPTURE_THRESHOLD_MS = 12 * 60 * 1000; // No successful capture in 12 min = stuck
+  const STUCK_CAPTURE_THRESHOLD_MS = 8 * 60 * 1000; // No successful capture in 8 min = stuck (was 12 – restart sooner)
   captureWatchdogInterval = setInterval(() => {
     if (!isTracking || pauseStartTime || !timeEntryId) return;
     const now = Date.now();
@@ -3610,25 +3766,6 @@ async function isBlackScreenBuffer(buffer) {
   }
 }
 
-/**
- * Hash of full image for "same camera image" comparison (e.g. something covering lens).
- * Used only when camera capture is enabled. Returns null if sharp unavailable or fails.
- */
-async function getCameraImageHash(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return null;
-  try {
-    const raw = await sharp(buffer)
-      .resize(COMPARE_RESIZE_WIDTH, COMPARE_RESIZE_WIDTH, { fit: 'fill' })
-      .grayscale()
-      .raw()
-      .toBuffer();
-    return crypto.createHash('sha256').update(raw).digest('hex');
-  } catch (err) {
-    console.warn('Screen comparer: getCameraImageHash failed', err.message);
-    return null;
-  }
-}
-
 async function captureScreenshotAndCamera() {
   // Always attempt capture if tracking is active - don't skip due to pause
   if (!isTracking) {
@@ -3641,11 +3778,12 @@ async function captureScreenshotAndCamera() {
   }
 
   captureInProgress = true;
-  lastCaptureTime = Date.now();
   try {
     await captureScreenshotAndCameraImpl();
   } finally {
     captureInProgress = false;
+    // Mark cycle complete so watchdog and catch-up use "last completed" time, not start time
+    lastCaptureTime = Date.now();
   }
 }
 
@@ -3774,7 +3912,8 @@ async function captureScreenshotAndCameraImpl() {
                   else consecutiveSameScreenCount = 0;
                   lastContentHashForComparer = contentHash;
                   const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                  const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
+                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
                     console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
                     await stopTracking();
                     if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
@@ -3839,7 +3978,8 @@ async function captureScreenshotAndCameraImpl() {
                 else consecutiveSameScreenCount = 0;
                 lastContentHashForComparer = contentHash;
                 const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
+                const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
+                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
                   console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
                   await stopTracking();
                   if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
@@ -3905,10 +4045,11 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-// Helper function to upload a screenshot (retries with backoff for API reliability with many users)
-const UPLOAD_TIMEOUT_MS = 60000; // 60s per attempt so rate-limited API can still succeed
-const UPLOAD_RETRY_DELAYS_MS = [1000, 2000, 4000]; // exponential backoff
+const CAMERA_UPLOAD_TIMEOUT_MS = 45000; // 45s – avoid capture loop hanging on slow API
+const UPLOAD_TIMEOUT_MS = 60000; // 60s so rate-limited API can still succeed
+const UPLOAD_RETRY_DELAY_MS = 1000; // Delay before single retry (screenshot and camera): first try, one retry, then exit
 
+// Screenshot: first attempt, one retry on failure, then exit (no further retries to avoid data inconsistency)
 async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   if (!screenshotBuffer || screenshotBuffer.length === 0) {
     throw new Error('Screenshot buffer is empty');
@@ -3924,69 +4065,66 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   try {
     const screenshotFileName = `screenshots/${currentUser.id}/${timestamp}-${screenIdentifier}-screenshot.png`;
     const screenshotFile = fs.readFileSync(screenshotPath);
-    let lastStorageError = null;
-    let screenshotData = null;
 
-    for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
+    const uploadPromise = supabase.storage
+      .from('screenshots')
+      .upload(screenshotFileName, screenshotFile, {
+        contentType: 'image/png',
+        upsert: false
+      });
+    const { data: screenshotData, error: screenshotError } = await withTimeout(
+      uploadPromise,
+      UPLOAD_TIMEOUT_MS,
+      'Screenshot storage upload'
+    );
+
+    if (screenshotError) {
+      // Single retry only: first attempt failed, try once more then exit
+      console.warn('Screenshot upload failed, retrying once:', screenshotError.message || screenshotError);
+      await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+      let retryData = null;
+      let retryError = null;
       try {
-        const uploadPromise = supabase.storage
-          .from('screenshots')
-          .upload(screenshotFileName, screenshotFile, {
-            contentType: 'image/png',
-            upsert: false
-          });
-        const { data, error: screenshotError } = await withTimeout(
-          uploadPromise,
+        const retry = await withTimeout(
+          supabase.storage.from('screenshots').upload(screenshotFileName, screenshotFile, { contentType: 'image/png', upsert: false }),
           UPLOAD_TIMEOUT_MS,
-          'Screenshot storage upload'
+          'Screenshot upload retry'
         );
-        if (!screenshotError && data) {
-          screenshotData = data;
-          lastStorageError = null;
-          break;
-        }
-        lastStorageError = screenshotError;
-      } catch (err) {
-        lastStorageError = err;
-        console.warn(`Screenshot upload attempt ${attempt + 1} failed:`, err.message || err);
+        retryData = retry && retry.data;
+        retryError = retry && retry.error;
+      } catch (e) {
+        retryError = e;
       }
-      if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
-        const delay = UPLOAD_RETRY_DELAYS_MS[attempt];
-        console.log(`Retrying screenshot upload in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+      if (retryError) {
+        console.warn('Screenshot upload retry failed, skipping this capture:', retryError.message || retryError);
+        return;
       }
+      if (retryData) {
+        const { error: insertError } = await supabase
+          .from('screenshots')
+          .insert({
+            time_entry_id: timeEntryId,
+            storage_path: screenshotFileName,
+            type: 'screenshot',
+            taken_at: new Date().toISOString()
+          });
+        if (insertError) console.error('Error inserting screenshot record:', insertError);
+      }
+      return;
     }
 
     if (screenshotData) {
-      let insertError = null;
-      for (let attempt = 0; attempt <= UPLOAD_RETRY_DELAYS_MS.length; attempt++) {
-        try {
-          const insertPromise = supabase
-            .from('screenshots')
-            .insert({
-              time_entry_id: timeEntryId,
-              storage_path: screenshotFileName,
-              type: 'screenshot',
-              taken_at: new Date().toISOString()
-            });
-          const { error } = await withTimeout(insertPromise, 15000, 'Screenshot record insert');
-          if (!error) {
-            insertError = null;
-            break;
-          }
-          insertError = error;
-        } catch (err) {
-          insertError = err;
-        }
-        if (attempt < UPLOAD_RETRY_DELAYS_MS.length) {
-          await new Promise(resolve => setTimeout(resolve, UPLOAD_RETRY_DELAYS_MS[attempt]));
-        }
-      }
+      const { error: insertError } = await supabase
+        .from('screenshots')
+        .insert({
+          time_entry_id: timeEntryId,
+          storage_path: screenshotFileName,
+          type: 'screenshot',
+          taken_at: new Date().toISOString()
+        });
       if (insertError) {
-        console.error('Error inserting screenshot record after retries:', insertError);
+        console.error('Error inserting screenshot record:', insertError);
       }
-    } else if (lastStorageError) {
-      console.warn('Error uploading screenshot after retries:', lastStorageError);
     }
   } finally {
     if (fs.existsSync(screenshotPath)) {
@@ -4067,6 +4205,102 @@ async function captureScreenshotWithElectron(sourceId) {
   }
 }
 
+// Get camera stream with fallbacks for Windows 11 (e.g. HP TrueVision not reporting facingMode).
+// Tries: (1) facingMode 'user', (2) each video device by deviceId, (3) video: true.
+async function getCameraStreamWithFallback(timeoutMs) {
+  const timeout = timeoutMs || 10000;
+  const baseConstraints = {
+    width: { ideal: 640, max: 1280 },
+    height: { ideal: 480, max: 720 }
+  };
+
+  const tryGetUserMedia = (constraints) =>
+    Promise.race([
+      navigator.mediaDevices.getUserMedia(constraints),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Camera access timeout')), timeout))
+    ]);
+
+  try {
+    const stream = await tryGetUserMedia({
+      video: { ...baseConstraints, facingMode: 'user' }
+    });
+    if (stream) return stream;
+  } catch (firstErr) {
+    const isOverconstrained = firstErr.name === 'OverconstrainedError' || (firstErr.message && firstErr.message.includes('Constraint'));
+    const isNotFound = firstErr.name === 'NotFoundError' || firstErr.name === 'DevicesNotFoundError';
+    if (!isOverconstrained && !isNotFound) throw firstErr;
+
+    console.warn('Camera (facingMode user) failed, trying by deviceId (Windows 11 fallback):', firstErr.message || firstErr.name);
+  }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoInputs = devices.filter(d => d.kind === 'videoinput');
+  for (const device of videoInputs) {
+    if (!device.deviceId) continue;
+    try {
+      const stream = await tryGetUserMedia({
+        video: { ...baseConstraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
+      });
+      if (stream) {
+        console.log('Camera obtained by deviceId (e.g. HP TrueVision on Windows 11):', device.label || device.deviceId);
+        return stream;
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+
+  return tryGetUserMedia({ video: true });
+}
+
+/** One-off face check before starting tracker. Returns true if face detected or camera disabled. Releases stream. */
+async function checkFaceBeforeStart() {
+  if (!captureSettings.enableCameraCapture) return true;
+  let stream = null;
+  let video = null;
+  try {
+    stream = await getCameraStreamWithFallback(8000);
+    video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.muted = true;
+    video.setAttribute('playsinline', 'true');
+    video.style.position = 'fixed';
+    video.style.top = '-9999px';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    document.body.appendChild(video);
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('Video timeout')), 5000);
+      video.addEventListener('loadedmetadata', () => {
+        clearTimeout(t);
+        video.play().then(() => setTimeout(resolve, 250)).catch(reject);
+      }, { once: true });
+      video.onerror = () => { clearTimeout(t); reject(new Error('Video error')); };
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const hasFace = await detectFaceInCanvas(canvas);
+    return hasFace;
+  } catch (err) {
+    console.warn('Face check before start failed:', err.message);
+    return true; // do not block start on errors
+  } finally {
+    if (stream && stream.getTracks) stream.getTracks().forEach(t => { t.stop(); });
+    if (video) {
+      try {
+        video.pause();
+        video.srcObject = null;
+        if (video.parentNode) video.parentNode.removeChild(video);
+      } catch (_) {}
+    }
+  }
+}
+
 async function captureCamera() {
   // Always attempt camera capture if tracking is active
   if (!isTracking) {
@@ -4092,15 +4326,7 @@ async function captureCamera() {
   try {
     console.log('Starting camera capture...');
     
-    // Get camera stream - only when we need to capture
-    // Use more lenient constraints to avoid conflicts
-    stream = await navigator.mediaDevices.getUserMedia({ 
-      video: { 
-        width: { ideal: 640, max: 1280 },
-        height: { ideal: 480, max: 720 },
-        facingMode: 'user'
-      } 
-    });
+    stream = await getCameraStreamWithFallback(10000);
     
     console.log('Camera stream obtained');
     
@@ -4187,6 +4413,29 @@ async function captureCamera() {
     
     console.log(`Camera frame captured: ${canvas.width}x${canvas.height}`);
 
+    // Face check every 5–7 min: stop tracker if no face detected
+    const faceDetected = await detectFaceInCanvas(canvas);
+    if (!faceDetected) {
+      console.log('Face detection: no face in camera - stopping tracker');
+      if (stream && stream.getTracks) {
+        stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
+      }
+      if (video) {
+        try { video.pause(); video.srcObject = null; if (video.parentNode) video.parentNode.removeChild(video); } catch (_) {}
+      }
+      video = null;
+      stream = null;
+      await stopTracking();
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered or blur';
+      await ipcRenderer.invoke('show-overlay', {
+        title: 'Camera covered or blur',
+        message: 'Your camera appears covered or blurry. Tracking has been stopped.',
+        icon: '📷',
+        isStopped: true
+      });
+      return;
+    }
+
     // CRITICAL: Release camera IMMEDIATELY after capturing frame
     // Stop all tracks first
     if (stream && stream.getTracks) {
@@ -4241,45 +4490,6 @@ async function captureCamera() {
             return;
           }
 
-          // Camera comparer: only when we're actually capturing camera (we're already in captureCamera)
-          if (sharp) {
-            const cameraBlack = await isBlackScreenBuffer(buffer);
-            if (cameraBlack) {
-              console.log('Screen comparer: camera image is black - stopping tracker');
-              await stopTracking();
-              if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera is black';
-              await ipcRenderer.invoke('show-overlay', {
-                title: 'Camera black',
-                message: 'Your camera image appears black. Tracking has been stopped.',
-                icon: '📷',
-                isStopped: true
-              });
-              resolve();
-              return;
-            }
-            // Same camera image check (e.g. something covering lens - same frame every time)
-            const cameraHash = await getCameraImageHash(buffer);
-            if (cameraHash !== null) {
-              if (cameraHash === lastCameraContentHashForComparer) consecutiveSameCameraCount++;
-              else consecutiveSameCameraCount = 0;
-              lastCameraContentHashForComparer = cameraHash;
-              const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
-              if (consecutiveSameCameraCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed) {
-                console.log('Screen comparer: camera image unchanged for consecutive captures - stopping tracker');
-                await stopTracking();
-                if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera unchanged';
-                await ipcRenderer.invoke('show-overlay', {
-                  title: 'Camera unchanged',
-                  message: 'Your camera image has not changed. Tracking has been stopped.',
-                  icon: '📷',
-                  isStopped: true
-                });
-                resolve();
-                return;
-              }
-            }
-          }
-
           const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
           fs.writeFileSync(cameraPath, buffer);
 
@@ -4296,28 +4506,35 @@ async function captureCamera() {
           const cameraFile = fs.readFileSync(cameraPath);
           
           console.log(`Uploading camera capture to screenshots bucket: ${cameraFileName}`);
-          const { data: cameraData, error: cameraError } = await supabase.storage
-            .from('screenshots')
-            .upload(cameraFileName, cameraFile, {
+          let uploadResult = await withTimeout(
+            supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
               contentType: 'image/png',
               upsert: false
-            });
+            }),
+            CAMERA_UPLOAD_TIMEOUT_MS,
+            'Camera storage upload'
+          ).catch(err => ({ data: null, error: err }));
+          let cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
+          let cameraError = uploadResult ? uploadResult.error : null;
 
+          // Single retry only: if first attempt failed, try once more then exit
           if (cameraError) {
-            console.error('Error uploading camera capture:', cameraError);
-            console.error('Error details:', JSON.stringify(cameraError, null, 2));
-            
-            // Check if it's a bucket/path issue
-            if (cameraError.message && (cameraError.message.includes('bucket') || cameraError.message.includes('not found'))) {
-              console.error('❌ Storage bucket issue - check if "screenshots" bucket exists in Supabase Storage');
-            }
-            if (cameraError.message && cameraError.message.includes('policy')) {
-              console.error('❌ Storage policy issue - check RLS policies for screenshots bucket (camera folder)');
-            }
-            if (cameraError.message && cameraError.message.includes('permission')) {
-              console.error('❌ Storage permission issue - check storage policies allow uploads to screenshots/camera/{user_id}/*');
-            }
-            
+            console.warn('Camera upload failed, retrying once:', cameraError.message || cameraError);
+            await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+            uploadResult = await withTimeout(
+              supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
+                contentType: 'image/png',
+                upsert: false
+              }),
+              CAMERA_UPLOAD_TIMEOUT_MS,
+              'Camera storage upload retry'
+            ).catch(err => ({ data: null, error: err }));
+            cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
+            cameraError = uploadResult ? uploadResult.error : null;
+          }
+          if (cameraError) {
+            console.warn('Camera upload retry failed, skipping this capture:', cameraError.message || cameraError);
+            try { fs.unlinkSync(cameraPath); } catch (_) {}
             resolve();
             return;
           }
@@ -4371,19 +4588,26 @@ async function captureCamera() {
       stack: error.stack
     });
     
-    if (errorName === 'NotReadableError' || errorMessage.includes('Could not start video source')) {
-      // Camera is likely in use by another application
-      console.warn('Camera is in use or unavailable:', errorMessage);
-      // Continue tracking without camera - don't log as error
+    const likelyInUse = errorName === 'NotReadableError' ||
+      /Could not start video source|in use|resource.*busy|device.*busy|overconstrained|timeout/i.test(errorMessage);
+    if (likelyInUse) {
+      // Camera in use (e.g. Teams/video call) – next capture in 90s so we resume when call ends
+      console.warn('Camera is in use or temporarily unavailable:', errorMessage);
+      cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
-      console.warn('Camera permission denied:', errorMessage);
-      // Continue tracking without camera
+      // User disabled camera in Windows mid-session – stop tracking to prevent abuse
+      console.warn('Camera permission revoked during tracking – stopping tracker:', errorMessage);
+      await stopTracking();
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera access disabled';
+      await ipcRenderer.invoke('show-overlay', {
+        title: 'Camera access disabled',
+        message: 'Camera was turned off in Windows settings during tracking. Tracking has been stopped. Re-enable "Allow desktop apps to access your camera" to track again.',
+        icon: '📷',
+        isStopped: true
+      });
+      return;
     } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
       console.warn('No camera device found:', errorMessage);
-      // Continue tracking without camera
-    } else if (errorMessage.includes('timeout')) {
-      console.warn('Camera capture timeout:', errorMessage);
-      // Continue tracking without camera
     } else {
       // Other errors - log but continue
       console.warn('Camera capture error (continuing without camera):', errorName, errorMessage);
@@ -4435,7 +4659,7 @@ function startRealTimeUpdates() {
     realTimeUpdateInterval = null;
   }
   
-  // Performance optimization: Update duration in database every 2 minutes (reduced frequency)
+  // Sync every 1 minute so user time is never lost (2 min was causing reported 4h -> 2-3h when app was in background or under load)
   // Use baseDurationAtSessionStart to prevent double-counting
   realTimeUpdateInterval = setInterval(async () => {
     // Double-check isTracking and isStoppingTracking to prevent race conditions
@@ -4534,7 +4758,18 @@ function startRealTimeUpdates() {
         duration: totalDuration
       });
     }
-  }, 120000); // Optimized: Every 2 minutes (reduced from 1 minute for better performance)
+  }, 60000); // Every 1 minute - ensures time is never lost when app is in background or under load
+  // First sync after 30s so we don't wait a full minute for initial persist
+  setTimeout(() => {
+    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartTime) return;
+    const now = Date.now();
+    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    sessionDuration -= Math.floor(pausedDuration / 1000);
+    if (sessionDuration < 0) sessionDuration = 0;
+    const totalDuration = baseDurationAtSessionStart + sessionDuration;
+    saveToLocalStorage(currentUser.id, currentDayCycle.dateString, { duration: totalDuration, timeEntryId: timeEntryId });
+    if (isOnline) syncCurrentDuration().catch(() => {});
+  }, 30000);
 }
 
 // Helper function to sync current duration to Supabase
