@@ -165,9 +165,20 @@ let timeEntryId = null;
 let startTime = null;
 let baseDuration = 0; // Cumulative duration from previous sessions in same day cycle
 let baseDurationAtSessionStart = 0; // Base duration when current session started (to prevent double-counting)
-let sessionStartTime = null; // Start time of current session
-let pausedDuration = 0; // Track paused time in current session
-let pauseStartTime = null; // When tracking was paused
+let sessionStartTime = null; // Wall-clock session start (for DB start_time / display only)
+let sessionStartPerfMs = null; // performance.now() at session start — monotonic, not affected by OS clock changes
+let pausedDuration = 0; // Accumulated paused time in current session (ms, from performance.now() deltas)
+let pauseStartPerfMs = null; // performance.now() when inactivity pause began (null = not paused)
+
+/** Active tracked seconds this session, from monotonic clock (immune to system time changes). */
+function getMonotonicSessionSeconds() {
+  if (sessionStartPerfMs == null) return 0;
+  const perfNow = performance.now();
+  const currentPauseMs = pauseStartPerfMs != null ? perfNow - pauseStartPerfMs : 0;
+  const activeMs = perfNow - sessionStartPerfMs - pausedDuration - currentPauseMs;
+  const sec = Math.floor(activeMs / 1000);
+  return sec < 0 ? 0 : sec;
+}
 let isStoppingTracking = false; // Flag to prevent race conditions during stop
 let timerInterval = null;
 let captureInterval = null; // Kept for clearInterval compatibility when stopping
@@ -754,7 +765,7 @@ document.addEventListener('visibilitychange', async () => {
     }
 
     // Catch-up: if we're tracking and last screenshot was too long ago (e.g. app was in background and timers were throttled), capture now and reschedule
-    if (isTracking && !pauseStartTime && timeEntryId && !captureInProgress) {
+    if (isTracking && pauseStartPerfMs == null && timeEntryId && !captureInProgress) {
       const timeSinceLastCapture = Date.now() - lastCaptureTime;
       if (timeSinceLastCapture >= CAPTURE_INTERVAL_MIN_MS) {
         console.log(`App visible: last capture ${Math.round(timeSinceLastCapture / 60000)} min ago - running catch-up capture`);
@@ -828,7 +839,7 @@ function setupActivityListeners() {
   // Single click or key = activity (no throttle)
   const activityHandler = (eventType) => {
     return () => {
-      if (isTracking && !pauseStartTime) {
+      if (isTracking && pauseStartPerfMs == null) {
         resetIdleTimer();
         if (!activityHandler.lastLogTime || (Date.now() - activityHandler.lastLogTime) > 5000) {
           console.log(`Activity detected: ${eventType}`);
@@ -855,7 +866,7 @@ function setupActivityListeners() {
   let lastMouseMoveActivityTime = 0;
   const MOUSE_MOVE_ACTIVITY_THROTTLE_MS = 15000;
   document.addEventListener('mousemove', () => {
-    if (!isTracking || pauseStartTime) return;
+    if (!isTracking || pauseStartPerfMs != null) return;
     const now = Date.now();
     if (now - lastMouseMoveActivityTime >= MOUSE_MOVE_ACTIVITY_THROTTLE_MS) {
       lastMouseMoveActivityTime = now;
@@ -888,7 +899,7 @@ function setupActivityListeners() {
 // Reset idle timer when activity is detected (mouse click or keyboard key only).
 function resetIdleTimer() {
   if (!isTracking) return;
-  if (pauseStartTime) return;
+  if (pauseStartPerfMs != null) return;
 
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
@@ -906,7 +917,7 @@ function resetIdleTimer() {
 // Activity = (1) mouse click, key press, or mouse move (hover) in THIS window, OR (2) system-wide from main, OR (3) fallback poll.
 // (2) and (3) prevent "inactive" when user is in another app. Single key/click/hover anywhere count as activity.
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
-  if (!isTracking || pauseStartTime) return;
+  if (!isTracking || pauseStartPerfMs != null) return;
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
   if (timeSinceLastUpdate > 50) {
@@ -926,7 +937,7 @@ function startActivityFallbackPoll() {
   const POLL_MS = 5000;
   const IDLE_ACTIVE_THRESHOLD_SEC = 30;
   activityFallbackInterval = setInterval(async () => {
-    if (!isTracking || pauseStartTime) return;
+    if (!isTracking || pauseStartPerfMs != null) return;
     try {
       const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
       if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
@@ -958,7 +969,7 @@ if (document.readyState === 'loading') {
 
 // IPC handlers for overlay
 ipcRenderer.on('overlay-continue', async () => {
-  if (isTracking && pauseStartTime) {
+  if (isTracking && pauseStartPerfMs != null) {
     // Resume tracking if paused (inactivity scenario)
     resumeTracking();
     // Close overlay after resuming
@@ -986,7 +997,7 @@ ipcRenderer.on('overlay-continue', async () => {
 
 ipcRenderer.on('overlay-stop', async () => {
   if (isTracking) {
-    if (pauseStartTime) pauseStartTime = null;
+    if (pauseStartPerfMs != null) pauseStartPerfMs = null;
     const entryIdToUpdate = timeEntryId;
     await stopTracking();
 
@@ -1922,7 +1933,8 @@ async function handleLogout() {
     selectedTaskId = null;
     timeEntryId = null;
     sessionStartTime = null;
-    pauseStartTime = null;
+    sessionStartPerfMs = null;
+    pauseStartPerfMs = null;
     pausedDuration = 0;
     baseDuration = 0;
     baseDurationAtSessionStart = 0;
@@ -2854,8 +2866,9 @@ async function startTracking() {
   isTracking = true;
   sessionStartTime = new Date();
   baseDurationAtSessionStart = baseDuration; // Store base duration at session start
+  sessionStartPerfMs = performance.now();
   pausedDuration = 0;
-  pauseStartTime = null;
+  pauseStartPerfMs = null;
   lastActivityTime = Date.now(); // Initialize with current time
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
@@ -3034,29 +3047,19 @@ async function stopTracking() {
   // Wait a brief moment to ensure any pending async operations complete
   await new Promise(resolve => setTimeout(resolve, 100));
 
-  // Calculate session duration (subtract paused time)
+  // Calculate session duration from monotonic clock (immune to OS time changes)
   const endTime = new Date();
   let sessionDuration = 0;
   
   if (sessionStartTime) {
-    // Calculate session duration accurately
-    const now = Date.now();
-    
-    // If tracking was paused (modal was open), add that time to pausedDuration
-    if (pauseStartTime) {
-      pausedDuration += now - pauseStartTime;
-      pauseStartTime = null;
+    // Close any in-progress pause using monotonic clock (same basis as pausedDuration)
+    if (pauseStartPerfMs != null) {
+      pausedDuration += performance.now() - pauseStartPerfMs;
+      pauseStartPerfMs = null;
     }
-    
-    // Calculate total session time and subtract paused time
-    const totalSessionTime = Math.floor((now - sessionStartTime.getTime()) / 1000); // in seconds
-    const pausedTimeSeconds = Math.floor(pausedDuration / 1000);
-    sessionDuration = totalSessionTime - pausedTimeSeconds;
-    if (sessionDuration < 0) sessionDuration = 0;
-    
+    sessionDuration = getMonotonicSessionSeconds();
     console.log(`Stop tracking - Session duration calculation:`, {
-      totalSessionTime,
-      pausedTimeSeconds,
+      pausedTimeSeconds: Math.floor(pausedDuration / 1000),
       sessionDuration,
       baseDurationAtSessionStart,
       sessionStartTime: sessionStartTime.toISOString(),
@@ -3098,7 +3101,7 @@ async function stopTracking() {
   
   // Additional safety: If we have a sessionStartTime but duration is 0, calculate minimum 1 second
   if (finalDuration === 0 && sessionStartTime && sessionDuration === 0) {
-    const minDuration = Math.max(1, Math.floor((Date.now() - sessionStartTime.getTime()) / 1000));
+    const minDuration = Math.max(1, getMonotonicSessionSeconds());
     if (minDuration > 0) {
       console.warn('Warning: Session duration calculated as 0, using minimum duration:', minDuration);
       finalDuration = baseDurationAtSessionStart + minDuration;
@@ -3329,11 +3332,12 @@ async function stopTracking() {
   updateStartButtonState(); // Update start button state based on selections
 
   sessionStartTime = null;
+  sessionStartPerfMs = null;
   baseDurationAtSessionStart = 0;
   // CRITICAL: Reset pausedDuration after stopping to prevent it from affecting future sessions
   // Note: This is reset here as a safety measure, but should already be reset after successful sync above
   pausedDuration = 0;
-  pauseStartTime = null;
+  pauseStartPerfMs = null;
   
   // Clear the stopping flag
   isStoppingTracking = false;
@@ -3371,7 +3375,7 @@ function startIdleDetection() {
     }
 
     // Don't check if already paused
-    if (pauseStartTime) {
+    if (pauseStartPerfMs != null) {
       idleTimer = setTimeout(checkIdle, 5000);
       return;
     }
@@ -3390,7 +3394,7 @@ function startIdleDetection() {
         const doubleCheckDelay = 3000;
         idleDoubleCheckTimer = setTimeout(async () => {
           idleDoubleCheckTimer = null;
-          if (!isTracking || pauseStartTime) return;
+          if (!isTracking || pauseStartPerfMs != null) return;
 
           const recheckTime = Date.now();
           const recheckTimeSinceActivity = recheckTime - lastActivityTime;
@@ -3399,7 +3403,7 @@ function startIdleDetection() {
 
           if (shouldShowOverlay) {
           // Pause tracking (no time deduction here - deduction only on Stop)
-          pauseStartTime = Date.now();
+          pauseStartPerfMs = performance.now();
       
           // Stop timer and captures
           if (timerInterval) {
@@ -3458,12 +3462,12 @@ function startIdleDetection() {
 
 // Resume tracking after inactivity (called when user clicks Continue)
 async function resumeTracking() {
-  if (!isTracking || !pauseStartTime) return;
+  if (!isTracking || pauseStartPerfMs == null) return;
 
   const now = Date.now();
   // Exclude time while inactivity modal was open from tracked time (don't add it when they click Continue)
-  pausedDuration += now - pauseStartTime;
-  pauseStartTime = null;
+  pausedDuration += performance.now() - pauseStartPerfMs;
+  pauseStartPerfMs = null;
 
   // Sync current duration to DB (duration = up to last activity, no time added for modal-open period)
   await syncCurrentDuration();
@@ -3512,25 +3516,17 @@ function startTimer() {
     timerInterval = null;
   }
   
-  // Performance optimization: Throttle UI updates to 1 second
-  let lastUpdateTime = Date.now();
-  
+  // Performance optimization: Throttle UI updates to 1 second (monotonic throttle)
+  let lastUpdatePerfMs = performance.now();
+
   timerInterval = setInterval(() => {
-    if (sessionStartTime && !pauseStartTime && isTracking) {
-      // Calculate session duration accurately
-      const now = Date.now();
-      let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
-      sessionDuration -= Math.floor(pausedDuration / 1000);
-      if (sessionDuration < 0) sessionDuration = 0;
-      
-      // Total duration = baseDurationAtSessionStart + session (prevents double-counting)
+    if (sessionStartTime && pauseStartPerfMs == null && isTracking) {
+      const sessionDuration = getMonotonicSessionSeconds();
       const totalDuration = baseDurationAtSessionStart + sessionDuration;
-      
-      // Only update UI if enough time has passed (throttle to 1 second)
-      // This prevents excessive DOM updates when app is visible
-      if (now - lastUpdateTime >= 1000) {
+      const perfNow = performance.now();
+      if (perfNow - lastUpdatePerfMs >= 1000) {
         updateTimerDisplay(totalDuration);
-        lastUpdateTime = now;
+        lastUpdatePerfMs = perfNow;
       }
     }
   }, 1000);
@@ -3554,7 +3550,7 @@ function getNextCaptureDelayMs() {
 }
 
 function scheduleNextCapture() {
-  if (!isTracking || pauseStartTime || !timeEntryId) return;
+  if (!isTracking || pauseStartPerfMs != null || !timeEntryId) return;
   const delay = getNextCaptureDelayMs(); // 5–7 min for all cycles (including after camera was in use)
   if (cameraSkippedDueToInUse) cameraSkippedDueToInUse = false;
   captureTimeoutId = setTimeout(() => {
@@ -3598,7 +3594,7 @@ function startPeriodicCaptures() {
   const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
   const STUCK_CAPTURE_THRESHOLD_MS = 8 * 60 * 1000; // No successful capture in 8 min = stuck (was 12 – restart sooner)
   captureWatchdogInterval = setInterval(() => {
-    if (!isTracking || pauseStartTime || !timeEntryId) return;
+    if (!isTracking || pauseStartPerfMs != null || !timeEntryId) return;
     const now = Date.now();
     const timeSinceLastCapture = now - lastCaptureTime;
     // If capture is stuck (in progress or scheduled but no capture completed in 12+ min), restart loop
@@ -3892,6 +3888,43 @@ const CAMERA_UPLOAD_TIMEOUT_MS = 45000; // 45s – avoid capture loop hanging on
 const UPLOAD_TIMEOUT_MS = 60000; // 60s so rate-limited API can still succeed
 const UPLOAD_RETRY_DELAY_MS = 1000; // Delay before single retry (screenshot and camera): first try, one retry, then exit
 
+/** Screenshot storage HTTP API (screenshot-storage-server). Set in .env for production. */
+function getScreenshotStorageServerBaseUrl() {
+  return String(process.env.SCREENSHOT_STORAGE_SERVER_URL || 'https://timeflowstorage.mechlintech.com').replace(
+    /\/$/,
+    ''
+  );
+}
+
+/**
+ * Upload image to local/cloud screenshot server: timeflow-screenshots/{screenshots|camera}/{uuid}/file.png
+ * Matches Supabase storage_path shape so the web app can resolve URLs via VITE_SCREENSHOT_STORAGE_BASE_URL.
+ */
+async function uploadBufferToScreenshotServer(buffer, { type, uuid, fileBaseName }) {
+  const base = getScreenshotStorageServerBaseUrl();
+  const formData = new FormData();
+  formData.append('type', type);
+  formData.append('uuid', uuid);
+  formData.append('filename', fileBaseName);
+  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const blob = new Blob([bytes], { type: 'image/png' });
+  formData.append('file', blob, fileBaseName);
+
+  const res = await fetch(`${base}/upload`, {
+    method: 'POST',
+    body: formData,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Screenshot server upload failed (${res.status}): ${text}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Screenshot server returned non-JSON: ${text.slice(0, 200)}`);
+  }
+}
+
 // Screenshot: first attempt, one retry on failure, then exit (no further retries to avoid data inconsistency)
 async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   if (!screenshotBuffer || screenshotBuffer.length === 0) {
@@ -3906,68 +3939,48 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
   }
 
   try {
-    const screenshotFileName = `screenshots/${currentUser.id}/${timestamp}-${screenIdentifier}-screenshot.png`;
+    const fileBaseName = `${timestamp}-${screenIdentifier}-screenshot.png`;
+    const storagePathForDb = `screenshots/${currentUser.id}/${fileBaseName}`;
     const screenshotFile = fs.readFileSync(screenshotPath);
 
-    const uploadPromise = supabase.storage
-      .from('screenshots')
-      .upload(screenshotFileName, screenshotFile, {
-        contentType: 'image/png',
-        upsert: false
-      });
-    const { data: screenshotData, error: screenshotError } = await withTimeout(
-      uploadPromise,
-      UPLOAD_TIMEOUT_MS,
-      'Screenshot storage upload'
-    );
+    const runUpload = () =>
+      withTimeout(
+        uploadBufferToScreenshotServer(screenshotFile, {
+          type: 'screenshots',
+          uuid: currentUser.id,
+          fileBaseName,
+        }),
+        UPLOAD_TIMEOUT_MS,
+        'Screenshot storage upload'
+      );
 
-    if (screenshotError) {
-      // Single retry only: first attempt failed, try once more then exit
-      console.warn('Screenshot upload failed, retrying once:', screenshotError.message || screenshotError);
-      await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
-      let retryData = null;
-      let retryError = null;
+    let uploadOk = false;
+    try {
+      await runUpload();
+      uploadOk = true;
+    } catch (e) {
+      console.warn('Screenshot upload failed, retrying once:', e.message || e);
+      await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
       try {
-        const retry = await withTimeout(
-          supabase.storage.from('screenshots').upload(screenshotFileName, screenshotFile, { contentType: 'image/png', upsert: false }),
-          UPLOAD_TIMEOUT_MS,
-          'Screenshot upload retry'
-        );
-        retryData = retry && retry.data;
-        retryError = retry && retry.error;
-      } catch (e) {
-        retryError = e;
+        await runUpload();
+        uploadOk = true;
+      } catch (e2) {
+        console.warn('Screenshot upload retry failed, skipping this capture:', e2.message || e2);
       }
-      if (retryError) {
-        console.warn('Screenshot upload retry failed, skipping this capture:', retryError.message || retryError);
-        return;
-      }
-      if (retryData) {
-        const { error: insertError } = await supabase
-          .from('screenshots')
-          .insert({
-            time_entry_id: timeEntryId,
-            storage_path: screenshotFileName,
-            type: 'screenshot',
-            taken_at: new Date().toISOString()
-          });
-        if (insertError) console.error('Error inserting screenshot record:', insertError);
-      }
+    }
+
+    if (!uploadOk) {
       return;
     }
 
-    if (screenshotData) {
-      const { error: insertError } = await supabase
-        .from('screenshots')
-        .insert({
-          time_entry_id: timeEntryId,
-          storage_path: screenshotFileName,
-          type: 'screenshot',
-          taken_at: new Date().toISOString()
-        });
-      if (insertError) {
-        console.error('Error inserting screenshot record:', insertError);
-      }
+    const { error: insertError } = await supabase.from('screenshots').insert({
+      time_entry_id: timeEntryId,
+      storage_path: storagePathForDb,
+      type: 'screenshot',
+      taken_at: new Date().toISOString(),
+    });
+    if (insertError) {
+      console.error('Error inserting screenshot record:', insertError);
     }
   } finally {
     if (fs.existsSync(screenshotPath)) {
@@ -4220,59 +4233,63 @@ async function captureCamera() {
           }
           console.log(`Camera file created: ${cameraPath} (${buffer.length} bytes)`);
 
-          // Upload camera capture to screenshots bucket in camera folder
-          const cameraFileName = `camera/${currentUser.id}/${Date.now()}-camera.png`;
+          const cameraTs = Date.now();
+          const cameraBaseName = `${cameraTs}-camera.png`;
+          const storagePathForDb = `camera/${currentUser.id}/${cameraBaseName}`;
           const cameraFile = fs.readFileSync(cameraPath);
-          
-          console.log(`Uploading camera capture to screenshots bucket: ${cameraFileName}`);
-          let uploadResult = await withTimeout(
-            supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
-              contentType: 'image/png',
-              upsert: false
-            }),
-            CAMERA_UPLOAD_TIMEOUT_MS,
-            'Camera storage upload'
-          ).catch(err => ({ data: null, error: err }));
-          let cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
-          let cameraError = uploadResult ? uploadResult.error : null;
 
-          // Single retry only: if first attempt failed, try once more then exit
-          if (cameraError) {
-            console.warn('Camera upload failed, retrying once:', cameraError.message || cameraError);
-            await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
-            uploadResult = await withTimeout(
-              supabase.storage.from('screenshots').upload(cameraFileName, cameraFile, {
-                contentType: 'image/png',
-                upsert: false
+          console.log(`Uploading camera capture to screenshot server: ${storagePathForDb}`);
+
+          const runCameraUpload = () =>
+            withTimeout(
+              uploadBufferToScreenshotServer(cameraFile, {
+                type: 'camera',
+                uuid: currentUser.id,
+                fileBaseName: cameraBaseName,
               }),
               CAMERA_UPLOAD_TIMEOUT_MS,
-              'Camera storage upload retry'
-            ).catch(err => ({ data: null, error: err }));
-            cameraData = uploadResult && !uploadResult.error ? uploadResult.data : null;
-            cameraError = uploadResult ? uploadResult.error : null;
+              'Camera storage upload'
+            );
+
+          let uploadOk = false;
+          try {
+            await runCameraUpload();
+            uploadOk = true;
+          } catch (cameraError) {
+            console.warn('Camera upload failed, retrying once:', cameraError.message || cameraError);
+            await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+            try {
+              await runCameraUpload();
+              uploadOk = true;
+            } catch (cameraError2) {
+              console.warn(
+                'Camera upload retry failed, skipping this capture:',
+                cameraError2.message || cameraError2
+              );
+            }
           }
-          if (cameraError) {
-            console.warn('Camera upload retry failed, skipping this capture:', cameraError.message || cameraError);
-            try { fs.unlinkSync(cameraPath); } catch (_) {}
+
+          if (!uploadOk) {
+            try {
+              fs.unlinkSync(cameraPath);
+            } catch (_) {}
             resolve();
             return;
           }
 
-          if (cameraData) {
-            console.log('Camera capture uploaded:', cameraData.path);
-            
-            // Insert screenshot record with type 'camera'
-            const { error: insertError } = await supabase
-              .from('screenshots')
-              .insert({
-                time_entry_id: timeEntryId,
-                storage_path: cameraFileName,
-                type: 'camera',
-                taken_at: new Date().toISOString()
-              });
+          console.log('Camera capture uploaded successfully:', storagePathForDb);
 
-            if (insertError) console.error('Error inserting camera record:', insertError);
-            else console.log('Camera record inserted successfully');
+          const { error: insertError } = await supabase.from('screenshots').insert({
+            time_entry_id: timeEntryId,
+            storage_path: storagePathForDb,
+            type: 'camera',
+            taken_at: new Date().toISOString(),
+          });
+
+          if (insertError) {
+            console.error('Error inserting camera record:', insertError);
+          } else {
+            console.log('Camera record inserted successfully');
           }
           try { fs.unlinkSync(cameraPath); } catch (_) {}
         } catch (error) {
@@ -4375,13 +4392,9 @@ function startRealTimeUpdates() {
     }
     
     // Skip if paused (but we'll sync when pause happens)
-    if (pauseStartTime) return;
+    if (pauseStartPerfMs != null) return;
 
-    // Calculate current session duration accurately
-    const now = Date.now();
-    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
-    sessionDuration -= Math.floor(pausedDuration / 1000);
-    if (sessionDuration < 0) sessionDuration = 0;
+    const sessionDuration = getMonotonicSessionSeconds();
 
     // Calculate total duration using baseDurationAtSessionStart (not current baseDuration)
     // This prevents double-counting if baseDuration was updated during this session
@@ -4465,11 +4478,8 @@ function startRealTimeUpdates() {
   }, 60000); // Every 1 minute - ensures time is never lost when app is in background or under load
   // First sync after 30s so we don't wait a full minute for initial persist
   setTimeout(() => {
-    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartTime) return;
-    const now = Date.now();
-    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
-    sessionDuration -= Math.floor(pausedDuration / 1000);
-    if (sessionDuration < 0) sessionDuration = 0;
+    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartPerfMs != null) return;
+    const sessionDuration = getMonotonicSessionSeconds();
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
     saveToLocalStorage(currentUser.id, currentDayCycle.dateString, { duration: totalDuration, timeEntryId: timeEntryId });
     if (isOnline) syncCurrentDuration().catch(() => {});
@@ -4481,14 +4491,7 @@ async function syncCurrentDuration() {
   if (!isTracking || !timeEntryId || !sessionStartTime) return false;
 
   try {
-    // When paused (inactivity modal open), use pause time as "now" so we don't count time while modal is open
-    const now = Date.now();
-    const effectiveNow = pauseStartTime || now;
-    let sessionDuration = Math.floor((effectiveNow - sessionStartTime.getTime()) / 1000);
-    sessionDuration -= Math.floor(pausedDuration / 1000);
-    if (sessionDuration < 0) sessionDuration = 0;
-    
-    // Calculate total duration using baseDurationAtSessionStart
+    const sessionDuration = getMonotonicSessionSeconds();
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
     
     // Save to local storage first (works offline)
