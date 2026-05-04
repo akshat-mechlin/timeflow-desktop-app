@@ -9,6 +9,8 @@
     "build": "electron-builder",
     "build:win": "build-win.bat",
     "build:mac": "electron-builder --mac",
+    "build:mac:arm64": "electron-builder --mac --arm64",
+    "build:mac:x64": "electron-builder --mac --x64",
     "build:all": "electron-builder --win --mac",
     "convert-icon": "node scripts/convert-icon.js"
   },
@@ -20,8 +22,8 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.9.1"
+    "electron": "^34.5.8",
+    "electron-builder": "^25.1.8"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
@@ -93,6 +95,10 @@
       ]
     },
     "mac": {
+      "extendInfo": {
+        "NSScreenCaptureUsageDescription": "TimeFlow needs screen recording to capture periodic screenshots while time tracking is active, when enabled by your organization.",
+        "NSCameraUsageDescription": "TimeFlow uses the camera for optional verification captures while tracking, when enabled by your organization."
+      },
       "target": [
         {
           "target": "dmg",
@@ -111,6 +117,7 @@
       ],
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
+      "identity": null,
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",

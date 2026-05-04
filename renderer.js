@@ -3,7 +3,6 @@ const { createClient } = require('@supabase/supabase-js');
 const screenshot = require('screenshot-desktop');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
 const os = require('os');
 const crypto = require('crypto');
 let sharp;
@@ -164,10 +163,9 @@ let timeEntryId = null;
 let startTime = null;
 let baseDuration = 0; // Cumulative duration from previous sessions in same day cycle
 let baseDurationAtSessionStart = 0; // Base duration when current session started (to prevent double-counting)
-let sessionStartTime = null; // Wall-clock session start (for DB start_time / display only)
-let sessionStartPerfMs = null; // performance.now() at session start — monotonic, not affected by OS clock changes
-let pausedDuration = 0; // Accumulated paused time in current session (ms, from performance.now() deltas)
-let pauseStartPerfMs = null; // performance.now() when inactivity pause began (null = not paused)
+let sessionStartTime = null; // Start time of current session
+let pausedDuration = 0; // Track paused time in current session
+let pauseStartTime = null; // When tracking was paused
 let isStoppingTracking = false; // Flag to prevent race conditions during stop
 let timerInterval = null;
 let captureInterval = null; // Kept for clearInterval compatibility when stopping
@@ -180,16 +178,6 @@ let dailyResetCheckInterval = null;
 let idleTimer = null; // Timer for inactivity detection
 let idleDoubleCheckTimer = null; // Timer for double-checking inactivity
 let lastActivityTime = Date.now(); // Last time user was active
-
-/** Active tracked seconds this session, from monotonic clock (immune to system time changes). */
-function getMonotonicSessionSeconds() {
-  if (sessionStartPerfMs == null) return 0;
-  const perfNow = performance.now();
-  const currentPauseMs = pauseStartPerfMs != null ? perfNow - pauseStartPerfMs : 0;
-  const activeMs = perfNow - sessionStartPerfMs - pausedDuration - currentPauseMs;
-  const sec = Math.floor(activeMs / 1000);
-  return sec < 0 ? 0 : sec;
-}
 let resetIdleTimerDebounce = null; // Debounce timer for resetIdleTimer
 let mouseMovementCount = 0;
 let keystrokeCount = 0;
@@ -829,7 +817,7 @@ document.addEventListener('visibilitychange', async () => {
     }
 
     // Catch-up: if we're tracking and last screenshot was too long ago (e.g. app was in background and timers were throttled), capture now and reschedule
-    if (isTracking && pauseStartPerfMs == null && timeEntryId && !captureInProgress) {
+    if (isTracking && !pauseStartTime && timeEntryId && !captureInProgress) {
       const timeSinceLastCapture = Date.now() - lastCaptureTime;
       if (timeSinceLastCapture >= CAPTURE_INTERVAL_MIN_MS) {
         console.log(`App visible: last capture ${Math.round(timeSinceLastCapture / 60000)} min ago - running catch-up capture`);
@@ -903,7 +891,7 @@ function setupActivityListeners() {
   // Single click or key = activity (no throttle)
   const activityHandler = (eventType) => {
     return () => {
-      if (isTracking && pauseStartPerfMs == null) {
+      if (isTracking && !pauseStartTime) {
         resetIdleTimer();
         if (!activityHandler.lastLogTime || (Date.now() - activityHandler.lastLogTime) > 5000) {
           console.log(`Activity detected: ${eventType}`);
@@ -930,7 +918,7 @@ function setupActivityListeners() {
   let lastMouseMoveActivityTime = 0;
   const MOUSE_MOVE_ACTIVITY_THROTTLE_MS = 15000;
   document.addEventListener('mousemove', () => {
-    if (!isTracking || pauseStartPerfMs != null) return;
+    if (!isTracking || pauseStartTime) return;
     const now = Date.now();
     if (now - lastMouseMoveActivityTime >= MOUSE_MOVE_ACTIVITY_THROTTLE_MS) {
       lastMouseMoveActivityTime = now;
@@ -963,7 +951,7 @@ function setupActivityListeners() {
 // Reset idle timer when activity is detected (mouse click or keyboard key only).
 function resetIdleTimer() {
   if (!isTracking) return;
-  if (pauseStartPerfMs != null) return;
+  if (pauseStartTime) return;
 
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
@@ -981,7 +969,7 @@ function resetIdleTimer() {
 // Activity = (1) mouse click, key press, or mouse move (hover) in THIS window, OR (2) system-wide from main, OR (3) fallback poll.
 // (2) and (3) prevent "inactive" when user is in another app. Single key/click/hover anywhere count as activity.
 ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
-  if (!isTracking || pauseStartPerfMs != null) return;
+  if (!isTracking || pauseStartTime) return;
   const now = Date.now();
   const timeSinceLastUpdate = now - lastActivityTime;
   if (timeSinceLastUpdate > 50) {
@@ -1001,7 +989,7 @@ function startActivityFallbackPoll() {
   const POLL_MS = 5000;
   const IDLE_ACTIVE_THRESHOLD_SEC = 30;
   activityFallbackInterval = setInterval(async () => {
-    if (!isTracking || pauseStartPerfMs != null) return;
+    if (!isTracking || pauseStartTime) return;
     try {
       const idleSeconds = await ipcRenderer.invoke('get-system-idle-time');
       if (typeof idleSeconds === 'number' && idleSeconds >= 0 && idleSeconds < IDLE_ACTIVE_THRESHOLD_SEC) {
@@ -1033,7 +1021,7 @@ if (document.readyState === 'loading') {
 
 // IPC handlers for overlay
 ipcRenderer.on('overlay-continue', async () => {
-  if (isTracking && pauseStartPerfMs != null) {
+  if (isTracking && pauseStartTime) {
     // Resume tracking if paused (inactivity scenario)
     resumeTracking();
     // Close overlay after resuming
@@ -1061,7 +1049,7 @@ ipcRenderer.on('overlay-continue', async () => {
 
 ipcRenderer.on('overlay-stop', async () => {
   if (isTracking) {
-    if (pauseStartPerfMs != null) pauseStartPerfMs = null;
+    if (pauseStartTime) pauseStartTime = null;
     const entryIdToUpdate = timeEntryId;
     await stopTracking();
 
@@ -1473,8 +1461,11 @@ function showCameraDetectionModal(customMessage, reason) {
           await startTracking();
         } else {
           cameraMessage.textContent =
-            'Camera access is still not allowed.\n\n' +
-            'Please turn ON "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then click Retry again. You may need to restart the app.';
+            (result.error || 'Camera access is still not allowed.') +
+            '\n\n' +
+            (appPlatform === 'darwin'
+              ? 'Open System Settings → Privacy & Security → Camera, enable TimeFlow (or Electron if you use npm start), then click Start Tracking again. Quit and reopen the app if needed.'
+              : 'Turn ON "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then click Start Tracking again. You may need to restart the app.');
         }
       };
     } else if (reason === 'screenshot') {
@@ -1486,7 +1477,12 @@ function showCameraDetectionModal(customMessage, reason) {
           updateStartButtonState();
           await startTracking();
         } else {
-          cameraMessage.textContent = (result.error || 'Screenshot access is still not allowed.') + '\n\nEnable screen recording in Windows Settings → Privacy, then click Start Tracking again.';
+          cameraMessage.textContent =
+            (result.error || 'Screenshot access is still not allowed.') +
+            '\n\n' +
+            (appPlatform === 'darwin'
+              ? 'Enable TimeFlow under System Settings → Privacy & Security → Screen Recording, then click Start Tracking again.'
+              : 'Enable screen recording in Windows Settings → Privacy, then click Start Tracking again.');
         }
       };
     } else if (reason === 'face') {
@@ -1530,9 +1526,14 @@ function showCameraPermissionRequiredModal() {
   const steps = getOSInstructions();
   const cameraSteps = (steps && steps.camera)
     ? steps.camera.join('\n• ')
-    : 'Privacy → Camera → Allow desktop apps to access your camera';
+    : 'Allow this app to use the camera in your system privacy settings';
   const message =
-    'The tracker cannot start because camera access is disabled in Windows.';
+    'The tracker cannot start because camera access is not allowed for this app.\n\n' +
+    'To fix this:\n\n' +
+    '• ' +
+    cameraSteps +
+    '\n\n' +
+    'After enabling, click "Start Tracking" below to try again. You may need to restart the app.';
   const modal = document.getElementById('camera-detection-modal');
   if (!modal) {
     alert('Camera access required\n\n' + message);
@@ -2013,8 +2014,7 @@ async function handleLogout() {
     selectedTaskId = null;
     timeEntryId = null;
     sessionStartTime = null;
-    sessionStartPerfMs = null;
-    pauseStartPerfMs = null;
+    pauseStartTime = null;
     pausedDuration = 0;
     baseDuration = 0;
     baseDurationAtSessionStart = 0;
@@ -2321,7 +2321,10 @@ function updateStartButtonState() {
   }
   // Keep Start button enabled so user can click and get the error popup; set tooltip when permission is missing
   if (captureSettings.enableCameraCapture && lastPermissionCheck && !lastPermissionCheck.cameraOk) {
-    startBtn.title = 'Enable camera access in Windows Settings (Privacy → Camera) to start tracking';
+    startBtn.title =
+      appPlatform === 'darwin'
+        ? 'Enable camera for TimeFlow in System Settings → Privacy & Security → Camera'
+        : 'Enable camera in Windows Settings → Privacy → Camera to start tracking';
   } else if (lastPermissionCheck && !lastPermissionCheck.screenshotOk) {
     startBtn.title = 'Please enable screenshot permission to start tracking';
   } else {
@@ -2663,6 +2666,14 @@ async function checkCameraPermission() {
       return { granted: false, error: 'Camera API not available' };
     }
 
+    if (appPlatform === 'darwin') {
+      try {
+        await ipcRenderer.invoke('ensure-macos-camera-access');
+      } catch (e) {
+        console.log('ensure-macos-camera-access:', e.message || e);
+      }
+    }
+
     // Check if we can enumerate devices first (this doesn't require permission)
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -2706,8 +2717,13 @@ async function checkCameraPermission() {
       // Camera might be in use by another application
       return { granted: true, error: 'Camera may be in use by another application, but permission appears granted' };
     } else if (error.message && error.message.includes('timeout')) {
-      // Timeout: could be permission denied (e.g. Windows dialog not shown) or camera slow - treat as not granted so user sees the modal
-      return { granted: false, error: 'Camera access failed (timeout). Please enable camera in Windows Settings → Privacy → Camera.' };
+      return {
+        granted: false,
+        error:
+          appPlatform === 'darwin'
+            ? 'Camera access timed out. Enable TimeFlow (or Electron) under System Settings → Privacy & Security → Camera, then try again.'
+            : 'Camera access failed (timeout). Enable camera in Windows Settings → Privacy → Camera.'
+      };
     } else {
       // Any other error (e.g. SecurityError when Windows blocks): show permission modal so user knows what to fix
       console.warn('Camera check failed:', errorDetails);
@@ -2748,11 +2764,13 @@ async function checkCameraDevice() {
       if (accessError.name === 'NotFoundError' || accessError.name === 'DevicesNotFoundError') {
         return { detected: false, error: 'No camera device found. Please connect a camera to start tracking.' };
       }
-      // Windows "Allow desktop apps to access your camera" off → NotAllowedError
       if (accessError.name === 'NotAllowedError' || accessError.name === 'PermissionDeniedError') {
         return {
           detected: false,
-          error: 'Camera access is blocked. Please enable "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then restart the app.'
+          error:
+            appPlatform === 'darwin'
+              ? 'Camera access is blocked. Open System Settings → Privacy & Security → Camera, enable TimeFlow (or Electron when developing), then restart the app.'
+              : 'Camera access is blocked. Enable "Allow desktop apps to access your camera" in Windows Settings → Privacy → Camera, then restart the app.'
         };
       }
       // For other errors (e.g. in use), device exists but can't access
@@ -2764,16 +2782,66 @@ async function checkCameraDevice() {
   }
 }
 
+/** PNG buffers from main-process desktopCapturer thumbnails — avoids renderer getUserMedia desktop capture (often "Timeout starting video source" on macOS). */
+async function captureDesktopScreensPngViaMain(maxWidth, maxHeight) {
+  const rows = await ipcRenderer.invoke('capture-desktop-screens-png', {
+    maxWidth: maxWidth || 3840,
+    maxHeight: maxHeight || 2160
+  });
+  if (!rows || !rows.length) return [];
+  return rows.map((row) => (row.png ? Buffer.from(row.png) : null)).filter((b) => b && b.length > 0);
+}
+
 async function checkScreenshotPermission() {
   try {
+    // macOS: getMediaAccessStatus('screen') often reports denied/unknown for unsigned Electron builds even when
+    // Screen Recording is enabled. Use a real capture probe first; only then show Settings-based errors.
+    if (appPlatform === 'darwin') {
+      let status = await ipcRenderer.invoke('get-screen-capture-access-status');
+      if (status === 'not-determined') {
+        status = await ipcRenderer.invoke('prompt-screen-capture-if-needed');
+      }
+
+      try {
+        const probeBufs = await captureDesktopScreensPngViaMain(320, 180);
+        if (probeBufs.length > 0 && probeBufs.some((b) => b.length > 200)) {
+          return { granted: true };
+        }
+      } catch (probeErr) {
+        console.log('Screenshot permission probe (main PNG):', probeErr.message || probeErr);
+      }
+
+      console.log('macOS screen capture: probe failed; TCC status from Electron:', status);
+
+      if (status !== 'granted') {
+        const byStatus = {
+          denied:
+            'macOS Screen Recording is off for this app. Open System Settings → Privacy & Security → Screen Recording, enable TimeFlow, then quit and reopen the app.',
+          'not-determined':
+            'Screen Recording is required. Accept the macOS prompt if shown, or enable TimeFlow under System Settings → Privacy & Security → Screen Recording.',
+          restricted: 'Screen Recording is restricted on this Mac (for example by device management).',
+          unknown: 'Could not verify Screen Recording permission. Enable TimeFlow under System Settings → Privacy & Security → Screen Recording.'
+        };
+        return {
+          granted: false,
+          error: byStatus[status] || byStatus.unknown
+        };
+      }
+
+      return {
+        granted: false,
+        error:
+          'Screen Recording is on for TimeFlow, but capture still failed. Fully quit TimeFlow (Cmd+Q), reopen it, and make sure you only run one copy—the app in System Settings must be the same file you launch (e.g. /Applications/TimeFlow.app, not a second copy in Downloads).'
+      };
+    }
+
     // Try to capture a test screenshot - use buffer method to avoid file copy issues
     const testBuffer = await screenshot({ format: 'png' });
-    
+
     if (testBuffer && testBuffer.length > 0) {
       return { granted: true };
-    } else {
-      return { granted: false, error: 'Screenshot capture returned empty buffer' };
     }
+    return { granted: false, error: 'Screenshot capture returned empty buffer' };
   } catch (error) {
     console.log('Screenshot permission check result:', error.message || error);
     return { granted: false, error: error.message || 'Screenshot capture failed' };
@@ -2802,18 +2870,16 @@ function getOSInstructions() {
   } else if (platform === 'darwin') {
     return {
       camera: [
-        'Open System Preferences → Security & Privacy',
-        'Go to the Privacy tab',
-        'Select Camera from the left sidebar',
-        'Check the box next to "Time Flow" or "Electron"',
-        'Restart the application after enabling'
+        'Open System Settings → Privacy & Security → Camera (older macOS: System Preferences → Security & Privacy → Privacy → Camera)',
+        'Turn ON TimeFlow (or "Electron" if you run the app with npm start / from the terminal)',
+        'If TimeFlow is not listed, click + and add your TimeFlow.app, or start tracking once and accept the camera prompt',
+        'Quit the app completely (Cmd+Q) and reopen so macOS applies the change'
       ],
       screenshot: [
-        'Open System Preferences → Security & Privacy',
-        'Go to the Privacy tab',
-        'Select Screen Recording from the left sidebar',
-        'Check the box next to "Time Flow" or "Electron"',
-        'Restart the application after enabling'
+        'Open System Settings → Privacy & Security → Screen Recording (or System Preferences → Security & Privacy → Privacy → Screen Recording on older macOS)',
+        'Turn ON TimeFlow (or "Electron" if you run from the terminal)',
+        'Quit TimeFlow completely and reopen so macOS applies the permission',
+        'If screenshots show only your wallpaper, Screen Recording is still off for this app'
       ]
     };
   } else {
@@ -2892,7 +2958,7 @@ async function startTracking() {
     screenshot({ format: 'png' }).catch(() => {});
   }
 
-  // When camera capture is enabled, require Windows camera permission and a detected device
+  // When camera capture is enabled, require camera permission and a detected device
   if (captureSettings.enableCameraCapture) {
     const cameraPermission = await checkCameraPermission();
     if (!cameraPermission.granted) {
@@ -2954,10 +3020,9 @@ async function startTracking() {
 
   isTracking = true;
   sessionStartTime = new Date();
-  sessionStartPerfMs = performance.now();
   baseDurationAtSessionStart = baseDuration; // Store base duration at session start
   pausedDuration = 0;
-  pauseStartPerfMs = null;
+  pauseStartTime = null;
   lastActivityTime = Date.now(); // Initialize with current time
   console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
   mouseMovementCount = 0;
@@ -3144,14 +3209,24 @@ async function stopTracking() {
   let sessionDuration = 0;
   
   if (sessionStartTime) {
-    // Close any in-progress pause using monotonic clock (same basis as pausedDuration)
-    if (pauseStartPerfMs != null) {
-      pausedDuration += performance.now() - pauseStartPerfMs;
-      pauseStartPerfMs = null;
+    // Calculate session duration accurately
+    const now = Date.now();
+    
+    // If tracking was paused (modal was open), add that time to pausedDuration
+    if (pauseStartTime) {
+      pausedDuration += now - pauseStartTime;
+      pauseStartTime = null;
     }
-    sessionDuration = getMonotonicSessionSeconds();
+    
+    // Calculate total session time and subtract paused time
+    const totalSessionTime = Math.floor((now - sessionStartTime.getTime()) / 1000); // in seconds
+    const pausedTimeSeconds = Math.floor(pausedDuration / 1000);
+    sessionDuration = totalSessionTime - pausedTimeSeconds;
+    if (sessionDuration < 0) sessionDuration = 0;
+    
     console.log(`Stop tracking - Session duration calculation:`, {
-      pausedTimeSeconds: Math.floor(pausedDuration / 1000),
+      totalSessionTime,
+      pausedTimeSeconds,
       sessionDuration,
       baseDurationAtSessionStart,
       sessionStartTime: sessionStartTime.toISOString(),
@@ -3193,7 +3268,7 @@ async function stopTracking() {
   
   // Additional safety: If we have a sessionStartTime but duration is 0, calculate minimum 1 second
   if (finalDuration === 0 && sessionStartTime && sessionDuration === 0) {
-    const minDuration = Math.max(1, getMonotonicSessionSeconds());
+    const minDuration = Math.max(1, Math.floor((Date.now() - sessionStartTime.getTime()) / 1000));
     if (minDuration > 0) {
       console.warn('Warning: Session duration calculated as 0, using minimum duration:', minDuration);
       finalDuration = baseDurationAtSessionStart + minDuration;
@@ -3424,12 +3499,11 @@ async function stopTracking() {
   updateStartButtonState(); // Update start button state based on selections
 
   sessionStartTime = null;
-  sessionStartPerfMs = null;
   baseDurationAtSessionStart = 0;
   // CRITICAL: Reset pausedDuration after stopping to prevent it from affecting future sessions
   // Note: This is reset here as a safety measure, but should already be reset after successful sync above
   pausedDuration = 0;
-  pauseStartPerfMs = null;
+  pauseStartTime = null;
   
   // Clear the stopping flag
   isStoppingTracking = false;
@@ -3467,7 +3541,7 @@ function startIdleDetection() {
     }
 
     // Don't check if already paused
-    if (pauseStartPerfMs != null) {
+    if (pauseStartTime) {
       idleTimer = setTimeout(checkIdle, 5000);
       return;
     }
@@ -3486,7 +3560,7 @@ function startIdleDetection() {
         const doubleCheckDelay = 3000;
         idleDoubleCheckTimer = setTimeout(async () => {
           idleDoubleCheckTimer = null;
-          if (!isTracking || pauseStartPerfMs != null) return;
+          if (!isTracking || pauseStartTime) return;
 
           const recheckTime = Date.now();
           const recheckTimeSinceActivity = recheckTime - lastActivityTime;
@@ -3495,7 +3569,7 @@ function startIdleDetection() {
 
           if (shouldShowOverlay) {
           // Pause tracking (no time deduction here - deduction only on Stop)
-          pauseStartPerfMs = performance.now();
+          pauseStartTime = Date.now();
       
           // Stop timer and captures
           if (timerInterval) {
@@ -3554,12 +3628,12 @@ function startIdleDetection() {
 
 // Resume tracking after inactivity (called when user clicks Continue)
 async function resumeTracking() {
-  if (!isTracking || pauseStartPerfMs == null) return;
+  if (!isTracking || !pauseStartTime) return;
 
   const now = Date.now();
   // Exclude time while inactivity modal was open from tracked time (don't add it when they click Continue)
-  pausedDuration += performance.now() - pauseStartPerfMs;
-  pauseStartPerfMs = null;
+  pausedDuration += now - pauseStartTime;
+  pauseStartTime = null;
 
   // Sync current duration to DB (duration = up to last activity, no time added for modal-open period)
   await syncCurrentDuration();
@@ -3608,17 +3682,25 @@ function startTimer() {
     timerInterval = null;
   }
   
-  // Performance optimization: Throttle UI updates to 1 second (monotonic throttle)
-  let lastUpdatePerfMs = performance.now();
-
+  // Performance optimization: Throttle UI updates to 1 second
+  let lastUpdateTime = Date.now();
+  
   timerInterval = setInterval(() => {
-    if (sessionStartTime && pauseStartPerfMs == null && isTracking) {
-      const sessionDuration = getMonotonicSessionSeconds();
+    if (sessionStartTime && !pauseStartTime && isTracking) {
+      // Calculate session duration accurately
+      const now = Date.now();
+      let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+      sessionDuration -= Math.floor(pausedDuration / 1000);
+      if (sessionDuration < 0) sessionDuration = 0;
+      
+      // Total duration = baseDurationAtSessionStart + session (prevents double-counting)
       const totalDuration = baseDurationAtSessionStart + sessionDuration;
-      const perfNow = performance.now();
-      if (perfNow - lastUpdatePerfMs >= 1000) {
+      
+      // Only update UI if enough time has passed (throttle to 1 second)
+      // This prevents excessive DOM updates when app is visible
+      if (now - lastUpdateTime >= 1000) {
         updateTimerDisplay(totalDuration);
-        lastUpdatePerfMs = perfNow;
+        lastUpdateTime = now;
       }
     }
   }, 1000);
@@ -3642,7 +3724,7 @@ function getNextCaptureDelayMs() {
 }
 
 function scheduleNextCapture() {
-  if (!isTracking || pauseStartPerfMs != null || !timeEntryId) return;
+  if (!isTracking || pauseStartTime || !timeEntryId) return;
   const delay = getNextCaptureDelayMs(); // 5–7 min for all cycles (including after camera was in use)
   if (cameraSkippedDueToInUse) cameraSkippedDueToInUse = false;
   captureTimeoutId = setTimeout(() => {
@@ -3686,7 +3768,7 @@ function startPeriodicCaptures() {
   const WATCHDOG_MS = 60 * 1000; // Check every 1 minute
   const STUCK_CAPTURE_THRESHOLD_MS = 8 * 60 * 1000; // No successful capture in 8 min = stuck (was 12 – restart sooner)
   captureWatchdogInterval = setInterval(() => {
-    if (!isTracking || pauseStartPerfMs != null || !timeEntryId) return;
+    if (!isTracking || pauseStartTime || !timeEntryId) return;
     const now = Date.now();
     const timeSinceLastCapture = now - lastCaptureTime;
     // If capture is stuck (in progress or scheduled but no capture completed in 12+ min), restart loop
@@ -3763,6 +3845,47 @@ async function isBlackScreenBuffer(buffer) {
   }
 }
 
+/** Screen comparer on first screen + upload. Returns { stopped: true } if tracking was stopped. */
+async function applyScreenComparerAndUploadIfOk(screenshotBuffer, screenIndex, timestamp) {
+  if (screenIndex === 0 && sharp) {
+    const black = await isBlackScreenBuffer(screenshotBuffer);
+    if (black) {
+      console.log('Screen comparer: black screen detected - stopping tracker');
+      await stopTracking();
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
+      await ipcRenderer.invoke('show-overlay', {
+        title: 'Black screen',
+        message: 'Your screen appears off or black. Tracking has been stopped.',
+        icon: '🖥️',
+        isStopped: true
+      });
+      return { stopped: true };
+    }
+    const contentHash = await getContentHashFromBuffer(screenshotBuffer);
+    if (contentHash !== null) {
+      if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
+      else consecutiveSameScreenCount = 0;
+      lastContentHashForComparer = contentHash;
+      const cooldownPassed = sessionStartTime && (Date.now() - sessionStartTime.getTime()) >= SCREEN_COMPARER_COOLDOWN_MS;
+      const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
+      if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
+        console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
+        await stopTracking();
+        if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
+        await ipcRenderer.invoke('show-overlay', {
+          title: 'Screen unchanged',
+          message: 'Your screen has not changed. Tracking has been stopped.',
+          icon: '🖥️',
+          isStopped: true
+        });
+        return { stopped: true };
+      }
+    }
+  }
+  await uploadScreenshot(screenshotBuffer, `screen-${screenIndex}`, timestamp);
+  return { stopped: false };
+}
+
 async function captureScreenshotAndCamera() {
   // Always attempt capture if tracking is active - don't skip due to pause
   if (!isTracking) {
@@ -3802,6 +3925,27 @@ async function captureScreenshotAndCameraImpl() {
   const timestamp = Date.now();
 
   try {
+    let skipScreencapturePath = false;
+    // macOS: main-process desktopCapturer PNG (same permission as getUserMedia path; avoids renderer video-source timeouts).
+    if (appPlatform === 'darwin') {
+      try {
+        console.log('macOS: capturing screens via main-process desktopCapturer (PNG)');
+        const macBufs = await captureDesktopScreensPngViaMain(3840, 2160);
+        for (let i = 0; i < macBufs.length; i++) {
+          const r = await applyScreenComparerAndUploadIfOk(macBufs[i], i, timestamp);
+          if (r.stopped) return;
+          screensCaptured++;
+        }
+        if (screensCaptured > 0) {
+          console.log(`✓ Successfully captured ${screensCaptured} screen(s) via desktopCapturer (macOS)`);
+          skipScreencapturePath = true;
+        }
+      } catch (macCapErr) {
+        console.warn('macOS desktop PNG capture failed, falling back to screencapture:', macCapErr.message || macCapErr);
+      }
+    }
+
+    if (!skipScreencapturePath) {
     // Performance optimization: Use cached display configuration if available
     let displays = [];
     const now = Date.now();
@@ -3873,64 +4017,21 @@ async function captureScreenshotAndCameraImpl() {
       }
     }
 
-    // Strategy 4: If screenshot-desktop completely fails, use Electron's desktopCapturer
+    // Strategy 4: If screenshot-desktop completely fails, use main-process desktopCapturer PNGs
     if (displays.length === 0) {
-      console.log('screenshot-desktop failed, trying Electron desktopCapturer fallback...');
+      console.log('screenshot-desktop failed, trying main-process desktopCapturer PNG fallback...');
       try {
-        const sources = await ipcRenderer.invoke('get-desktop-sources', {
-          types: ['screen'],
-          thumbnailSize: { width: 1920, height: 1080 }
-        });
-        
-        if (sources && sources.length > 0) {
-          console.log(`Found ${sources.length} screen source(s) using Electron desktopCapturer`);
-          for (let i = 0; i < sources.length; i++) {
-            const source = sources[i];
-            const screenshotBuffer = await captureScreenshotWithElectron(source.id);
-            if (screenshotBuffer) {
-              // Screen comparer: on first screen, check black and unchanged then maybe auto-stop
-              if (i === 0 && sharp) {
-                const black = await isBlackScreenBuffer(screenshotBuffer);
-                if (black) {
-                  console.log('Screen comparer: black screen detected - stopping tracker');
-                  await stopTracking();
-                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
-                  await ipcRenderer.invoke('show-overlay', {
-                    title: 'Black screen',
-                    message: 'Your screen appears off or black. Tracking has been stopped.',
-                    icon: '🖥️',
-                    isStopped: true
-                  });
-                  return;
-                }
-                const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-                if (contentHash !== null) {
-                  if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                  else consecutiveSameScreenCount = 0;
-                  lastContentHashForComparer = contentHash;
-                  const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
-                  const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                    console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
-                    await stopTracking();
-                    if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                    await ipcRenderer.invoke('show-overlay', {
-                      title: 'Screen unchanged',
-                      message: 'Your screen has not changed. Tracking has been stopped.',
-                      icon: '🖥️',
-                      isStopped: true
-                    });
-                    return;
-                  }
-                }
-              }
-              await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
-              screensCaptured++;
-            }
+        const fallbackBufs = await captureDesktopScreensPngViaMain(3840, 2160);
+        if (fallbackBufs.length > 0) {
+          console.log(`Captured ${fallbackBufs.length} screen(s) via desktopCapturer PNG`);
+          for (let i = 0; i < fallbackBufs.length; i++) {
+            const r = await applyScreenComparerAndUploadIfOk(fallbackBufs[i], i, timestamp);
+            if (r.stopped) return;
+            screensCaptured++;
           }
         }
       } catch (electronError) {
-        console.warn('Electron desktopCapturer fallback also failed:', electronError.message || electronError);
+        console.warn('desktopCapturer PNG fallback failed:', electronError.message || electronError);
       }
     } else {
       // Capture each detected screen
@@ -3954,44 +4055,8 @@ async function captureScreenshotAndCameraImpl() {
               displayCacheTimestamp = Date.now();
             }
 
-            // Screen comparer: on first screen only, check black and unchanged then maybe auto-stop
-            if (i === 0 && sharp) {
-              const black = await isBlackScreenBuffer(screenshotBuffer);
-              if (black) {
-                console.log('Screen comparer: black screen detected - stopping tracker');
-                await stopTracking();
-                if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
-                await ipcRenderer.invoke('show-overlay', {
-                  title: 'Black screen',
-                  message: 'Your screen appears off or black. Tracking has been stopped.',
-                  icon: '🖥️',
-                  isStopped: true
-                });
-                return;
-              }
-              const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-              if (contentHash !== null) {
-                if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                else consecutiveSameScreenCount = 0;
-                lastContentHashForComparer = contentHash;
-                const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
-                const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                  console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
-                  await stopTracking();
-                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                  await ipcRenderer.invoke('show-overlay', {
-                    title: 'Screen unchanged',
-                    message: 'Your screen has not changed. Tracking has been stopped.',
-                    icon: '🖥️',
-                    isStopped: true
-                  });
-                  return;
-                }
-              }
-            }
-
-            await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
+            const r = await applyScreenComparerAndUploadIfOk(screenshotBuffer, i, timestamp);
+            if (r.stopped) return;
             screensCaptured++;
             console.log(`✓ Captured screen ${i + 1}/${displays.length}: ${display.name || `Screen ${i}`}`);
           }
@@ -4002,8 +4067,12 @@ async function captureScreenshotAndCameraImpl() {
       }
     }
 
+    } // end if (!skipScreencapturePath)
+
     if (screensCaptured > 0) {
-      console.log(`✓ Successfully captured ${screensCaptured} screen(s)`);
+      if (!skipScreencapturePath) {
+        console.log(`✓ Successfully captured ${screensCaptured} screen(s)`);
+      }
     } else {
       console.warn('⚠ No screens were captured - all methods failed');
     }
@@ -4148,74 +4217,6 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
         console.warn('Error deleting temp screenshot file:', unlinkError);
       }
     }
-  }
-}
-
-// Helper function to capture screenshot using Electron's desktopCapturer
-async function captureScreenshotWithElectron(sourceId) {
-  try {
-    // Request desktop capture stream
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: sourceId
-        }
-      }
-    });
-
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.muted = true; // Required for autoplay in some browsers
-
-    // Wait for video to be ready
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Video load timeout'));
-      }, 10000);
-
-      video.onloadedmetadata = () => {
-        clearTimeout(timeout);
-        video.play().then(resolve).catch(reject);
-      };
-      video.onerror = (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      };
-    });
-
-    // Create canvas and draw video frame
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    // Stop the stream immediately
-    stream.getTracks().forEach(track => {
-      track.stop();
-    });
-    video.srcObject = null;
-
-    // Convert canvas to buffer using toDataURL (more reliable than toBlob in Electron)
-    return new Promise((resolve) => {
-      try {
-        const dataUrl = canvas.toDataURL('image/png');
-        // Convert data URL to buffer
-        const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
-        resolve(buffer);
-      } catch (error) {
-        console.warn('Error converting canvas to buffer:', error);
-        resolve(null);
-      }
-    });
-  } catch (error) {
-    console.warn('Error capturing screenshot with Electron desktopCapturer:', error.message || error);
-    return null;
   }
 }
 
@@ -4608,13 +4609,15 @@ async function captureCamera() {
       console.warn('Camera is in use or temporarily unavailable:', errorMessage);
       cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
-      // User disabled camera in Windows mid-session – stop tracking to prevent abuse
       console.warn('Camera permission revoked during tracking – stopping tracker:', errorMessage);
       await stopTracking();
       if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera access disabled';
       await ipcRenderer.invoke('show-overlay', {
         title: 'Camera access disabled',
-        message: 'Camera was turned off in Windows settings during tracking. Tracking has been stopped. Re-enable "Allow desktop apps to access your camera" to track again.',
+        message:
+          appPlatform === 'darwin'
+            ? 'Camera access was revoked during tracking. Re-enable TimeFlow under System Settings → Privacy & Security → Camera, then start tracking again.'
+            : 'Camera was turned off in Windows settings during tracking. Re-enable camera privacy for this app to track again.',
         icon: '📷',
         isStopped: true
       });
@@ -4684,9 +4687,13 @@ function startRealTimeUpdates() {
     }
     
     // Skip if paused (but we'll sync when pause happens)
-    if (pauseStartPerfMs != null) return;
+    if (pauseStartTime) return;
 
-    const sessionDuration = getMonotonicSessionSeconds();
+    // Calculate current session duration accurately
+    const now = Date.now();
+    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    sessionDuration -= Math.floor(pausedDuration / 1000);
+    if (sessionDuration < 0) sessionDuration = 0;
 
     // Calculate total duration using baseDurationAtSessionStart (not current baseDuration)
     // This prevents double-counting if baseDuration was updated during this session
@@ -4770,8 +4777,11 @@ function startRealTimeUpdates() {
   }, 60000); // Every 1 minute - ensures time is never lost when app is in background or under load
   // First sync after 30s so we don't wait a full minute for initial persist
   setTimeout(() => {
-    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartPerfMs != null) return;
-    const sessionDuration = getMonotonicSessionSeconds();
+    if (!currentUser || !currentDayCycle || !isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime || pauseStartTime) return;
+    const now = Date.now();
+    let sessionDuration = Math.floor((now - sessionStartTime.getTime()) / 1000);
+    sessionDuration -= Math.floor(pausedDuration / 1000);
+    if (sessionDuration < 0) sessionDuration = 0;
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
     saveToLocalStorage(currentUser.id, currentDayCycle.dateString, { duration: totalDuration, timeEntryId: timeEntryId });
     if (isOnline) syncCurrentDuration().catch(() => {});
@@ -4783,7 +4793,14 @@ async function syncCurrentDuration() {
   if (!isTracking || !timeEntryId || !sessionStartTime) return false;
 
   try {
-    const sessionDuration = getMonotonicSessionSeconds();
+    // When paused (inactivity modal open), use pause time as "now" so we don't count time while modal is open
+    const now = Date.now();
+    const effectiveNow = pauseStartTime || now;
+    let sessionDuration = Math.floor((effectiveNow - sessionStartTime.getTime()) / 1000);
+    sessionDuration -= Math.floor(pausedDuration / 1000);
+    if (sessionDuration < 0) sessionDuration = 0;
+    
+    // Calculate total duration using baseDurationAtSessionStart
     const totalDuration = baseDurationAtSessionStart + sessionDuration;
     
     // Save to local storage first (works offline)

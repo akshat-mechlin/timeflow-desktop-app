@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonitor, systemPreferences, desktopCapturer } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -36,7 +36,6 @@ function createMainWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
-      enableRemoteModule: true,
       webSecurity: true // Enable web security for Supabase
     }
   });
@@ -236,10 +235,60 @@ ipcMain.handle('set-is-tracking', (event, value) => {
   }
 });
 
+// macOS: wallpaper-only screenshots mean Screen Recording is off; empty-buffer checks are not enough.
+ipcMain.handle('get-screen-capture-access-status', () => {
+  if (process.platform !== 'darwin') {
+    return 'granted';
+  }
+  try {
+    return systemPreferences.getMediaAccessStatus('screen');
+  } catch (e) {
+    console.error('get-screen-capture-access-status:', e.message);
+    return 'unknown';
+  }
+});
+
+// macOS: show system camera prompt when status is still "not-determined"
+ipcMain.handle('ensure-macos-camera-access', async () => {
+  if (process.platform !== 'darwin') {
+    return { status: 'granted' };
+  }
+  try {
+    let status = systemPreferences.getMediaAccessStatus('camera');
+    if (status === 'not-determined') {
+      await systemPreferences.askForMediaAccess('camera');
+      status = systemPreferences.getMediaAccessStatus('camera');
+    }
+    return { status };
+  } catch (e) {
+    console.warn('ensure-macos-camera-access:', e.message);
+    return { status: 'unknown' };
+  }
+});
+
+// macOS: triggers the system Screen Recording prompt when status is still "not-determined"
+ipcMain.handle('prompt-screen-capture-if-needed', async () => {
+  if (process.platform !== 'darwin') {
+    return 'granted';
+  }
+  try {
+    await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 320, height: 180 }
+    });
+  } catch (e) {
+    console.warn('prompt-screen-capture-if-needed getSources:', e.message);
+  }
+  try {
+    return systemPreferences.getMediaAccessStatus('screen');
+  } catch (e) {
+    return 'unknown';
+  }
+});
+
 // Handler to get desktop sources for screenshot capture fallback
 ipcMain.handle('get-desktop-sources', async (event, options) => {
   try {
-    const { desktopCapturer } = require('electron');
     const sources = await desktopCapturer.getSources({
       types: options.types || ['screen'],
       thumbnailSize: options.thumbnailSize || { width: 1920, height: 1080 }
@@ -247,6 +296,26 @@ ipcMain.handle('get-desktop-sources', async (event, options) => {
     return sources;
   } catch (error) {
     console.error('Error getting desktop sources:', error);
+    return [];
+  }
+});
+
+// PNG snapshots from main process — avoids renderer getUserMedia desktop capture, which often hits
+// "Timeout starting video source" on macOS (Chromium/Electron) even when Screen Recording is granted.
+ipcMain.handle('capture-desktop-screens-png', async (event, options) => {
+  const w = Math.min(options?.maxWidth || 3840, 3840);
+  const h = Math.min(options?.maxHeight || 2160, 2160);
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: w, height: h }
+    });
+    return sources.map((s) => ({
+      name: s.name,
+      png: s.thumbnail.toPNG()
+    }));
+  } catch (error) {
+    console.error('capture-desktop-screens-png:', error.message || error);
     return [];
   }
 });
