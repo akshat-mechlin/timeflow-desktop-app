@@ -25,14 +25,18 @@ CREATE INDEX IF NOT EXISTS idx_app_versions_minimum ON app_versions(minimum_requ
 -- Enable Row Level Security
 ALTER TABLE app_versions ENABLE ROW LEVEL SECURITY;
 
--- RLS Policy: Anyone can read app versions (needed for version check)
+-- RLS Policy: Anyone authenticated can read app versions (needed for version check)
 CREATE POLICY "Anyone can view app versions" ON app_versions
-    FOR SELECT USING (true);
+    FOR SELECT USING (auth.role() = 'authenticated');
 
--- RLS Policy: Only authenticated users can insert/update (admin operations)
--- Note: You may want to restrict this further based on user roles
-CREATE POLICY "Authenticated users can manage app versions" ON app_versions
-    FOR ALL USING (auth.role() = 'authenticated');
+-- RLS Policy: Only admins can manage app versions
+CREATE POLICY "Admins can manage app versions" ON app_versions
+    FOR ALL USING (
+      EXISTS (
+        SELECT 1 FROM profiles
+        WHERE profiles.id = auth.uid() AND profiles.role = 'admin'
+      )
+    );
 
 -- ============================================
 -- 2. USER_VERSION_TRACKING TABLE

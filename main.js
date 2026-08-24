@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonitor, Menu } = require('electron');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-// dotenv removed - credentials are hardcoded in renderer.js
+// Load .env for main process; renderer also loads dotenv (see renderer.js)
+require('dotenv').config({ path: require('path').join(__dirname, '.env') })
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -10,6 +11,55 @@ let isTracking = false;
 let systemActivityMonitor = null;
 let oauthCallbackServer = null;
 const OAUTH_CALLBACK_PORT = 5174; // Different port from your website
+
+function isDevToolsShortcut(input) {
+  const key = String(input.key || '').toLowerCase();
+  if (input.key === 'F12') return true;
+  if (input.control && input.shift && ['i', 'j', 'c', 'k'].includes(key)) return true;
+  if (input.meta && input.alt && ['i', 'j', 'c'].includes(key)) return true;
+  if ((input.control || input.meta) && key === 'u') return true;
+  return false;
+}
+
+/** Always notify the main renderer so it can warn, log, and capture evidence. */
+function notifyDevToolsBlocked(payload) {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+      mainWindow.webContents.send('devtools-blocked', payload || { trigger: 'blocked' });
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function attachDevToolsGuard(win) {
+  if (!win || win.isDestroyed()) return;
+  const contents = win.webContents;
+  if (!contents || contents.__devtoolsGuardAttached) return;
+  contents.__devtoolsGuardAttached = true;
+
+  contents.on('before-input-event', (event, input) => {
+    if (!isDevToolsShortcut(input)) return;
+    event.preventDefault();
+    notifyDevToolsBlocked({
+      trigger: 'keyboard_shortcut',
+      key: input.key,
+      control: Boolean(input.control),
+      shift: Boolean(input.shift),
+      alt: Boolean(input.alt),
+      meta: Boolean(input.meta),
+    });
+  });
+
+  contents.on('devtools-opened', () => {
+    try {
+      contents.closeDevTools();
+    } catch (_) {
+      /* ignore */
+    }
+    notifyDevToolsBlocked({ trigger: 'devtools_opened' });
+  });
+}
 
 function createMainWindow() {
   // Don't create duplicate windows
@@ -34,17 +84,19 @@ function createMainWindow() {
     autoHideMenuBar: true, // Hide menu bar (File, Edit, View, etc.)
     icon: iconPath, // Set application icon
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      enableRemoteModule: true,
-      webSecurity: true // Enable web security for Supabase
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      webSecurity: true,
+      devTools: false,
     }
   });
 
   mainWindow.loadFile('index.html');
+  attachDevToolsGuard(mainWindow);
 
-  // DevTools disabled - uncomment the line below if you need to debug
-  // mainWindow.webContents.openDevTools();
+  // DevTools intentionally disabled for production tracker builds
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -84,12 +136,16 @@ function createOverlayWindow() {
       transparent: true,
       show: false, // Don't show until ready
       webPreferences: {
-        nodeIntegration: true,
-        contextIsolation: false
+        preload: path.join(__dirname, 'preload-overlay.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+        devTools: false,
       }
     });
 
     overlayWindow.loadFile('overlay.html');
+    attachDevToolsGuard(overlayWindow);
     
     overlayWindow.once('ready-to-show', () => {
       overlayWindow.setAlwaysOnTop(true, 'screen-saver');
@@ -146,6 +202,29 @@ app.on('will-finish-launching', () => {
 });
 
 app.whenReady().then(() => {
+  // Remove default menu (View → Toggle Developer Tools, etc.)
+  try {
+    Menu.setApplicationMenu(null);
+  } catch (_) {
+    /* ignore */
+  }
+
+  // Harden every webContents that gets created (force-close DevTools if opened)
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('devtools-opened', () => {
+      try {
+        contents.closeDevTools();
+      } catch (_) {
+        /* ignore */
+      }
+      notifyDevToolsBlocked({ trigger: 'devtools_opened' });
+    });
+  });
+
+  app.on('browser-window-created', (_event, win) => {
+    attachDevToolsGuard(win);
+  });
+
   createMainWindow();
   
   // Handle protocol on Windows/Linux (after app is ready)

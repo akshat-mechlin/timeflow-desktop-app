@@ -110,39 +110,36 @@
   </div>
 
   <script>
-    const { ipcRenderer } = require('electron');
-
-    // Update overlay content when message is received
-    ipcRenderer.on('update-overlay', (event, data) => {
-      const { title, message, icon, isStopped } = data;
+    const api = window.overlayApi
+    api.onUpdate((data) => {
+      const { title, message, icon, isStopped } = data
       
       if (title) {
-        document.getElementById('overlay-title').textContent = title;
+        document.getElementById('overlay-title').textContent = title
       }
       if (message) {
-        document.getElementById('overlay-message').textContent = message;
+        document.getElementById('overlay-message').textContent = message
       }
       if (icon !== undefined) {
-        document.getElementById('overlay-icon').textContent = icon;
+        document.getElementById('overlay-icon').textContent = icon
       }
       
-      // Update button text if tracking is stopped (not paused)
       if (isStopped) {
-        document.getElementById('continue-btn').textContent = 'Start Tracking';
-        document.getElementById('stop-btn').textContent = 'Close';
+        document.getElementById('continue-btn').textContent = 'Start Tracking'
+        document.getElementById('stop-btn').textContent = 'Close'
       } else {
-        document.getElementById('continue-btn').textContent = 'Continue';
-        document.getElementById('stop-btn').textContent = 'Stop Tracking';
+        document.getElementById('continue-btn').textContent = 'Continue'
+        document.getElementById('stop-btn').textContent = 'Stop Tracking'
       }
-    });
+    })
 
     document.getElementById('continue-btn').addEventListener('click', () => {
-      ipcRenderer.send('overlay-continue');
-    });
+      api.continue()
+    })
 
     document.getElementById('stop-btn').addEventListener('click', () => {
-      ipcRenderer.send('overlay-stop');
-    });
+      api.stop()
+    })
   </script>
 </body>
 </html>

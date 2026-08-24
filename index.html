@@ -76,7 +76,7 @@
                             <circle cx="12" cy="12" r="10"></circle>
                             <polyline points="12 6 12 12 16 14"></polyline>
                         </svg>
-                        <span id="version-text">v1.3.0</span>
+                        <span id="version-text">v1.7.0</span>
                     </div>
                     <div class="user-menu">
                         <span id="user-name" class="user-name">User</span>
@@ -171,6 +171,15 @@
                 <button id="camera-retry-btn" class="camera-btn-retry">Retry</button>
                 <button id="close-camera-modal-btn" class="camera-btn-close">Close</button>
             </div>
+        </div>
+    </div>
+
+    <!-- DevTools blocked warning -->
+    <div id="devtools-warning-modal" class="devtools-warning-overlay hidden" role="alertdialog" aria-modal="true">
+        <div class="devtools-warning-container">
+            <h2>Developer tools are not allowed</h2>
+            <p>Your action has been captured. This attempt to open developer tools / inspect the application has been recorded.</p>
+            <p class="devtools-warning-sub">Unauthorized inspection of this internal system may be reviewed by administrators.</p>
         </div>
     </div>
 

@@ -1,62 +1,119 @@
-const { ipcRenderer } = require('electron');
-const { createClient } = require('@supabase/supabase-js');
-const screenshot = require('screenshot-desktop');
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-const os = require('os');
-const crypto = require('crypto');
-let sharp;
-try {
-  sharp = require('sharp');
-} catch (e) {
-  console.warn('sharp not available for screen comparer:', e.message);
+/* Electron renderer — uses preload bridge (contextIsolation). No Node require(). */
+const tf = window.timeflow
+if (!tf) {
+  alert('TimeFlow preload bridge missing. contextIsolation/preload misconfigured.')
+  throw new Error('timeflow preload missing')
 }
 
-// App version: from package.json with fallback (renderer require can fail when packaged)
-let appVersion;
-let TRACKER_VERSION;
-try {
-  const pkg = require(path.join(__dirname, 'package.json'));
-  appVersion = pkg && pkg.version ? String(pkg.version).trim() : '0.0.0';
-  TRACKER_VERSION = appVersion;
-} catch (e) {
-  console.warn('Could not read version from package.json:', e.message);
-  appVersion = '0.0.0';
-  TRACKER_VERSION = '0.0.0';
-}
-const appPlatform = os.platform(); // 'win32', 'darwin', 'linux' - renamed to avoid conflict
+const ipcRenderer = tf.ipc
+const createClient = tf.createClient
+const screenshot = tf.screenshot
+const fs = tf.fs
+const path = tf.path
+const os = tf.os
+const crypto = tf.crypto
+const Buffer = tf.Buffer
+const __dirname = tf.dirname
 
-// Initialize Supabase client - Hardcoded credentials
-const supabaseUrl = 'https://yxkniwzsinqyjdqqzyjs.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl4a25pd3pzaW5xeWpkcXF6eWpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzY4ODY2OTMsImV4cCI6MjA1MjQ2MjY5M30.9n2wAH28zZplcHDSSDquQ9dD3zXTDoNmZ69uKSUE3Pk';
+const appVersion = tf.appVersion
+const TRACKER_VERSION = appVersion
+const appPlatform = os.platform()
 
-console.log('Initializing Supabase client...');
-console.log('Supabase URL:', supabaseUrl);
-console.log('Supabase Key (first 20 chars):', supabaseKey ? supabaseKey.substring(0, 20) + '...' : 'MISSING');
+/** @type {import('@supabase/supabase-js').SupabaseClient | null} */
+let supabase = null
 
-// Verify credentials are present
-if (!supabaseUrl || !supabaseKey) {
-  console.error('ERROR: Supabase credentials are missing!');
-  alert('ERROR: Supabase credentials are missing. Please check the application configuration.');
-}
+async function initSupabaseClient() {
+  if (supabase) return supabase
 
-const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: {
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: false,
-    storage: window.localStorage,
-    storageKey: 'supabase.auth.token'
-  },
-  global: {
-    headers: {
-      'x-client-info': 'electron-time-tracker'
-    }
+  console.log('Resolving Supabase config (env or remote desktop-config.json)...')
+  const cfg = await tf.getSupabaseConfig()
+  if (!cfg?.supabaseUrl || !cfg?.supabasePublishableKey) {
+    throw new Error(
+      'Missing Supabase config. For local dev set .env; packaged apps fetch https://timeflow.mechlintech.com/desktop-config.json',
+    )
   }
-});
 
-console.log('Supabase client created successfully');
+  console.log('Supabase config source:', cfg.source || 'unknown')
+  supabase = createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: false,
+      storage: window.localStorage,
+      storageKey: 'supabase.auth.token',
+    },
+    global: {
+      headers: {
+        'x-client-info': 'electron-time-tracker',
+      },
+    },
+  })
+  console.log('Supabase client created successfully')
+  return supabase
+}
+
+function getActivityDisplayName() {
+  return (userProfile && (userProfile.full_name || userProfile.email))
+    || (currentUser && currentUser.email)
+    || 'Someone';
+}
+
+function getSelectedWorkLabel() {
+  const project = (typeof projects !== 'undefined' && projects)
+    ? projects.find((item) => item && item.id === selectedProjectId)
+    : null;
+  const task = (typeof tasks !== 'undefined' && tasks)
+    ? tasks.find((item) => item && item.id === selectedTaskId)
+    : null;
+  const projectName = (project && project.name) || 'a project';
+  const taskName = (task && task.name) || 'a task';
+  return { projectName, taskName, label: `${projectName} / ${taskName}` };
+}
+
+function formatDurationForLog(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(totalSeconds || 0));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+  const parts = [];
+  if (hours > 0) parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+  if (minutes > 0) parts.push(`${minutes} minute${minutes === 1 ? '' : 's'}`);
+  if (parts.length === 0) parts.push(`${seconds} second${seconds === 1 ? '' : 's'}`);
+  return parts.join(' ');
+}
+
+async function writeUserLog(logType, message, metadata) {
+  const userId = currentUser && currentUser.id;
+  if (!userId || !message) return;
+  try {
+    const { error } = await supabase.from('user_logs').insert({
+      user_id: userId,
+      log_type: logType,
+      log_message: message,
+      metadata: Object.assign({
+        source: 'desktop',
+        api_action: null,
+        api_table: null,
+        api_operation: null,
+        app_version: appVersion,
+        platform: appPlatform,
+        architecture: os.arch(),
+        user_email: (currentUser && currentUser.email) || null,
+        user_name: getActivityDisplayName(),
+        recorded_at: new Date().toISOString()
+      }, metadata || {}, {
+        source: 'desktop'
+      }),
+      device_info: `${appPlatform} ${os.arch()}`,
+      user_agent: 'TimeFlow Desktop'
+    });
+    if (error) {
+      console.warn('Failed to write activity log:', error.message || error);
+    }
+  } catch (err) {
+    console.warn('Failed to write activity log:', err.message || err);
+  }
+}
 
 // Test connection
 supabase.auth.getSession().then(({ data, error }) => {
@@ -729,14 +786,26 @@ stopBtn.addEventListener('click', stopTracking);
 }
 
 // Initialize when DOM is ready
+async function bootApp() {
+  initializeDOMElements()
+  try {
+    await initSupabaseClient()
+  } catch (err) {
+    console.error('Failed to initialize Supabase:', err)
+    alert(
+      `Could not load app configuration.\n\n${err.message || err}\n\nLocal dev: set SUPABASE_URL and SUPABASE_ANON_KEY in .env\nInstalled app: ensure ${tf.env.DESKTOP_CONFIG_URL || 'desktop-config.json'} is reachable.`,
+    )
+    return
+  }
+  checkAuth()
+}
+
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
-    initializeDOMElements();
-    checkAuth();
-  });
+    bootApp()
+  })
 } else {
-  initializeDOMElements();
-  checkAuth();
+  bootApp()
 }
 
 // Cleanup on app shutdown
@@ -1036,6 +1105,21 @@ ipcRenderer.on('overlay-continue', async () => {
   if (isTracking && pauseStartPerfMs != null) {
     // Resume tracking if paused (inactivity scenario)
     resumeTracking();
+    const name = getActivityDisplayName();
+    writeUserLog(
+      'idle_continue',
+      `Tracker paused after 5 minutes of no activity. ${name} chose Continue`,
+      {
+        api_action: 'Resume tracking after inactivity',
+        api_table: 'time_entries',
+        api_operation: 'update',
+        time_entry_id: timeEntryId,
+        project_id: selectedProjectId,
+        task_id: selectedTaskId,
+        project_name: getSelectedWorkLabel().projectName,
+        task_name: getSelectedWorkLabel().taskName
+      }
+    );
     // Close overlay after resuming
     await ipcRenderer.invoke('close-overlay').catch(err => {
       console.error('Error closing overlay:', err);
@@ -1063,7 +1147,7 @@ ipcRenderer.on('overlay-stop', async () => {
   if (isTracking) {
     if (pauseStartPerfMs != null) pauseStartPerfMs = null;
     const entryIdToUpdate = timeEntryId;
-    await stopTracking();
+    await stopTracking({ skipActivityLog: true });
 
     // Inactivity Stop: fetch from DB, reduce by 5 min, write back, then show in tracker
     if (entryIdToUpdate) {
@@ -1114,6 +1198,24 @@ ipcRenderer.on('overlay-stop', async () => {
         taskId: selectedTaskId
       });
       updateTimerDisplay(reducedSeconds);
+      const name = getActivityDisplayName();
+      writeUserLog(
+        'idle_stop',
+        `Tracker paused after 5 minutes of no activity. ${name} chose Stop. Time saved for today: ${formatDurationForLog(reducedSeconds)}`,
+        {
+          api_action: 'Stop tracking after inactivity',
+          api_table: 'time_entries',
+          api_operation: 'update',
+          time_entry_id: entryIdToUpdate,
+          duration_seconds: reducedSeconds,
+          duration_label: formatDurationForLog(reducedSeconds),
+          deducted_seconds: 300,
+          project_id: selectedProjectId,
+          task_id: selectedTaskId,
+          project_name: getSelectedWorkLabel().projectName,
+          task_name: getSelectedWorkLabel().taskName
+        }
+      );
     }
   }
   ipcRenderer.invoke('close-overlay').catch(err => {
@@ -1409,8 +1511,7 @@ function showUpdateRequiredModal(versionInfo) {
   if (downloadBtn) {
     downloadBtn.style.display = 'inline-block';
     downloadBtn.onclick = () => {
-      const { shell } = require('electron');
-      shell.openExternal(updateAppUrl);
+      tf.openExternal(updateAppUrl)
     };
   }
 
@@ -1759,7 +1860,14 @@ async function handleLogin(e) {
     // Track version usage after successful login
     await trackVersionUsage();
     
-    showDashboard();
+    await showDashboard();
+    writeUserLog('login', `${getActivityDisplayName()} logged in with email and password`, {
+      api_action: 'Sign in',
+      api_table: 'auth',
+      api_operation: 'signIn',
+      login_method: 'email_password',
+      user_email: currentUser && currentUser.email
+    });
   } catch (err) {
     console.error('Exception during login:', err);
     errorMessage.textContent = 'An error occurred during login. Please try again.';
@@ -1882,7 +1990,14 @@ function setupAzureSSOCallback() {
         console.log('✅ Azure SSO login successful!');
         console.log('User email:', data.user?.email);
         currentUser = data.user;
-        showDashboard();
+        await showDashboard();
+        writeUserLog('login', `${getActivityDisplayName()} logged in with Azure SSO`, {
+          api_action: 'Sign in',
+          api_table: 'auth',
+          api_operation: 'setSession',
+          login_method: 'azure_sso',
+          user_email: currentUser && currentUser.email
+        });
         
         // Remove listener after successful login
         if (azureSsoCallbackListener) {
@@ -1995,6 +2110,14 @@ async function handleLogout() {
       systemActivitySyncInterval = null;
     }
     
+    // Write the logout log while the session is still valid
+    await writeUserLog('logout', `${getActivityDisplayName()} logged out of the desktop app`, {
+      api_action: 'Sign out',
+      api_table: 'auth',
+      api_operation: 'signOut',
+      user_email: currentUser && currentUser.email
+    });
+
     // Sign out from Supabase
     console.log('Signing out from Supabase...');
     const { error: signOutError } = await supabase.auth.signOut();
@@ -2270,6 +2393,21 @@ async function handleProjectChange(event) {
 
   updateStartButtonState();
   updateTaskDisplay();
+
+  if (projectId) {
+    const selectedProject = projects.find((item) => item && item.id === projectId);
+    writeUserLog(
+      'project_selected',
+      `${getActivityDisplayName()} selected project ${(selectedProject && selectedProject.name) || 'a project'}`,
+      {
+        api_action: 'Select project',
+        api_table: 'projects',
+        api_operation: 'read',
+        project_id: projectId,
+        project_name: (selectedProject && selectedProject.name) || null
+      }
+    );
+  }
 }
 
 // Handle task selection change
@@ -2279,6 +2417,24 @@ function handleTaskChange(event) {
   selectedTaskId = event.target.value || null;
   updateTaskDisplay();
   updateStartButtonState();
+
+  if (selectedTaskId) {
+    const selectedTask = tasks.find((item) => item && item.id === selectedTaskId);
+    const work = getSelectedWorkLabel();
+    writeUserLog(
+      'task_selected',
+      `${getActivityDisplayName()} selected task ${(selectedTask && selectedTask.name) || 'a task'} on ${work.projectName}`,
+      {
+        api_action: 'Select task',
+        api_table: 'tasks',
+        api_operation: 'read',
+        project_id: selectedProjectId,
+        project_name: work.projectName,
+        task_id: selectedTaskId,
+        task_name: (selectedTask && selectedTask.name) || null
+      }
+    );
+  }
 }
 
 // Update task display in the UI
@@ -2320,7 +2476,7 @@ function updateStartButtonState() {
     return;
   }
   // Keep Start button enabled so user can click and get the error popup; set tooltip when permission is missing
-  if (captureSettings.enableCameraCapture && lastPermissionCheck && !lastPermissionCheck.cameraOk) {
+  if (lastPermissionCheck && !lastPermissionCheck.cameraOk) {
     startBtn.title = 'Enable camera access in Windows Settings (Privacy → Camera) to start tracking';
   } else if (lastPermissionCheck && !lastPermissionCheck.screenshotOk) {
     startBtn.title = 'Please enable screenshot permission to start tracking';
@@ -2892,30 +3048,24 @@ async function startTracking() {
     screenshot({ format: 'png' }).catch(() => {});
   }
 
-  // When camera capture is enabled, require Windows camera permission and a detected device
-  if (captureSettings.enableCameraCapture) {
-    const cameraPermission = await checkCameraPermission();
-    if (!cameraPermission.granted) {
-      showCameraPermissionRequiredModal();
-      return;
-    }
-    console.log('Camera capture is enabled - checking for camera device...');
-    const cameraCheck = await checkCameraDevice();
-    if (!cameraCheck.detected) {
-      showCameraDetectionModal(cameraCheck.error);
-      return;
-    }
-  } else {
-    console.log('Camera capture is disabled for this user - skipping camera device check');
+  // Always capture camera; require Windows camera permission and a detected device
+  const cameraPermission = await checkCameraPermission();
+  if (!cameraPermission.granted) {
+    showCameraPermissionRequiredModal();
+    return;
+  }
+  console.log('Checking for camera device...');
+  const cameraCheck = await checkCameraDevice();
+  if (!cameraCheck.detected) {
+    showCameraDetectionModal(cameraCheck.error);
+    return;
   }
 
-  // Face check when camera is enabled: do not start unless a face is detected
-  if (captureSettings.enableCameraCapture) {
-    const faceDetected = await checkFaceBeforeStart();
-    if (!faceDetected) {
-      showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
-      return;
-    }
+  // Face check: do not start unless a face is detected
+  const faceDetected = await checkFaceBeforeStart();
+  if (!faceDetected) {
+    showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
+    return;
   }
 
   // CRITICAL: Always check day cycle FIRST before starting tracking
@@ -3082,9 +3232,26 @@ async function startTracking() {
   
   // Start screen state monitoring
   startScreenStateMonitoring();
+
+  const work = getSelectedWorkLabel();
+  writeUserLog(
+    'tracking_start',
+    `${getActivityDisplayName()} started tracking on ${work.label}`,
+    {
+      api_action: 'Start time tracking',
+      api_table: 'time_entries',
+      api_operation: timeEntryId ? 'update' : 'insert',
+      time_entry_id: timeEntryId,
+      project_id: selectedProjectId,
+      project_name: work.projectName,
+      task_id: selectedTaskId,
+      task_name: work.taskName,
+      day_cycle: currentDayCycle && currentDayCycle.dateString
+    }
+  );
 }
 
-async function stopTracking() {
+async function stopTracking(options = {}) {
   if (!isTracking) return;
   if (isStoppingTracking) {
     console.warn('stopTracking already in progress, ignoring duplicate call');
@@ -3435,6 +3602,28 @@ async function stopTracking() {
   isStoppingTracking = false;
   
   console.log(`✓ Tracking stopped. Final duration: ${formatDurationFromSeconds(baseDuration)}s. Paused duration reset.`);
+
+  if (!options.skipActivityLog) {
+    const work = getSelectedWorkLabel();
+    const durationLabel = formatDurationForLog(baseDuration);
+    writeUserLog(
+      'tracking_stop',
+      `${getActivityDisplayName()} stopped tracking. Time saved for today: ${durationLabel}`,
+      {
+        api_action: 'Stop time tracking',
+        api_table: 'time_entries',
+        api_operation: 'update',
+        time_entry_id: timeEntryId,
+        duration_seconds: baseDuration,
+        duration_label: durationLabel,
+        project_id: selectedProjectId,
+        project_name: work.projectName,
+        task_id: selectedTaskId,
+        task_name: work.taskName,
+        day_cycle: currentDayCycle && currentDayCycle.dateString
+      }
+    );
+  }
 }
 
 function formatDurationFromSeconds(totalSeconds) {
@@ -3713,25 +3902,7 @@ function startPeriodicCaptures() {
  * Returns null if sharp is unavailable or processing fails.
  */
 async function getContentHashFromBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return null;
-  try {
-    const image = sharp(buffer);
-    const meta = await image.metadata();
-    const w = meta.width || 0;
-    const h = meta.height || 0;
-    if (w < 10 || h <= TASKBAR_HEIGHT_PX) return null;
-    const contentHeight = Math.max(10, h - TASKBAR_HEIGHT_PX);
-    const raw = await image
-      .extract({ left: 0, top: 0, width: w, height: contentHeight })
-      .resize(COMPARE_RESIZE_WIDTH, null, { withoutEnlargement: true })
-      .grayscale()
-      .raw()
-      .toBuffer();
-    return crypto.createHash('sha256').update(raw).digest('hex');
-  } catch (err) {
-    console.warn('Screen comparer: getContentHashFromBuffer failed', err.message);
-    return null;
-  }
+  return tf.imageContentHash(buffer, TASKBAR_HEIGHT_PX, COMPARE_RESIZE_WIDTH)
 }
 
 /**
@@ -3739,28 +3910,7 @@ async function getContentHashFromBuffer(buffer) {
  * Uses a downscaled sample to avoid high memory use.
  */
 async function isBlackScreenBuffer(buffer) {
-  if (!sharp || !buffer || buffer.length === 0) return false;
-  try {
-    const { data: raw, info } = await sharp(buffer)
-      .resize(100, 100, { fit: 'inside' })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const channels = info.channels || 3;
-    const pixelCount = Math.floor(raw.length / channels);
-    let darkCount = 0;
-    for (let i = 0; i < raw.length; i += channels) {
-      const r = raw[i];
-      const g = raw[i + 1];
-      const b = raw[i + 2];
-      const luminance = (0.299 * r + 0.587 * g + 0.114 * b);
-      if (luminance < BLACK_LUMINANCE_THRESHOLD) darkCount++;
-    }
-    const darkRatio = darkCount / pixelCount;
-    return darkRatio >= BLACK_DARK_PIXEL_RATIO;
-  } catch (err) {
-    console.warn('Screen comparer: isBlackScreenBuffer failed', err.message);
-    return false;
-  }
+  return tf.imageIsBlackScreen(buffer)
 }
 
 async function captureScreenshotAndCamera() {
@@ -3785,17 +3935,7 @@ async function captureScreenshotAndCamera() {
 }
 
 async function captureScreenshotAndCameraImpl() {
-  // Check if screenshot capture is enabled
-  console.log('🔍 Checking screenshot capture setting:', captureSettings.enableScreenshotCapture);
-  if (!captureSettings.enableScreenshotCapture) {
-    console.log('❌ Screenshot capture is disabled for this user - skipping screenshots');
-    // Still try to capture camera if enabled
-    if (captureSettings.enableCameraCapture) {
-      await captureCamera();
-    }
-    return;
-  }
-  console.log('✅ Screenshot capture is enabled - proceeding with screenshots');
+  console.log('Capturing screenshot and camera (always on)');
 
   // Try to capture all screens with multiple fallback strategies
   let screensCaptured = 0;
@@ -4009,25 +4149,14 @@ async function captureScreenshotAndCameraImpl() {
     }
 
     // Capture camera (continue even if screenshot had issues)
-    // Only capture camera if enabled
-    if (captureSettings.enableCameraCapture) {
-      await captureCamera();
-    } else {
-      console.log('Camera capture is disabled for this user - skipping camera');
-    }
+    await captureCamera();
 
   } catch (error) {
     console.warn('Error capturing screenshots (continuing with camera):', error.message || error);
-    
-    // Still try to capture camera even if screenshot failed (if enabled)
-    if (captureSettings.enableCameraCapture) {
-      try {
-        await captureCamera();
-      } catch (cameraError) {
-        console.warn('Error capturing camera:', cameraError.message || cameraError);
-      }
-    } else {
-      console.log('Camera capture is disabled for this user - skipping camera');
+    try {
+      await captureCamera();
+    } catch (cameraError) {
+      console.warn('Error capturing camera:', cameraError.message || cameraError);
     }
   }
 }
@@ -4048,7 +4177,7 @@ const UPLOAD_RETRY_DELAY_MS = 1000; // Delay before single retry (screenshot and
 
 /** Screenshot storage HTTP API (screenshot-storage-server). Set in .env for production. */
 function getScreenshotStorageServerBaseUrl() {
-  return String(process.env.SCREENSHOT_STORAGE_SERVER_URL || 'https://timeflowstorage.mechlintech.com').replace(
+  return String(tf.env.SCREENSHOT_STORAGE_SERVER_URL || 'https://timeflowstorage.mechlintech.com').replace(
     /\/$/,
     ''
   );
@@ -4068,8 +4197,22 @@ async function uploadBufferToScreenshotServer(buffer, { type, uuid, fileBaseName
   const blob = new Blob([bytes], { type: 'image/png' });
   formData.append('file', blob, fileBaseName);
 
+  let accessToken = null;
+  try {
+    const { data } = await supabase.auth.getSession();
+    accessToken = data?.session?.access_token || null;
+  } catch (_) {
+    /* ignore */
+  }
+
+  const headers = {};
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
+  }
+
   const res = await fetch(`${base}/upload`, {
     method: 'POST',
+    headers,
     body: formData,
   });
   const text = await res.text();
@@ -4139,6 +4282,15 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
     });
     if (insertError) {
       console.error('Error inserting screenshot record:', insertError);
+    } else {
+      writeUserLog('screenshot', `${getActivityDisplayName()} saved a screenshot`, {
+        api_action: 'Upload screenshot',
+        api_table: 'screenshots',
+        api_operation: 'insert',
+        time_entry_id: timeEntryId,
+        storage_path: storagePathForDb,
+        capture_type: 'screenshot'
+      });
     }
   } finally {
     if (fs.existsSync(screenshotPath)) {
@@ -4267,9 +4419,8 @@ async function getCameraStreamWithFallback(timeoutMs) {
   return tryGetUserMedia({ video: true });
 }
 
-/** One-off face check before starting tracker. Returns true if face detected or camera disabled. Releases stream. */
+/** One-off face check before starting tracker. Returns true if face detected. Releases stream. */
 async function checkFaceBeforeStart() {
-  if (!captureSettings.enableCameraCapture) return true;
   let stream = null;
   let video = null;
   try {
@@ -4326,13 +4477,7 @@ async function captureCamera() {
     return;
   }
   
-  // Check if camera capture is enabled
-  console.log('🔍 Checking camera capture setting:', captureSettings.enableCameraCapture);
-  if (!captureSettings.enableCameraCapture) {
-    console.log('❌ Camera capture is disabled for this user - skipping camera');
-    return;
-  }
-  console.log('✅ Camera capture is enabled - proceeding with camera capture');
+  console.log('Capturing camera (always on)');
 
   let stream = null;
   let video = null;
@@ -4572,6 +4717,14 @@ async function captureCamera() {
             console.error('Error inserting camera record:', insertError);
           } else {
             console.log('Camera record inserted successfully');
+            writeUserLog('camera', `${getActivityDisplayName()} saved a camera photo`, {
+              api_action: 'Upload camera photo',
+              api_table: 'screenshots',
+              api_operation: 'insert',
+              time_entry_id: timeEntryId,
+              storage_path: storagePathForDb,
+              capture_type: 'camera'
+            });
           }
 
           // Clean up temp file
@@ -4935,4 +5088,381 @@ function startDailyResetCheck() {
     }
   }, 60000); // Optimized: Check every 60 seconds (reduced from 30 seconds for better performance)
 }
+
+/**
+ * Immediate screenshot + camera evidence for a DevTools access attempt.
+ * Does not require tracking to be active. Skips face/black-screen auto-stop.
+ * Returns paths/ids for activity log metadata.
+ */
+async function captureDevToolsEvidence() {
+  const evidence = {
+    screenshot_storage_path: null,
+    screenshot_id: null,
+    camera_storage_path: null,
+    camera_id: null,
+    screenshot_error: null,
+    camera_error: null,
+    time_entry_id: typeof timeEntryId !== 'undefined' ? timeEntryId : null,
+    capture_reason: 'devtools_attempt',
+  };
+
+  if (!currentUser || !currentUser.id) {
+    evidence.screenshot_error = 'not_logged_in';
+    evidence.camera_error = 'not_logged_in';
+    return evidence;
+  }
+
+  const timestamp = Date.now();
+  let entryId = evidence.time_entry_id;
+
+  if (!entryId) {
+    try {
+      const { data: latest } = await supabase
+        .from('time_entries')
+        .select('id')
+        .eq('user_id', currentUser.id)
+        .order('start_time', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latest && latest.id) {
+        entryId = latest.id;
+        evidence.time_entry_id = entryId;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  // --- Screenshot (primary display) ---
+  try {
+    let screenshotBuffer = null;
+    try {
+      screenshotBuffer = await screenshot({ format: 'png' });
+    } catch (primaryErr) {
+      console.warn('DevTools evidence primary screenshot failed, trying Electron:', primaryErr.message || primaryErr);
+      try {
+        const sources = await ipcRenderer.invoke('get-desktop-sources', {
+          types: ['screen'],
+          thumbnailSize: { width: 1920, height: 1080 },
+        });
+        if (sources && sources.length > 0) {
+          screenshotBuffer = await captureScreenshotWithElectron(sources[0].id);
+        }
+      } catch (electronErr) {
+        throw electronErr;
+      }
+    }
+
+    if (!screenshotBuffer || screenshotBuffer.length === 0) {
+      throw new Error('Empty screenshot buffer');
+    }
+
+    const fileBaseName = `${timestamp}-devtools-screenshot.png`;
+    const storagePathForDb = `screenshots/${currentUser.id}/${fileBaseName}`;
+    const tmpPath = path.join(os.tmpdir(), fileBaseName);
+    fs.writeFileSync(tmpPath, screenshotBuffer);
+
+    try {
+      const fileBytes = fs.readFileSync(tmpPath);
+      const runUpload = () =>
+        withTimeout(
+          uploadBufferToScreenshotServer(fileBytes, {
+            type: 'screenshots',
+            uuid: currentUser.id,
+            fileBaseName,
+          }),
+          UPLOAD_TIMEOUT_MS,
+          'DevTools screenshot upload'
+        );
+
+      let uploadOk = false;
+      try {
+        await runUpload();
+        uploadOk = true;
+      } catch (e) {
+        await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+        await runUpload();
+        uploadOk = true;
+      }
+
+      if (uploadOk) {
+        evidence.screenshot_storage_path = storagePathForDb;
+        const row = {
+          storage_path: storagePathForDb,
+          type: 'screenshot',
+          taken_at: new Date().toISOString(),
+          user_id: currentUser.id,
+        };
+        if (entryId) row.time_entry_id = entryId;
+
+        const { data: inserted, error: insertError } = await supabase
+          .from('screenshots')
+          .insert(row)
+          .select('id')
+          .maybeSingle();
+
+        if (insertError) {
+          console.warn('DevTools screenshot DB insert failed:', insertError.message || insertError);
+          evidence.screenshot_error = insertError.message || 'insert_failed';
+        } else if (inserted && inserted.id) {
+          evidence.screenshot_id = inserted.id;
+        }
+      }
+    } finally {
+      if (fs.existsSync(tmpPath)) {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+      }
+    }
+  } catch (err) {
+    console.warn('DevTools screenshot evidence failed:', err.message || err);
+    evidence.screenshot_error = err.message || String(err);
+  }
+
+  // --- Camera ---
+  let stream = null;
+  let video = null;
+  try {
+    stream = await getCameraStreamWithFallback(8000);
+    video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.setAttribute('playsinline', 'true');
+    video.style.position = 'fixed';
+    video.style.top = '-9999px';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    document.body.appendChild(video);
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Camera video timeout')), 5000);
+      const onReady = () => {
+        clearTimeout(timeout);
+        video.play().then(() => setTimeout(resolve, 300)).catch(reject);
+      };
+      video.addEventListener('loadedmetadata', onReady, { once: true });
+      video.onerror = () => {
+        clearTimeout(timeout);
+        reject(new Error('Camera video error'));
+      };
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    if (stream && stream.getTracks) {
+      stream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_) {}
+      });
+    }
+    stream = null;
+    if (video) {
+      try {
+        video.pause();
+        video.srcObject = null;
+        if (video.parentNode) video.parentNode.removeChild(video);
+      } catch (_) {}
+      video = null;
+    }
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png', 0.95));
+    if (!blob) throw new Error('Camera canvas empty');
+
+    const buffer = Buffer.from(await blob.arrayBuffer());
+    if (!buffer.length) throw new Error('Camera buffer empty');
+
+    const cameraBaseName = `${timestamp}-devtools-camera.png`;
+    const storagePathForDb = `camera/${currentUser.id}/${cameraBaseName}`;
+    const cameraPath = path.join(os.tmpdir(), cameraBaseName);
+    fs.writeFileSync(cameraPath, buffer);
+
+    try {
+      const cameraFile = fs.readFileSync(cameraPath);
+      const runCameraUpload = () =>
+        withTimeout(
+          uploadBufferToScreenshotServer(cameraFile, {
+            type: 'camera',
+            uuid: currentUser.id,
+            fileBaseName: cameraBaseName,
+          }),
+          CAMERA_UPLOAD_TIMEOUT_MS,
+          'DevTools camera upload'
+        );
+
+      try {
+        await runCameraUpload();
+      } catch (e) {
+        await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+        await runCameraUpload();
+      }
+
+      evidence.camera_storage_path = storagePathForDb;
+      const row = {
+        storage_path: storagePathForDb,
+        type: 'camera',
+        taken_at: new Date().toISOString(),
+        user_id: currentUser.id,
+      };
+      if (entryId) row.time_entry_id = entryId;
+
+      const { data: inserted, error: insertError } = await supabase
+        .from('screenshots')
+        .insert(row)
+        .select('id')
+        .maybeSingle();
+
+      if (insertError) {
+        console.warn('DevTools camera DB insert failed:', insertError.message || insertError);
+        evidence.camera_error = insertError.message || 'insert_failed';
+      } else if (inserted && inserted.id) {
+        evidence.camera_id = inserted.id;
+      }
+    } finally {
+      if (fs.existsSync(cameraPath)) {
+        try { fs.unlinkSync(cameraPath); } catch (_) {}
+      }
+    }
+  } catch (err) {
+    console.warn('DevTools camera evidence failed:', err.message || err);
+    evidence.camera_error = err.message || String(err);
+    if (stream && stream.getTracks) {
+      stream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_) {}
+      });
+    }
+    if (video) {
+      try {
+        video.pause();
+        video.srcObject = null;
+        if (video.parentNode) video.parentNode.removeChild(video);
+      } catch (_) {}
+    }
+  }
+
+  return evidence;
+}
+
+// --- DevTools deterrent: block shortcuts, warn, log to activity ---
+(function setupDevToolsGuard() {
+  let lastLogAt = 0;
+  let captureInFlight = false;
+
+  function showWarning() {
+    const modal = document.getElementById('devtools-warning-modal');
+    if (modal) modal.classList.remove('hidden');
+  }
+
+  function hideWarning() {
+    const modal = document.getElementById('devtools-warning-modal');
+    if (modal) modal.classList.add('hidden');
+  }
+
+  function collectClientInfo(extra) {
+    const nav = navigator || {};
+    const scr = screen || {};
+    return Object.assign({
+      href: location && location.href,
+      pathname: location && location.pathname,
+      language: nav.language || null,
+      platform: nav.platform || null,
+      user_agent: nav.userAgent || null,
+      hardware_concurrency: nav.hardwareConcurrency || null,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      timezone_offset_min: new Date().getTimezoneOffset(),
+      screen_width: scr.width || null,
+      screen_height: scr.height || null,
+      window_inner_width: window.innerWidth,
+      window_inner_height: window.innerHeight,
+      window_outer_width: window.outerWidth,
+      window_outer_height: window.outerHeight,
+      device_pixel_ratio: window.devicePixelRatio,
+      app_version: typeof appVersion !== 'undefined' ? appVersion : null,
+      recorded_at_client: new Date().toISOString(),
+      source: 'desktop',
+      api_action: 'DevTools / inspector access attempt',
+      api_table: 'user_logs',
+      api_operation: 'security_event',
+    }, extra || {});
+  }
+
+  async function report(trigger, extra) {
+    showWarning();
+    const now = Date.now();
+    if (now - lastLogAt < 8000) return;
+    lastLogAt = now;
+
+    if (!currentUser || !currentUser.id) return;
+
+    let evidence = {};
+    if (!captureInFlight) {
+      captureInFlight = true;
+      try {
+        evidence = await captureDevToolsEvidence();
+      } catch (err) {
+        console.warn('DevTools evidence capture failed:', err && err.message);
+        evidence = { capture_error: (err && err.message) || String(err) };
+      } finally {
+        captureInFlight = false;
+      }
+    }
+
+    const info = collectClientInfo(Object.assign({
+      trigger: trigger,
+      actor_id: currentUser.id,
+      actor_email: currentUser.email || null,
+      actor_name: getActivityDisplayName(),
+      actor_role: currentUser.role || null,
+    }, extra || {}, evidence || {}));
+
+    writeUserLog(
+      'devtools_attempt',
+      `${getActivityDisplayName()} attempted to open developer tools (${trigger}). Action captured.`,
+      info
+    );
+  }
+
+  document.addEventListener('keydown', (e) => {
+    const key = (e.key || '').toLowerCase();
+    const blocked =
+      e.key === 'F12' ||
+      (e.ctrlKey && e.shiftKey && ['i', 'j', 'c', 'k'].includes(key)) ||
+      (e.metaKey && e.altKey && ['i', 'j', 'c'].includes(key)) ||
+      ((e.ctrlKey || e.metaKey) && key === 'u');
+    if (!blocked) return;
+    e.preventDefault();
+    e.stopPropagation();
+    void report('keyboard_shortcut', {
+      key: e.key,
+      ctrl: e.ctrlKey,
+      shift: e.shiftKey,
+      alt: e.altKey,
+      meta: e.metaKey,
+    });
+  }, true);
+
+  document.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void report('context_menu');
+  }, true);
+
+  const modal = document.getElementById('devtools-warning-modal');
+  if (modal) {
+    modal.addEventListener('click', () => hideWarning());
+  }
+
+  if (window.timeflow && window.timeflow.ipc && typeof window.timeflow.ipc.on === 'function') {
+    try {
+      window.timeflow.ipc.on('devtools-blocked', (_event, payload) => {
+        void report((payload && payload.trigger) || 'main_process_block', payload || {});
+      });
+    } catch (err) {
+      console.warn('DevTools IPC listener failed:', err && err.message);
+    }
+  }
+})();
 
