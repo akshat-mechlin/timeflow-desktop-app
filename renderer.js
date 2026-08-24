@@ -1327,6 +1327,30 @@ function compareVersions(version1, version2) {
   return 0;
 }
 
+// Normalize a version token to major.minor.patch (drops prerelease suffix for numeric compare)
+function normalizeSemver(version) {
+  const base = String(version || '').trim().split('-')[0].trim();
+  const parts = base.split('.').filter(Boolean);
+  if (parts.length === 1) parts.push('0', '0');
+  else if (parts.length === 2) parts.push('0');
+  const normalized = parts.slice(0, 3).map((p) => (parseInt(p, 10) || 0).toString()).join('.');
+  return /^\d+\.\d+\.\d+$/.test(normalized) ? normalized : null;
+}
+
+// Allowed versions from DB: comma-separated list, e.g. "1.6.2, 1.6.2-Beta, 1.7.0"
+function parseAllowedVersions(rawRequired) {
+  const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+  return requiredStr
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map((token) => ({
+      raw: token,
+      normalized: normalizeSemver(token),
+    }))
+    .filter((entry) => entry.normalized);
+}
+
 // Fetch required version via RPC (bypasses RLS, avoids "infinite recursion in policy for relation profiles"). No fallback — if fetch fails, app is blocked.
 async function checkAppVersion() {
   try {
@@ -1364,15 +1388,9 @@ async function checkAppVersion() {
       };
     }
 
-    const rawRequired = requiredFromDb;
-    const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
-    const parts = requiredStr.split('.').filter(Boolean);
-    if (parts.length === 1) parts.push('0', '0');
-    else if (parts.length === 2) parts.push('0');
-    minimumRequiredVersion = parts.slice(0, 3).map(p => (parseInt(p, 10) || 0).toString()).join('.');
-
-    if (!minimumRequiredVersion || !/^\d+\.\d+\.\d+$/.test(minimumRequiredVersion)) {
-      console.error('❌ tracker_required_version invalid format:', rawRequired);
+    const allowed = parseAllowedVersions(requiredFromDb);
+    if (allowed.length === 0) {
+      console.error('❌ tracker_required_version invalid format:', requiredFromDb);
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1386,14 +1404,20 @@ async function checkAppVersion() {
       };
     }
 
-    console.log(`📋 Required version (from DB): ${minimumRequiredVersion}`);
+    const currentRaw = String(TRACKER_VERSION || '').trim();
+    const currentNormalized = normalizeSemver(currentRaw);
+    minimumRequiredVersion = allowed.map((entry) => entry.raw).join(', ');
+
+    console.log(`📋 Allowed versions (from DB): ${minimumRequiredVersion}`);
     console.log(`📋 Current tracker version: ${TRACKER_VERSION}`);
 
-    const versionComparison = compareVersions(TRACKER_VERSION, minimumRequiredVersion);
+    const isAllowed = allowed.some((entry) => {
+      if (entry.raw.toLowerCase() === currentRaw.toLowerCase()) return true;
+      return currentNormalized && entry.normalized === currentNormalized;
+    });
 
-    // Exact match only: if not equal, show update modal (no "equal or greater" logic)
-    if (versionComparison !== 0) {
-      console.warn(`❌ Version mismatch: ${TRACKER_VERSION} !== ${minimumRequiredVersion} (exact match required) — showing update modal`);
+    if (!isAllowed) {
+      console.warn(`❌ Version not allowed: ${TRACKER_VERSION} not in [${minimumRequiredVersion}] — showing update modal`);
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1407,7 +1431,7 @@ async function checkAppVersion() {
       };
     }
 
-    console.log(`✓ Version OK: exact match ${TRACKER_VERSION}`);
+    console.log(`✓ Version OK: ${TRACKER_VERSION} is in allowed list`);
     isVersionValid = true;
     versionCheckComplete = true;
     return { valid: true, reason: 'version_valid' };
