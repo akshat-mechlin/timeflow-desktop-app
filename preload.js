@@ -63,7 +63,7 @@ let sharp = null
 try {
   sharp = require('sharp')
 } catch (e) {
-  console.warn('sharp not available in preload:', e.message)
+
 }
 
 let appVersion = '0.0.0'
@@ -172,7 +172,7 @@ contextBridge.exposeInMainWorld('timeflow', {
         .toBuffer()
       return crypto.createHash('sha256').update(raw).digest('hex')
     } catch (err) {
-      console.warn('imageContentHash failed', err.message)
+
       return null
     }
   },
@@ -194,7 +194,7 @@ contextBridge.exposeInMainWorld('timeflow', {
       }
       return pixelCount > 0 && darkCount / pixelCount > 0.92
     } catch (err) {
-      console.warn('imageIsBlackScreen failed', err.message)
+
       return false
     }
   },

@@ -25,7 +25,7 @@ let supabase = null
 async function initSupabaseClient() {
   if (supabase) return supabase
 
-  console.log('Resolving Supabase config (env or remote desktop-config.json)...')
+
   const cfg = await tf.getSupabaseConfig()
   if (!cfg?.supabaseUrl || !cfg?.supabasePublishableKey) {
     throw new Error(
@@ -33,7 +33,7 @@ async function initSupabaseClient() {
     )
   }
 
-  console.log('Supabase config source:', cfg.source || 'unknown')
+
   supabase = createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
     auth: {
       persistSession: true,
@@ -48,7 +48,7 @@ async function initSupabaseClient() {
       },
     },
   })
-  console.log('Supabase client created successfully')
+
   return supabase
 }
 
@@ -108,22 +108,22 @@ async function writeUserLog(logType, message, metadata) {
       user_agent: 'TimeFlow Desktop'
     });
     if (error) {
-      console.warn('Failed to write activity log:', error.message || error);
+
     }
   } catch (err) {
-    console.warn('Failed to write activity log:', err.message || err);
+
   }
 }
 
 // Test connection
 supabase.auth.getSession().then(({ data, error }) => {
   if (error) {
-    console.error('Error testing Supabase connection:', error);
+
   } else {
-    console.log('Supabase connection test successful');
+
   }
 }).catch(err => {
-  console.error('Exception testing Supabase connection:', err);
+
 });
 
 // Day cycle timezone utilities
@@ -301,16 +301,16 @@ async function loadFaceApiModels() {
   if (faceApiLoadPromise) return faceApiLoadPromise;
   faceApiLoadPromise = (async () => {
     if (typeof faceapi === 'undefined') {
-      console.warn('Face detection: face-api not loaded (script missing or blocked)');
+
       return false;
     }
     try {
       await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_API_WEIGHTS_BASE);
       faceApiModelsLoaded = true;
-      console.log('Face detection: tiny face detector loaded');
+
       return true;
     } catch (err) {
-      console.warn('Face detection: failed to load models', err.message);
+
       return false;
     }
   })();
@@ -333,7 +333,7 @@ async function detectFaceInCanvas(canvas) {
     const detections = await faceapi.detectAllFaces(canvas, opts);
     return detections && detections.length > 0;
   } catch (err) {
-    console.warn('Face detection: detect failed', err.message);
+
     return true; // do not block on detection errors
   }
 }
@@ -352,7 +352,7 @@ let lastPermissionCheck = null;
 // Initialize capture settings from user profile
 async function initializeCaptureSettings(userId) {
   try {
-    console.log('Fetching capture settings for user:', userId);
+
     
     const { data: profile, error } = await supabase
       .from('profiles')
@@ -361,12 +361,12 @@ async function initializeCaptureSettings(userId) {
       .single();
 
     if (error) {
-      console.error('Error fetching capture settings:', error);
-      console.error('Error details:', JSON.stringify(error, null, 2));
+
+
       
       // If profile doesn't exist, create it with default enabled settings
       if (error.code === 'PGRST116' || error.message?.includes('No rows')) {
-        console.log('Profile not found, creating default profile...');
+
         const { data: newProfile, error: createError } = await supabase
           .from('profiles')
           .insert({
@@ -378,7 +378,7 @@ async function initializeCaptureSettings(userId) {
           .single();
         
         if (createError) {
-          console.error('Error creating profile:', createError);
+
           // Default to enabled on error (graceful degradation)
           captureSettings.enableScreenshotCapture = true;
           captureSettings.enableCameraCapture = true;
@@ -388,10 +388,7 @@ async function initializeCaptureSettings(userId) {
         if (newProfile) {
           captureSettings.enableScreenshotCapture = newProfile.enable_screenshot_capture ?? true;
           captureSettings.enableCameraCapture = newProfile.enable_camera_capture ?? true;
-          console.log('Created profile with default settings:', {
-            screenshot: captureSettings.enableScreenshotCapture,
-            camera: captureSettings.enableCameraCapture
-          });
+
         } else {
           captureSettings.enableScreenshotCapture = true;
           captureSettings.enableCameraCapture = true;
@@ -407,13 +404,10 @@ async function initializeCaptureSettings(userId) {
     if (profile) {
       captureSettings.enableScreenshotCapture = profile.enable_screenshot_capture ?? true;
       captureSettings.enableCameraCapture = profile.enable_camera_capture ?? true;
-      console.log('✅ Capture settings loaded:', {
-        screenshot: captureSettings.enableScreenshotCapture,
-        camera: captureSettings.enableCameraCapture
-      });
+
     } else {
       // Default to enabled if profile not found
-      console.warn('Profile not found, defaulting to enabled');
+
       captureSettings.enableScreenshotCapture = true;
       captureSettings.enableCameraCapture = true;
     }
@@ -427,12 +421,12 @@ async function initializeCaptureSettings(userId) {
     }
     captureSettings.refreshInterval = setInterval(() => {
       initializeCaptureSettings(userId).catch(err => {
-        console.error('Error refreshing capture settings:', err);
+
       });
     }, 5 * 60 * 1000); // Every 5 minutes
 
   } catch (error) {
-    console.error('Exception fetching capture settings:', error);
+
     // Default to enabled on exception (graceful degradation)
     captureSettings.enableScreenshotCapture = true;
     captureSettings.enableCameraCapture = true;
@@ -468,18 +462,18 @@ function setupCaptureSettingsSubscription(userId) {
 
           // Notify user if settings changed
           if (oldScreenshot !== captureSettings.enableScreenshotCapture) {
-            console.log(`Screenshot capture ${captureSettings.enableScreenshotCapture ? 'enabled' : 'disabled'} by administrator`);
+
           }
           if (oldCamera !== captureSettings.enableCameraCapture) {
-            console.log(`Camera capture ${captureSettings.enableCameraCapture ? 'enabled' : 'disabled'} by administrator`);
+
           }
         }
       )
       .subscribe();
 
-    console.log('Capture settings real-time subscription established');
+
   } catch (error) {
-    console.error('Error setting up capture settings subscription:', error);
+
   }
 }
 
@@ -511,7 +505,7 @@ function saveToLocalStorage(userId, dayCycle, data) {
     };
     localStorage.setItem(key, JSON.stringify(storageData));
   } catch (error) {
-    console.error('Error saving to local storage:', error);
+
   }
 }
 
@@ -523,7 +517,7 @@ function loadFromLocalStorage(userId, dayCycle) {
       return JSON.parse(data);
     }
   } catch (error) {
-    console.error('Error loading from local storage:', error);
+
   }
   return null;
 }
@@ -532,9 +526,9 @@ function clearLocalStorage(userId, dayCycle) {
   try {
     const key = getLocalStorageKey(userId, dayCycle);
     localStorage.removeItem(key);
-    console.log(`Cleared local storage for ${dayCycle}`);
+
   } catch (error) {
-    console.error('Error clearing local storage:', error);
+
   }
 }
 
@@ -560,14 +554,14 @@ function clearAllOldLocalStorage(userId, currentDayCycle) {
     // Remove all old entries
     keysToRemove.forEach(key => {
       localStorage.removeItem(key);
-      console.log(`Cleared old local storage entry: ${key}`);
+
     });
     
     if (keysToRemove.length > 0) {
-      console.log(`🧹 Cleaned up ${keysToRemove.length} old local storage entries`);
+
     }
   } catch (error) {
-    console.error('Error clearing old local storage:', error);
+
   }
 }
 
@@ -575,13 +569,13 @@ function clearAllOldLocalStorage(userId, currentDayCycle) {
 function setupNetworkMonitoring() {
   window.addEventListener('online', () => {
     isOnline = true;
-    console.log('Network connection restored');
+
     syncPendingUpdates();
   });
   
   window.addEventListener('offline', () => {
     isOnline = false;
-    console.log('Network connection lost - using local storage');
+
   });
   
   // Check network status periodically
@@ -590,7 +584,7 @@ function setupNetworkMonitoring() {
     isOnline = navigator.onLine;
     
     if (!wasOnline && isOnline) {
-      console.log('Network connection restored');
+
       syncPendingUpdates();
     }
   }, 5000);
@@ -628,14 +622,14 @@ async function syncDurationToSupabase(timeEntryId, duration) {
         .eq('id', timeEntryId);
 
       if (error) {
-        console.error('Error syncing duration:', error);
+
         return false;
       }
       return true;
     }
     return true;
   } catch (error) {
-    console.error('Error syncing duration:', error);
+
     return false;
   }
 }
@@ -644,7 +638,7 @@ async function syncDurationToSupabase(timeEntryId, duration) {
 async function syncPendingUpdates() {
   if (!isOnline || !currentUser || pendingUpdates.length === 0) return;
 
-  console.log(`Syncing ${pendingUpdates.length} pending updates...`);
+
 
   for (let i = pendingUpdates.length - 1; i >= 0; i--) {
     const update = pendingUpdates[i];
@@ -672,12 +666,12 @@ async function syncPendingUpdates() {
       if (!error) {
         // Remove from queue
         pendingUpdates.splice(i, 1);
-        console.log('Synced pending update successfully');
+
       } else {
-        console.error('Error syncing pending update:', error);
+
       }
     } catch (error) {
-      console.error('Error syncing pending update:', error);
+
     }
   }
 
@@ -729,16 +723,16 @@ function initializeDOMElements() {
 
   // Verify critical elements exist
   if (!projectSelect) {
-    console.error('project-select element not found!');
+
   }
   if (!taskSelect) {
-    console.error('task-select element not found!');
+
   }
   if (!taskNameDisplay) {
-    console.error('task-name element not found!');
+
   }
   if (!taskTagDisplay) {
-    console.error('task-tag element not found!');
+
   }
 
   // Set up event listeners
@@ -749,15 +743,15 @@ loginForm.addEventListener('submit', handleLogin);
     azureSsoBtn.addEventListener('click', handleAzureSSO);
   }
   if (logoutBtn) {
-    console.log('Logout button found, adding event listener');
+
     logoutBtn.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      console.log('Logout button clicked');
+
       handleLogout();
     });
   } else {
-    console.error('Logout button not found!');
+
   }
   if (minimizeBtn) {
     minimizeBtn.addEventListener('click', handleMinimize);
@@ -791,7 +785,7 @@ async function bootApp() {
   try {
     await initSupabaseClient()
   } catch (err) {
-    console.error('Failed to initialize Supabase:', err)
+
     alert(
       `Could not load app configuration.\n\n${err.message || err}\n\nLocal dev: set SUPABASE_URL and SUPABASE_ANON_KEY in .env\nInstalled app: ensure ${tf.env.DESKTOP_CONFIG_URL || 'desktop-config.json'} is reachable.`,
     )
@@ -816,7 +810,7 @@ window.addEventListener('beforeunload', () => {
 // Handle window beforeunload to save duration if tracking is active
 window.addEventListener('beforeunload', async (e) => {
   if (isTracking) {
-    console.log('Window closing - stopping tracking and saving duration...');
+
     // Use synchronous-like approach - we can't use async/await in beforeunload
     // So we'll use sendBeacon or a synchronous approach
     // For Electron, we can use a blocking approach
@@ -825,7 +819,7 @@ window.addEventListener('beforeunload', async (e) => {
     // CRITICAL: Check day cycle before saving (don't save if day has changed)
     const currentCycle = getCurrentDayCycle();
     if (currentDayCycle && currentDayCycle.dateString !== currentCycle.dateString) {
-      console.warn('⚠️ Day cycle changed during shutdown - not saving old day data');
+
       // Don't save - let the new day start fresh
       return;
     }
@@ -840,7 +834,7 @@ window.addEventListener('beforeunload', async (e) => {
         new Promise(resolve => setTimeout(resolve, 2000)) // 2 second timeout
       ]);
     } catch (error) {
-      console.error('Error in beforeunload stopTracking:', error);
+
     }
     
     // Small delay to ensure database write completes
@@ -852,20 +846,20 @@ window.addEventListener('beforeunload', async (e) => {
 document.addEventListener('visibilitychange', async () => {
   if (document.hidden && isTracking) {
     // App became hidden - check if screen is off
-    console.log('👁️ App became hidden - checking if screen is off...');
+
     await checkScreenOffAndStop();
   } else if (!document.hidden && currentUser) {
     // App became visible - sync duration immediately (timers are throttled when hidden, so DB may be behind)
     if (isTracking && timeEntryId && sessionStartTime) {
-      syncCurrentDuration().catch(err => console.error('Visibility sync failed:', err));
+      syncCurrentDuration().catch(err =>);
     }
     // App became visible - validate day cycle
-    console.log('🔄 App became visible - validating day cycle...');
+
     const newDayCycle = getCurrentDayCycle();
     
     if (!currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString) {
       const wasTracking = isTracking;
-      console.log('🔄 Day cycle changed while app was hidden - resetting', { wasTracking });
+
       
       if (wasTracking) {
         await stopTracking();
@@ -889,7 +883,7 @@ document.addEventListener('visibilitychange', async () => {
       updateTimerDisplay(0);
       
       if (wasTracking && selectedProjectId && selectedTaskId) {
-        console.log('🔄 Auto-starting tracker for new day (app became visible)');
+
         await startTracking();
       } else if (statusDisplay) {
         statusDisplay.textContent = 'Not Tracking';
@@ -901,7 +895,7 @@ document.addEventListener('visibilitychange', async () => {
     if (isTracking && pauseStartPerfMs == null && timeEntryId && !captureInProgress) {
       const timeSinceLastCapture = Date.now() - lastCaptureTime;
       if (timeSinceLastCapture >= CAPTURE_INTERVAL_MIN_MS) {
-        console.log(`App visible: last capture ${Math.round(timeSinceLastCapture / 60000)} min ago - running catch-up capture`);
+
         startPeriodicCaptures();
       }
     }
@@ -917,7 +911,7 @@ async function checkScreenOffAndStop() {
     if (process.platform === 'win32') {
       const isScreenOff = await ipcRenderer.invoke('check-screen-off');
       if (isScreenOff) {
-        console.log('🖥️ Screen is off - stopping tracker');
+
         await stopTracking();
         if (statusDisplay) {
           statusDisplay.textContent = 'Stopped: Screen is off';
@@ -939,7 +933,7 @@ async function checkScreenOffAndStop() {
       }
     }
   } catch (error) {
-    console.error('Error checking screen state:', error);
+
   }
 }
 
@@ -975,7 +969,7 @@ function setupActivityListeners() {
       if (isTracking && pauseStartPerfMs == null) {
         resetIdleTimer();
         if (!activityHandler.lastLogTime || (Date.now() - activityHandler.lastLogTime) > 5000) {
-          console.log(`Activity detected: ${eventType}`);
+
           activityHandler.lastLogTime = Date.now();
         }
       }
@@ -1042,7 +1036,7 @@ function resetIdleTimer() {
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
-      console.log(`Activity detected (${Math.floor(timeSinceLastUpdate / 1000)}s since last) - cancelled idle double-check`);
+
     }
   }
 }
@@ -1058,7 +1052,7 @@ ipcRenderer.on('system-activity-detected', (event, idleSeconds) => {
     if (idleDoubleCheckTimer) {
       clearTimeout(idleDoubleCheckTimer);
       idleDoubleCheckTimer = null;
-      console.log(`System activity (idle=${idleSeconds != null ? idleSeconds.toFixed(1) : '?'}s) - cancelled idle double-check`);
+
     }
   }
 });
@@ -1122,7 +1116,7 @@ ipcRenderer.on('overlay-continue', async () => {
     );
     // Close overlay after resuming
     await ipcRenderer.invoke('close-overlay').catch(err => {
-      console.error('Error closing overlay:', err);
+
     });
   } else if (!isTracking) {
     // Start tracking if stopped (system event scenario)
@@ -1131,13 +1125,13 @@ ipcRenderer.on('overlay-continue', async () => {
       await startTracking();
       // Close overlay after starting
       await ipcRenderer.invoke('close-overlay').catch(err => {
-        console.error('Error closing overlay:', err);
+
       });
     } else {
       alert('Please select a project and task before starting tracking.');
       // Close overlay even if can't start
       await ipcRenderer.invoke('close-overlay').catch(err => {
-        console.error('Error closing overlay:', err);
+
       });
     }
   }
@@ -1163,13 +1157,13 @@ ipcRenderer.on('overlay-stop', async () => {
             dbDurationSeconds = Number(entry.duration) || 0;
           }
         } catch (e) {
-          console.error('Overlay Stop: error fetching duration from DB', e);
+
         }
       }
       const FIVE_MIN_SEC = 5 * 60;
       const durationToReduce = dbDurationSeconds > 0 ? dbDurationSeconds : baseDuration;
       const reducedSeconds = Math.max(0, durationToReduce - FIVE_MIN_SEC);
-      console.log(`Overlay Stop: DB duration=${dbDurationSeconds}s, after 5 min deduction=${reducedSeconds}s`);
+
 
       if (isOnline && durationToReduce > 0) {
         try {
@@ -1182,12 +1176,12 @@ ipcRenderer.on('overlay-stop', async () => {
             })
             .eq('id', entryIdToUpdate);
           if (updateError) {
-            console.error('Overlay Stop: error saving reduced duration to DB', updateError);
+
           } else {
-            console.log(`Overlay Stop: saved reduced duration to DB: ${reducedSeconds}s`);
+
           }
         } catch (e) {
-          console.error('Overlay Stop: error updating DB', e);
+
         }
       }
       baseDuration = reducedSeconds;
@@ -1219,7 +1213,7 @@ ipcRenderer.on('overlay-stop', async () => {
     }
   }
   ipcRenderer.invoke('close-overlay').catch(err => {
-    console.error('Error closing overlay:', err);
+
   });
 });
 
@@ -1231,8 +1225,8 @@ ipcRenderer.on('system-event', async (event, data) => {
     return; // Not tracking, ignore
   }
   
-  console.log(`🛑 System event detected: ${type} - ${reason || 'No reason provided'}`);
-  console.log('⏹️ Stopping tracker automatically...');
+
+
   
   // Stop tracking immediately
   try {
@@ -1297,7 +1291,7 @@ ipcRenderer.on('system-event', async (event, data) => {
       isStopped: true // Indicates tracking is stopped (not paused)
     });
   } catch (error) {
-    console.error('Error stopping tracking on system event:', error);
+
   }
 });
 
@@ -1354,12 +1348,12 @@ function parseAllowedVersions(rawRequired) {
 // Fetch required version via RPC (bypasses RLS, avoids "infinite recursion in policy for relation profiles"). No fallback — if fetch fails, app is blocked.
 async function checkAppVersion() {
   try {
-    console.log(`🔍 Checking app version: ${TRACKER_VERSION} (Platform: ${appPlatform})`);
+
 
     const { data: requiredFromDb, error: rpcError } = await supabase.rpc('get_tracker_required_version');
 
     if (rpcError) {
-      console.error('❌ Could not fetch tracker_required_version:', rpcError.message || rpcError.code || JSON.stringify(rpcError));
+
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1374,7 +1368,7 @@ async function checkAppVersion() {
     }
 
     if (requiredFromDb == null || requiredFromDb === '') {
-      console.error('❌ tracker_required_version not set in system_settings');
+
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1390,7 +1384,7 @@ async function checkAppVersion() {
 
     const allowed = parseAllowedVersions(requiredFromDb);
     if (allowed.length === 0) {
-      console.error('❌ tracker_required_version invalid format:', requiredFromDb);
+
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1408,8 +1402,8 @@ async function checkAppVersion() {
     const currentNormalized = normalizeSemver(currentRaw);
     minimumRequiredVersion = allowed.map((entry) => entry.raw).join(', ');
 
-    console.log(`📋 Allowed versions (from DB): ${minimumRequiredVersion}`);
-    console.log(`📋 Current tracker version: ${TRACKER_VERSION}`);
+
+
 
     const isAllowed = allowed.some((entry) => {
       if (entry.raw.toLowerCase() === currentRaw.toLowerCase()) return true;
@@ -1417,7 +1411,7 @@ async function checkAppVersion() {
     });
 
     if (!isAllowed) {
-      console.warn(`❌ Version not allowed: ${TRACKER_VERSION} not in [${minimumRequiredVersion}] — showing update modal`);
+
       isVersionValid = false;
       versionCheckComplete = true;
       return {
@@ -1431,12 +1425,12 @@ async function checkAppVersion() {
       };
     }
 
-    console.log(`✓ Version OK: ${TRACKER_VERSION} is in allowed list`);
+
     isVersionValid = true;
     versionCheckComplete = true;
     return { valid: true, reason: 'version_valid' };
   } catch (error) {
-    console.error('❌ Error checking app version:', error);
+
     isVersionValid = false;
     versionCheckComplete = true;
     return {
@@ -1454,12 +1448,12 @@ async function checkAppVersion() {
 // Track version usage in database
 async function trackVersionUsage() {
   if (!currentUser) {
-    console.log('No user logged in, skipping version tracking');
+
     return;
   }
   
   try {
-    console.log(`📊 Tracking version usage: ${appVersion} for user ${currentUser.id}`);
+
     
     // Check if record exists
     const { data: existingRecord } = await supabase
@@ -1482,9 +1476,9 @@ async function trackVersionUsage() {
         .eq('id', existingRecord.id);
       
       if (updateError) {
-        console.error('Error updating version tracking:', updateError);
+
       } else {
-        console.log('✓ Version tracking updated');
+
       }
     } else {
       // Insert new record
@@ -1500,13 +1494,13 @@ async function trackVersionUsage() {
         });
       
       if (insertError) {
-        console.error('Error inserting version tracking:', insertError);
+
       } else {
-        console.log('✓ Version tracking created');
+
       }
     }
   } catch (error) {
-    console.error('❌ Error tracking version usage:', error);
+
     // Don't block app if tracking fails
   }
 }
@@ -1519,7 +1513,7 @@ function showUpdateRequiredModal(versionInfo) {
   const closeBtn = document.getElementById('close-app-btn');
 
   if (!updateModal || !updateMessage) {
-    console.error('Update modal elements not found');
+
     if (typeof alert === 'function') {
       alert('Your current version is old please update to new version.');
     }
@@ -1569,7 +1563,7 @@ function showCameraDetectionModal(customMessage, reason) {
   const closeCameraModalBtn = document.getElementById('close-camera-modal-btn');
   
   if (!cameraModal || !cameraMessage) {
-    console.error('Camera detection modal elements not found');
+
     alert(customMessage || 'No camera device detected. Please connect a camera to start tracking.');
     return;
   }
@@ -1699,9 +1693,9 @@ function hideCameraDetectionModal() {
 
 async function checkAuth() {
   try {
-    console.log('Checking authentication...');
+
     if (!loadingContainer || !loginContainer || !dashboardContainer) {
-      console.error('DOM containers not ready');
+
       return;
     }
     // Show loading state while checking
@@ -1712,7 +1706,7 @@ async function checkAuth() {
     // Version check: fetch required version from DB (tracker_required_version), then compare. No fallback — fetch failure blocks app.
     const versionCheck = await checkAppVersion();
     if (!versionCheck.valid) {
-      console.error('❌ Version check failed, blocking app access');
+
       if (loadingContainer) loadingContainer.classList.add('hidden');
       if (loginContainer) loginContainer.classList.add('hidden');
       if (dashboardContainer) dashboardContainer.classList.add('hidden');
@@ -1729,13 +1723,13 @@ async function checkAuth() {
     const { data: { session }, error } = await supabase.auth.getSession();
     
     if (error) {
-      console.error('Error checking session:', error);
+
       showLogin();
       return;
     }
     
     if (session) {
-      console.log('Session found, user:', session.user.email);
+
       currentUser = session.user;
       
       // Track version usage after login
@@ -1743,11 +1737,11 @@ async function checkAuth() {
       
       showDashboard();
     } else {
-      console.log('No session found, showing login');
+
       showLogin();
     }
   } catch (error) {
-    console.error('Error in checkAuth:', error);
+
     showLogin();
   }
 }
@@ -1788,7 +1782,7 @@ async function showDashboard() {
       }
     }
   } catch (error) {
-    console.error('Error fetching user profile:', error);
+
     if (userNameSpan) {
     userNameSpan.textContent = currentUser.email || 'User';
     }
@@ -1805,13 +1799,13 @@ async function showDashboard() {
   
   // CRITICAL: Validate day cycle on startup (handles forced shutdowns)
   // This ensures we never load stale data from previous day after PC restart
-  console.log('🔄 Validating day cycle on startup...');
+
   const startupDayCycle = getCurrentDayCycle();
   
   // Clear ALL old local storage entries on startup (safety measure)
   if (currentUser) {
     clearAllOldLocalStorage(currentUser.id, startupDayCycle.dateString);
-    console.log('🧹 Cleared all old local storage entries on startup');
+
   }
   
   // Initialize day cycle
@@ -1862,9 +1856,9 @@ async function handleLogin(e) {
   const email = emailInput.value;
   const password = passwordInput.value;
 
-  console.log('Attempting login for:', email);
-  console.log('Supabase URL:', supabaseUrl);
-  console.log('Supabase client initialized:', !!supabase);
+
+
+
 
   try {
     const { data, error } = await supabase.auth.signInWithPassword({
@@ -1873,12 +1867,12 @@ async function handleLogin(e) {
     });
 
     if (error) {
-      console.error('Login error:', error);
+
       errorMessage.textContent = error.message || 'Login failed. Please check your credentials.';
       return;
     }
 
-    console.log('Login successful, user:', data.user.email);
+
     currentUser = data.user;
     
     // Track version usage after successful login
@@ -1893,7 +1887,7 @@ async function handleLogin(e) {
       user_email: currentUser && currentUser.email
     });
   } catch (err) {
-    console.error('Exception during login:', err);
+
     errorMessage.textContent = 'An error occurred during login. Please try again.';
   }
 }
@@ -1901,7 +1895,7 @@ async function handleLogin(e) {
 async function handleAzureSSO() {
   try {
     errorMessage.textContent = '';
-    console.log('Initiating Azure SSO login...');
+
     
     // Show loading message
     errorMessage.textContent = 'Opening Azure SSO login in your browser...';
@@ -1917,8 +1911,8 @@ async function handleAzureSSO() {
     });
     
     if (result.callbackUrl) {
-      console.log('Callback URL:', result.callbackUrl);
-      console.log('Your website should redirect to:', result.callbackUrl);
+
+
     }
     
     if (result.error) {
@@ -1929,7 +1923,7 @@ async function handleAzureSSO() {
     errorMessage.textContent = 'Please complete login in your browser. Waiting for callback...';
     
   } catch (err) {
-    console.error('Error initiating Azure SSO:', err);
+
     errorMessage.textContent = err.message || 'Failed to initiate Azure SSO login. Please try again.';
     errorMessage.style.color = '#ef4444';
   }
@@ -1947,16 +1941,10 @@ function setupAzureSSOCallback() {
   // Create new listener
   azureSsoCallbackListener = async (event, callbackData) => {
     try {
-      console.log('═══════════════════════════════════════════════════════');
-      console.log('Renderer: Received Azure SSO callback');
-      console.log('Callback data:', {
-        has_access_token: !!callbackData.access_token,
-        has_refresh_token: !!callbackData.refresh_token,
-        has_url: !!callbackData.url,
-        has_error: !!callbackData.error,
-        success: callbackData.success
-      });
-      console.log('═══════════════════════════════════════════════════════');
+
+
+
+
       
       if (callbackData.error) {
         throw new Error(callbackData.error);
@@ -1987,7 +1975,7 @@ function setupAzureSSOCallback() {
             refreshToken = url.searchParams.get('refresh_token');
           }
         } catch (parseError) {
-          console.error('Error parsing callback URL:', parseError);
+
         }
       }
       
@@ -1995,11 +1983,11 @@ function setupAzureSSOCallback() {
       if (callbackData.access_token && callbackData.refresh_token) {
         accessToken = callbackData.access_token;
         refreshToken = callbackData.refresh_token;
-        console.log('Using tokens from callback data (HTTP server)');
+
       }
       
       if (accessToken && refreshToken) {
-        console.log('Setting Supabase session with tokens...');
+
         // Set session with tokens
         const { data, error } = await supabase.auth.setSession({
           access_token: accessToken,
@@ -2007,12 +1995,12 @@ function setupAzureSSOCallback() {
         });
         
         if (error) {
-          console.error('Error setting session:', error);
+
           throw error;
         }
         
-        console.log('✅ Azure SSO login successful!');
-        console.log('User email:', data.user?.email);
+
+
         currentUser = data.user;
         await showDashboard();
         writeUserLog('login', `${getActivityDisplayName()} logged in with Azure SSO`, {
@@ -2035,7 +2023,7 @@ function setupAzureSSOCallback() {
       throw new Error('Failed to extract authentication tokens from callback.');
       
     } catch (err) {
-      console.error('❌ Error processing Azure SSO callback:', err);
+
       errorMessage.textContent = err.message || 'Failed to complete Azure SSO login. Please try again.';
       errorMessage.style.color = '#ef4444';
     }
@@ -2043,12 +2031,12 @@ function setupAzureSSOCallback() {
   
   // Add listener
   ipcRenderer.on('azure-sso-callback', azureSsoCallbackListener);
-  console.log('✅ Azure SSO callback listener set up');
+
   
   // Set up timeout in case callback never arrives
   setTimeout(() => {
     if (loginContainer && !loginContainer.classList.contains('hidden')) {
-      console.warn('⚠️ Azure SSO login timed out');
+
       errorMessage.textContent = 'Azure SSO login timed out. Please try again.';
       errorMessage.style.color = '#ef4444';
       
@@ -2069,13 +2057,13 @@ function handleMinimize() {
 async function handleClose() {
   // If tracking is active, stop tracking and save duration before closing
   if (isTracking) {
-    console.log('Stopping tracking before closing application...');
+
     try {
       await stopTracking();
       // Give a small delay to ensure the database update completes
       await new Promise(resolve => setTimeout(resolve, 500));
     } catch (error) {
-      console.error('Error stopping tracking before close:', error);
+
       // Still close even if there's an error, but log it
     }
   }
@@ -2088,11 +2076,11 @@ async function handleLogout() {
   // Cleanup capture settings subscription
   cleanupCaptureSettings();
   try {
-    console.log('Logout initiated...');
+
     
   // Stop tracking and save state
   if (isTracking) {
-      console.log('Stopping tracking before logout...');
+
     await stopTracking();
   }
   
@@ -2143,11 +2131,11 @@ async function handleLogout() {
     });
 
     // Sign out from Supabase
-    console.log('Signing out from Supabase...');
+
     const { error: signOutError } = await supabase.auth.signOut();
     
     if (signOutError) {
-      console.error('Error signing out:', signOutError);
+
       // Continue with logout even if signOut fails
     }
     
@@ -2177,12 +2165,12 @@ async function handleLogout() {
     }
     
     // Show login screen
-    console.log('Showing login screen...');
+
   showLogin();
     
-    console.log('Logout completed successfully');
+
   } catch (error) {
-    console.error('Error during logout:', error);
+
     // Still try to show login screen even if there's an error
     showLogin();
   }
@@ -2208,7 +2196,7 @@ async function linkTimeEntryToProject(timeEntryId, projectId) {
         .eq('time_entry_id', timeEntryId);
 
       if (error) {
-        console.error('Error updating project_time_entries:', error);
+
       }
     } else {
       // Create new link
@@ -2221,28 +2209,28 @@ async function linkTimeEntryToProject(timeEntryId, projectId) {
         });
 
       if (error) {
-        console.error('Error creating project_time_entries:', error);
+
       }
     }
   } catch (error) {
-    console.error('Error linking time entry to project:', error);
+
   }
 }
 
 // Fetch projects assigned to the current user
 async function loadProjects() {
   if (!currentUser) {
-    console.log('No current user, skipping loadProjects');
+
     return;
   }
 
   if (!projectSelect) {
-    console.error('projectSelect element not found, cannot load projects');
+
     return;
   }
 
   try {
-    console.log('Loading projects for user:', currentUser.id);
+
     
     // Query project_members table (not project_user_assignments)
     const { data: memberships, error: membershipsError } = await supabase
@@ -2260,16 +2248,16 @@ async function loadProjects() {
       .eq('user_id', currentUser.id);
 
     if (membershipsError) {
-      console.error('Error fetching project memberships:', membershipsError);
-      console.error('Error code:', membershipsError.code);
-      console.error('Error message:', membershipsError.message);
+
+
+
       
       const errorMsg = membershipsError.message || '';
       if (errorMsg.includes('does not exist') || errorMsg.includes('relation')) {
         if (projectSelect) {
           projectSelect.innerHTML = '<option value="">⚠ project_members table not found</option>';
         }
-        console.error('❌ project_members table does not exist');
+
         return;
       }
       
@@ -2285,7 +2273,7 @@ async function loadProjects() {
       .map(membership => membership.projects)
       .filter(project => project !== null && project.status === 'active'); // Only show active projects
 
-    console.log('Loaded projects:', projects);
+
 
     // Populate project dropdown
     if (projectSelect) {
@@ -2293,7 +2281,7 @@ async function loadProjects() {
       
       if (projects.length === 0) {
         projectSelect.innerHTML = '<option value="">No projects assigned</option>';
-        console.warn('No projects found for user:', currentUser.id);
+
       } else {
         projects.forEach(project => {
           const option = document.createElement('option');
@@ -2314,7 +2302,7 @@ async function loadProjects() {
     selectedTaskId = null;
     updateTaskDisplay();
   } catch (error) {
-    console.error('Error loading projects:', error);
+
     if (projectSelect) {
       projectSelect.innerHTML = '<option value="">Error loading projects</option>';
     }
@@ -2334,12 +2322,12 @@ async function loadTasks(projectId) {
   }
 
   if (!taskSelect) {
-    console.error('taskSelect element not found, cannot load tasks');
+
     return;
   }
 
   try {
-    console.log('Loading tasks (all available tasks)');
+
     
     // Fetch all tasks (they're not project-specific in this schema)
     const { data: allTasks, error } = await supabase
@@ -2348,7 +2336,7 @@ async function loadTasks(projectId) {
       .order('name');
 
     if (error) {
-      console.error('Error fetching tasks:', error);
+
       if (taskSelect) {
         taskSelect.innerHTML = '<option value="">Error loading tasks</option>';
       }
@@ -2356,7 +2344,7 @@ async function loadTasks(projectId) {
     }
 
     tasks = allTasks || [];
-    console.log('Loaded tasks:', tasks);
+
 
     // Populate task dropdown
     if (taskSelect) {
@@ -2364,7 +2352,7 @@ async function loadTasks(projectId) {
       
       if (tasks.length === 0) {
         taskSelect.innerHTML = '<option value="">No tasks available</option>';
-        console.warn('No tasks found');
+
       } else {
         tasks.forEach(task => {
           const option = document.createElement('option');
@@ -2377,7 +2365,7 @@ async function loadTasks(projectId) {
       taskSelect.disabled = false;
     }
   } catch (error) {
-    console.error('Error loading tasks:', error);
+
     if (taskSelect) {
       taskSelect.innerHTML = '<option value="">Error loading tasks</option>';
     }
@@ -2464,7 +2452,7 @@ function handleTaskChange(event) {
 // Update task display in the UI
 function updateTaskDisplay() {
   if (!taskNameDisplay || !taskTagDisplay) {
-    console.warn('Task display elements not found');
+
     return;
   }
 
@@ -2517,11 +2505,11 @@ function updateStartButtonState() {
  */
 async function loadLastTimeEntry() {
   if (!currentUser) {
-    console.log('No current user, skipping loadLastTimeEntry');
+
     return;
   }
   
-  console.log('🔄 Loading last time entry for current day cycle...');
+
 
   // ALWAYS get the current day cycle first
   const newDayCycle = getCurrentDayCycle();
@@ -2531,10 +2519,7 @@ async function loadLastTimeEntry() {
   
   if (dayCycleChanged) {
     // New day cycle - reset everything
-    console.log('🔄 New day cycle detected, resetting:', {
-      old: currentDayCycle ? currentDayCycle.dateString : 'null',
-      new: newDayCycle.dateString
-    });
+
     
     // Clear ALL old local storage data for this user (cleanup old entries)
     if (currentUser) {
@@ -2571,7 +2556,7 @@ async function loadLastTimeEntry() {
     .single();
 
   if (!profile) {
-    console.error('Profile not found');
+
     return;
   }
 
@@ -2591,10 +2576,7 @@ async function loadLastTimeEntry() {
       const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
       
       if (dataAge > maxAge) {
-        console.warn('⚠️ Local storage data is too old (>24 hours), clearing it:', {
-          ageHours: Math.floor(dataAge / (60 * 60 * 1000)),
-          dateString: localData.dateString
-        });
+
         clearLocalStorage(currentUser.id, currentDayCycle.dateString);
         localDuration = 0;
         localTimeEntryId = null;
@@ -2617,10 +2599,7 @@ async function loadLastTimeEntry() {
             const cycleStartMs = currentDayCycle.start.getTime();
             const cycleEndMs = currentDayCycle.end.getTime();
             if (entryStartMs < cycleStartMs || entryStartMs > cycleEndMs) {
-              console.warn('⚠️ Local storage timeEntryId is from a different day (wrong session), clearing:', {
-                entryStart: entry.start_time,
-                dateString: currentDayCycle.dateString
-              });
+
               clearLocalStorage(currentUser.id, currentDayCycle.dateString);
               localDuration = 0;
               localTimeEntryId = null;
@@ -2630,7 +2609,7 @@ async function loadLastTimeEntry() {
             }
           }
         } catch (e) {
-          console.warn('⚠️ Could not validate local storage timeEntryId, discarding local data:', e.message);
+
           clearLocalStorage(currentUser.id, currentDayCycle.dateString);
           localDuration = 0;
           localTimeEntryId = null;
@@ -2642,10 +2621,7 @@ async function loadLastTimeEntry() {
       }
     } else {
       // Data is for a different day - clear it and don't use it
-      console.warn('⚠️ Local storage data is for a different day cycle, clearing it:', {
-        stored: localData.dateString,
-        current: currentDayCycle.dateString
-      });
+
       clearLocalStorage(currentUser.id, localData.dateString || currentDayCycle.dateString);
       localDuration = 0;
       localTimeEntryId = null;
@@ -2683,12 +2659,7 @@ async function loadLastTimeEntry() {
         const cycleStartMs = currentDayCycle.start.getTime();
         const cycleEndMs = currentDayCycle.end.getTime();
         if (entryStart < cycleStartMs || entryStart > cycleEndMs) {
-          console.warn('⚠️ Ignoring entry that is outside current day cycle (wrong day):', {
-            entryStart: matchingEntry.start_time,
-            cycleStart: cycleStartISO,
-            cycleEnd: cycleEndISO,
-            dateString: currentDayCycle.dateString
-          });
+
           remoteDuration = 0;
           remoteTimeEntryId = null;
         } else {
@@ -2726,33 +2697,21 @@ async function loadLastTimeEntry() {
             }
           }
 
-          console.log('✅ Loaded time entry for current cycle:', {
-            id: matchingEntry.id,
-            duration: remoteDuration,
-            durationFormatted: formatDurationFromSeconds(remoteDuration),
-            start_time: matchingEntry.start_time,
-            updated_at: matchingEntry.updated_at,
-            cycle_start: cycleStartISO,
-            cycle_end: cycleEndISO,
-            cycle_date: currentDayCycle.dateString
-          });
+
         }
       } else {
-        console.log('ℹ️ No time entry found for current day cycle:', currentDayCycle.dateString);
-        if (error1) console.error('Error querying by start_time:', error1);
+
+        if (error1)
       }
     } catch (error) {
-      console.error('❌ Error fetching time entries:', error);
+
       isOnline = false; // Mark as offline if fetch fails
     }
   }
 
   // Validation already done above - this check is redundant but kept for safety
   if (localData && localData.dateString && localData.dateString !== currentDayCycle.dateString) {
-    console.warn('⚠️ Additional validation: Local storage data mismatch detected, clearing:', {
-      stored: localData.dateString,
-      current: currentDayCycle.dateString
-    });
+
     clearLocalStorage(currentUser.id, localData.dateString);
     localDuration = 0;
     localTimeEntryId = null;
@@ -2768,12 +2727,7 @@ async function loadLastTimeEntry() {
   const bufferSeconds = 300; // 5 minute buffer to account for pauses, etc.
   
   if (baseDuration > (maxPossibleDuration + bufferSeconds)) {
-    console.warn('Duration exceeds maximum possible for current cycle (with buffer), resetting:', {
-      baseDuration,
-      maxPossibleDuration,
-      buffer: bufferSeconds,
-      cycleStart: currentDayCycle.start.toISOString()
-    });
+
     // Reset to 0 if duration is clearly wrong
     baseDuration = 0;
     baseDurationAtSessionStart = 0;
@@ -2782,10 +2736,7 @@ async function loadLastTimeEntry() {
     clearLocalStorage(currentUser.id, currentDayCycle.dateString);
   } else if (baseDuration > maxPossibleDuration) {
     // If slightly over (within buffer), cap it to max possible
-    console.log('Capping duration to maximum possible:', {
-      baseDuration,
-      maxPossibleDuration
-    });
+
     baseDuration = maxPossibleDuration;
   }
   
@@ -2805,15 +2756,7 @@ async function loadLastTimeEntry() {
     dateString: currentDayCycle.dateString // Store dateString for validation
   });
   
-  console.log('Duration loaded:', {
-    localDuration,
-    remoteDuration,
-    baseDuration,
-    maxPossibleDuration,
-    dateString: currentDayCycle.dateString,
-    cycleStart: currentDayCycle.start.toISOString(),
-    currentTime: now.toISOString()
-  });
+
   
   // Update display with saved duration
   updateDayCycleDisplay();
@@ -2851,7 +2794,7 @@ async function checkCameraPermission() {
         return { granted: false, error: 'No camera device found' };
       }
     } catch (enumError) {
-      console.log('Could not enumerate devices:', enumError);
+
       // Continue anyway, might still work
     }
 
@@ -2875,7 +2818,7 @@ async function checkCameraPermission() {
       constraint: error.constraint,
       toString: error.toString()
     };
-    console.log('Camera permission check result:', errorDetails);
+
     
     // Handle specific error types
     if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
@@ -2890,7 +2833,7 @@ async function checkCameraPermission() {
       return { granted: false, error: 'Camera access failed (timeout). Please enable camera in Windows Settings → Privacy → Camera.' };
     } else {
       // Any other error (e.g. SecurityError when Windows blocks): show permission modal so user knows what to fix
-      console.warn('Camera check failed:', errorDetails);
+
       return { granted: false, error: error.message || 'Camera access denied. Please allow camera in your system settings.' };
     }
   }
@@ -2939,7 +2882,7 @@ async function checkCameraDevice() {
       return { detected: true, warning: 'Camera device found but may be in use or requires permission.' };
     }
   } catch (error) {
-    console.error('Error checking camera device:', error);
+
     return { detected: false, error: 'Unable to check for camera device. Please ensure a camera is connected.' };
   }
 }
@@ -2955,7 +2898,7 @@ async function checkScreenshotPermission() {
       return { granted: false, error: 'Screenshot capture returned empty buffer' };
     }
   } catch (error) {
-    console.log('Screenshot permission check result:', error.message || error);
+
     return { granted: false, error: error.message || 'Screenshot capture failed' };
   }
 }
@@ -3017,15 +2960,15 @@ function updatePermissionUI(type, granted, error) {
   // Log permission status for debugging
   const isGranted = granted || (error && error.includes('may still be granted'));
   if (isGranted) {
-    console.log(`${type} permission: Granted`);
+
   } else {
-    console.warn(`${type} permission: Not granted - ${error || 'Unknown error'}`);
+
   }
 }
 
 async function checkAllPermissions() {
   // Check permissions in background (UI removed)
-  console.log('Checking permissions...');
+
   
   // Check camera permission
   const cameraResult = await checkCameraPermission();
@@ -3078,7 +3021,7 @@ async function startTracking() {
     showCameraPermissionRequiredModal();
     return;
   }
-  console.log('Checking for camera device...');
+
   const cameraCheck = await checkCameraDevice();
   if (!cameraCheck.detected) {
     showCameraDetectionModal(cameraCheck.error);
@@ -3099,10 +3042,7 @@ async function startTracking() {
   
   if (dayCycleChanged) {
     // New day cycle detected - reset everything and reload
-    console.log('🔄 Day cycle changed before starting tracking, resetting:', {
-      old: currentDayCycle ? currentDayCycle.dateString : 'null',
-      new: newDayCycle.dateString
-    });
+
     
     // Clear old local storage
     if (currentUser) {
@@ -3133,7 +3073,7 @@ async function startTracking() {
   pausedDuration = 0;
   pauseStartPerfMs = null;
   lastActivityTime = Date.now(); // Initialize with current time
-  console.log('Tracking started - lastActivityTime initialized to:', new Date(lastActivityTime).toLocaleTimeString());
+
   mouseMovementCount = 0;
   keystrokeCount = 0;
   // Reset screen comparer state so auto-stop uses fresh baseline
@@ -3149,7 +3089,7 @@ async function startTracking() {
     .single();
 
   if (!profile) {
-    console.error('Profile not found');
+
     return;
   }
 
@@ -3169,14 +3109,14 @@ async function startTracking() {
           .eq('id', timeEntryId);
 
         if (error) {
-          console.error('Error updating time entry:', error);
+
           isOnline = false;
         } else {
           // Update or create project_time_entries link
           await linkTimeEntryToProject(timeEntryId, selectedProjectId);
         }
       } catch (error) {
-        console.error('Error updating time entry:', error);
+
         isOnline = false;
       }
     }
@@ -3204,7 +3144,7 @@ async function startTracking() {
           .single();
 
         if (error) {
-          console.error('Error creating time entry:', error);
+
           isOnline = false;
         } else {
           timeEntryId = timeEntry.id;
@@ -3212,7 +3152,7 @@ async function startTracking() {
           await linkTimeEntryToProject(timeEntryId, selectedProjectId);
         }
       } catch (error) {
-        console.error('Error creating time entry:', error);
+
         isOnline = false;
       }
     }
@@ -3278,7 +3218,7 @@ async function startTracking() {
 async function stopTracking(options = {}) {
   if (!isTracking) return;
   if (isStoppingTracking) {
-    console.warn('stopTracking already in progress, ignoring duplicate call');
+
     return;
   }
 
@@ -3341,22 +3281,16 @@ async function stopTracking(options = {}) {
       pauseStartPerfMs = null;
     }
     sessionDuration = getMonotonicSessionSeconds();
-    console.log(`Stop tracking - Session duration calculation:`, {
-      pausedTimeSeconds: Math.floor(pausedDuration / 1000),
-      sessionDuration,
-      baseDurationAtSessionStart,
-      sessionStartTime: sessionStartTime.toISOString(),
-      endTime: endTime.toISOString()
-    });
+
   } else {
-    console.warn('Stop tracking called but sessionStartTime is null - duration may be incorrect');
+
   }
 
   // Calculate cumulative duration using baseDurationAtSessionStart to prevent double-counting
   const cumulativeDuration = baseDurationAtSessionStart + sessionDuration;
   
-  console.log(`Stop tracking - Cumulative duration: ${cumulativeDuration} seconds (base: ${baseDurationAtSessionStart}, session: ${sessionDuration})`);
-  console.log(`Stop tracking - Paused duration (inactive time excluded): ${Math.floor(pausedDuration / 1000)}s`);
+
+
 
   // CRITICAL: If we have pausedDuration (inactive time was deducted), we must trust our calculated duration
   // Don't let old values from Supabase/local storage override the corrected duration
@@ -3369,7 +3303,7 @@ async function stopTracking(options = {}) {
     // Only use local/remote if it's higher (shouldn't happen, but safety check)
     // Use our calculated duration, but ensure we don't go below what we already have synced
     finalDuration = Math.max(cumulativeDuration, currentMax);
-    console.log(`⚠️ Inactive time was deducted - using calculated duration: ${finalDuration}s (paused: ${Math.floor(pausedDuration / 1000)}s)`);
+
   } else {
     // No inactive time deducted - use normal max duration logic
     finalDuration = ensureMaxDuration(currentMax, cumulativeDuration);
@@ -3378,7 +3312,7 @@ async function stopTracking(options = {}) {
   // Safety check: If tracking was active but duration is 0, something went wrong
   // Use the currentMax as a fallback to prevent losing existing duration
   if (finalDuration === 0 && currentMax > 0) {
-    console.warn('Warning: Calculated duration is 0 but currentMax is', currentMax, '- using currentMax as fallback');
+
     finalDuration = currentMax;
   }
   
@@ -3386,7 +3320,7 @@ async function stopTracking(options = {}) {
   if (finalDuration === 0 && sessionStartTime && sessionDuration === 0) {
     const minDuration = Math.max(1, getMonotonicSessionSeconds());
     if (minDuration > 0) {
-      console.warn('Warning: Session duration calculated as 0, using minimum duration:', minDuration);
+
       finalDuration = baseDurationAtSessionStart + minDuration;
     }
   }
@@ -3398,7 +3332,7 @@ async function stopTracking(options = {}) {
   });
 
   // Sync duration to Supabase when stopping
-  console.log('Stopping tracking - syncing final duration to Supabase...');
+
   if (timeEntryId) {
     if (isOnline) {
       try {
@@ -3410,12 +3344,12 @@ async function stopTracking(options = {}) {
           .single();
 
         if (fetchError) {
-          console.error('Error fetching current duration before update:', fetchError);
+
           // Still try to update with our calculated duration
         }
 
         const remoteDuration = currentEntry?.duration || 0;
-        console.log(`📊 Current state in database before update: duration=${remoteDuration}s, updated_at=${currentEntry?.updated_at || 'N/A'}`);
+
         
         // CRITICAL FIX: If inactive time was deducted (pausedDuration > 0), we must use our calculated duration
         // The remote duration might still have the old value (before inactivity deduction)
@@ -3425,7 +3359,7 @@ async function stopTracking(options = {}) {
           // Inactive time was deducted - trust our calculated finalDuration
           // The remote value might be stale (includes inactive time)
           maxDuration = Math.max(finalDuration, remoteDuration);
-          console.log(`⚠️ Inactive time was deducted - using calculated duration: ${finalDuration}s instead of potentially stale remote: ${remoteDuration}s`);
+
         } else {
           // No inactive time deducted - use normal max logic
           maxDuration = ensureMaxDuration(remoteDuration, finalDuration);
@@ -3433,35 +3367,20 @@ async function stopTracking(options = {}) {
         
         // If remote duration is suspiciously low (like 15 seconds) but we calculated much more, log a warning
         if (remoteDuration < 60 && finalDuration > 300) {
-          console.warn(`⚠️ SUSPICIOUS: Database has ${remoteDuration}s but we calculated ${finalDuration}s. This might indicate another process is overwriting values.`);
+
         }
         
-        console.log(`Stop tracking - Updating Supabase:`, {
-          timeEntryId,
-          remoteDuration,
-          finalDuration,
-          maxDuration,
-          formatted: formatDurationFromSeconds(maxDuration)
-        });
+
 
         // CRITICAL: Verify isTracking is still false before updating (prevent race condition)
         if (isTracking) {
-          console.warn('WARNING: isTracking became true during stopTracking - aborting update to prevent race condition');
+
           isStoppingTracking = false; // Reset flag before returning
           return;
         }
 
         // CRITICAL: Ensure we're saving the correct duration - log all values for debugging
-        console.log('🔵 About to save to Supabase:', {
-          timeEntryId,
-          calculatedFinalDuration: finalDuration,
-          remoteDurationFromDB: remoteDuration,
-          maxDurationToSave: maxDuration,
-          sessionDuration,
-          baseDurationAtSessionStart,
-          cumulativeDuration,
-          formatted: formatDurationFromSeconds(maxDuration)
-        });
+
 
         // Retry mechanism to ensure the duration is saved correctly
         let updateSuccess = false;
@@ -3470,7 +3389,7 @@ async function stopTracking(options = {}) {
         
         while (!updateSuccess && retryCount < maxRetries) {
           retryCount++;
-          console.log(`Attempting to save duration (attempt ${retryCount}/${maxRetries}): ${maxDuration} seconds`);
+
           
           // Use a timestamp to ensure we're the latest update
           const updateTimestamp = new Date().toISOString();
@@ -3487,14 +3406,14 @@ async function stopTracking(options = {}) {
             .select('duration, updated_at'); // Request the updated data back
           
           if (updateData && updateData.length > 0) {
-            console.log(`Update response data:`, updateData[0]);
+
             if (updateData[0].duration !== maxDuration) {
-              console.error(`⚠️ Update returned wrong duration! Expected ${maxDuration}, got ${updateData[0].duration}`);
+
             }
           }
           
           if (error) {
-            console.error(`Error updating time entry on stop (attempt ${retryCount}):`, error);
+
             if (retryCount >= maxRetries) {
               // Queue for retry when online
               pendingUpdates.push({
@@ -3521,7 +3440,7 @@ async function stopTracking(options = {}) {
             .single();
           
           if (verifyError) {
-            console.error(`Error verifying time entry update (attempt ${retryCount}):`, verifyError);
+
             if (retryCount >= maxRetries) {
               break;
             }
@@ -3529,20 +3448,20 @@ async function stopTracking(options = {}) {
             continue;
           }
           
-          console.log(`✓ Verification (attempt ${retryCount}): Duration in DB = ${verifyEntry.duration} seconds, Expected = ${maxDuration} seconds`);
+
           
           if (verifyEntry.duration === maxDuration) {
-            console.log(`✅ SUCCESS: Duration correctly saved to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
+
             updateSuccess = true;
           } else {
-            console.error(`⚠️ WARNING: Duration mismatch on attempt ${retryCount}! Expected ${maxDuration}, got ${verifyEntry.duration}`);
+
             if (retryCount < maxRetries) {
-              console.log(`Retrying update...`);
+
               await new Promise(resolve => setTimeout(resolve, 500));
             } else {
-              console.error(`❌ FAILED: Could not save correct duration after ${maxRetries} attempts. Final value in DB: ${verifyEntry.duration} seconds`);
+
               // Try one more time with a more aggressive approach
-              console.log('Attempting final aggressive update...');
+
               const { error: finalError } = await supabase
                 .from('time_entries')
                 .update({
@@ -3554,9 +3473,9 @@ async function stopTracking(options = {}) {
                 .eq('id', timeEntryId);
               
               if (finalError) {
-                console.error('Final update attempt also failed:', finalError);
+
               } else {
-                console.log('Final update attempt completed - please verify manually');
+
               }
             }
           }
@@ -3578,11 +3497,11 @@ async function stopTracking(options = {}) {
             taskId: selectedTaskId,
             synced: true
           });
-          console.log(`✓ Final duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)} (${maxDuration} seconds)`);
-          console.log(`✓ Paused duration reset to 0 after successful sync`);
+
+
         }
       } catch (error) {
-        console.error('Error syncing duration on stop:', error);
+
         pendingUpdates.push({
           timeEntryId: timeEntryId,
           duration: finalDuration,
@@ -3625,7 +3544,7 @@ async function stopTracking(options = {}) {
   // Clear the stopping flag
   isStoppingTracking = false;
   
-  console.log(`✓ Tracking stopped. Final duration: ${formatDurationFromSeconds(baseDuration)}s. Paused duration reset.`);
+
 
   if (!options.skipActivityLog) {
     const work = getSelectedWorkLabel();
@@ -3689,13 +3608,13 @@ function startIdleDetection() {
     const timeSinceLastActivity = now - lastActivityTime;
 
     if (timeSinceLastActivity > IDLE_THRESHOLD - 10000 && timeSinceLastActivity < IDLE_THRESHOLD + 10000) {
-      console.log(`Idle check: ${Math.floor(timeSinceLastActivity / 1000)}s since last mouse/keyboard activity (threshold: ${IDLE_THRESHOLD / 1000}s)`);
+
     }
 
     // Inactivity = no activity for 5 min. Activity = (A) mouse click/key in this window OR (B) system-wide mouse/key (main process). No low/high - any event counts.
     if (timeSinceLastActivity >= IDLE_THRESHOLD) {
       if (!idleDoubleCheckTimer) {
-        console.log(`Idle threshold reached (${Math.floor(timeSinceLastActivity / 1000)}s), starting double-check...`);
+
         const doubleCheckDelay = 3000;
         idleDoubleCheckTimer = setTimeout(async () => {
           idleDoubleCheckTimer = null;
@@ -3703,7 +3622,7 @@ function startIdleDetection() {
 
           const recheckTime = Date.now();
           const recheckTimeSinceActivity = recheckTime - lastActivityTime;
-          console.log(`Double-check: ${Math.floor(recheckTimeSinceActivity / 1000)}s since last activity`);
+
           const shouldShowOverlay = recheckTimeSinceActivity >= IDLE_THRESHOLD;
 
           if (shouldShowOverlay) {
@@ -3729,10 +3648,10 @@ function startIdleDetection() {
 
           // Show overlay - Continue = resume with no time change; Stop = deduct 5 min and stop
           ipcRenderer.invoke('show-overlay').catch(err => {
-            console.error('Error showing overlay:', err);
+
           });
         } else {
-            console.log(`Activity detected during double-check (${Math.floor(recheckTimeSinceActivity / 1000)}s) - not showing overlay`);
+
         }
       }, doubleCheckDelay);
       }
@@ -3741,7 +3660,7 @@ function startIdleDetection() {
       if (idleDoubleCheckTimer) {
         clearTimeout(idleDoubleCheckTimer);
         idleDoubleCheckTimer = null;
-        console.log('Activity detected - cleared pending idle double-check');
+
       }
       
       // User must click Continue (resume, no deduction) or Stop (deduct 5 min and stop).
@@ -3811,7 +3730,7 @@ async function resumeTracking() {
   }
   
 
-  console.log('Tracking resumed (Continue) - no time deduction, synced to DB');
+
 }
 
 function startTimer() {
@@ -3864,12 +3783,12 @@ function scheduleNextCapture() {
       captureScreenshotAndCamera()
         .then(() => { scheduleNextCapture(); })
         .catch(err => {
-          console.warn('Periodic capture failed, will retry on next interval:', err);
+
           scheduleNextCapture();
         });
     }
   }, delay);
-  console.log(`Next capture in ${Math.round(delay / 60000)} min`);
+
 }
 
 function startPeriodicCaptures() {
@@ -3887,7 +3806,7 @@ function startPeriodicCaptures() {
   captureScreenshotAndCamera()
     .then(() => { scheduleNextCapture(); })
     .catch(err => {
-      console.warn('Initial capture failed, will retry on next interval:', err);
+
       scheduleNextCapture();
     });
 
@@ -3904,7 +3823,7 @@ function startPeriodicCaptures() {
     const timeSinceLastCapture = now - lastCaptureTime;
     // If capture is stuck (in progress or scheduled but no capture completed in 12+ min), restart loop
     if (timeSinceLastCapture >= STUCK_CAPTURE_THRESHOLD_MS) {
-      console.warn(`Capture appears stuck (last capture ${Math.round(timeSinceLastCapture / 60000)} min ago) - restarting periodic captures`);
+
       if (captureInProgress) captureInProgress = false;
       if (captureTimeoutId) {
         clearTimeout(captureTimeoutId);
@@ -3914,11 +3833,11 @@ function startPeriodicCaptures() {
       return;
     }
     if (captureTimeoutId !== null || captureInProgress) return; // Loop is running or capture in progress
-    console.warn('Capture loop was lost (no scheduled capture) - restarting periodic captures');
+
     startPeriodicCaptures();
   }, WATCHDOG_MS);
 
-  console.log('Periodic captures started - will capture every 5-7 minutes (after each capture completes)');
+
 }
 
 /**
@@ -3940,11 +3859,11 @@ async function isBlackScreenBuffer(buffer) {
 async function captureScreenshotAndCamera() {
   // Always attempt capture if tracking is active - don't skip due to pause
   if (!isTracking) {
-    console.log('Skipping capture: tracking is not active');
+
     return;
   }
   if (!timeEntryId) {
-    console.warn('Skipping capture: no timeEntryId available yet');
+
     return;
   }
 
@@ -3959,7 +3878,7 @@ async function captureScreenshotAndCamera() {
 }
 
 async function captureScreenshotAndCameraImpl() {
-  console.log('Capturing screenshot and camera (always on)');
+
 
   // Try to capture all screens with multiple fallback strategies
   let screensCaptured = 0;
@@ -3973,13 +3892,13 @@ async function captureScreenshotAndCameraImpl() {
     // Check if we have a valid cached display configuration
     if (cachedDisplays && (now - displayCacheTimestamp) < DISPLAY_CACHE_DURATION) {
       displays = cachedDisplays;
-      console.log(`Using cached display configuration: ${displays.length} display(s)`);
+
     } else {
       // Strategy 1: Try to get all displays using listDisplays()
       try {
         if (typeof screenshot.listDisplays === 'function') {
           displays = await screenshot.listDisplays();
-          console.log(`Found ${displays.length} display(s) using listDisplays()`);
+
           
           // Cache the display configuration
           if (displays && displays.length > 0) {
@@ -3988,14 +3907,14 @@ async function captureScreenshotAndCameraImpl() {
           }
         }
       } catch (listError) {
-        console.warn('Could not list displays, falling back to all screens capture:', listError.message || listError);
+
       }
     }
 
     // Strategy 2: If listDisplays failed or returned empty, try capturing screens by index
     // Performance optimization: Limit to 4 screens max and break early on consecutive failures
     if (!displays || displays.length === 0) {
-      console.log('Attempting to capture screens by index (fallback method)...');
+
       let consecutiveFailures = 0;
       const MAX_SCREENS = 4; // Optimized: Limit to 4 screens (most users have 1-2)
       
@@ -4004,7 +3923,7 @@ async function captureScreenshotAndCameraImpl() {
           const testBuffer = await screenshot({ screen: screenIndex, format: 'png' });
           if (testBuffer && testBuffer.length > 0) {
             displays.push({ id: screenIndex, name: `Screen ${screenIndex}` });
-            console.log(`Found screen at index ${screenIndex}`);
+
             consecutiveFailures = 0; // Reset on success
           } else {
             consecutiveFailures++;
@@ -4025,21 +3944,21 @@ async function captureScreenshotAndCameraImpl() {
 
     // Strategy 3: If no displays found, try primary screen capture
     if (displays.length === 0) {
-      console.log('No displays detected, attempting primary screen capture...');
+
       try {
         const primaryBuffer = await screenshot({ format: 'png' });
         if (primaryBuffer && primaryBuffer.length > 0) {
           displays = [{ id: 0, name: 'Primary Screen' }];
-          console.log('Captured primary screen');
+
         }
       } catch (primaryError) {
-        console.warn('Primary screen capture failed:', primaryError.message || primaryError);
+
       }
     }
 
     // Strategy 4: If screenshot-desktop completely fails, use Electron's desktopCapturer
     if (displays.length === 0) {
-      console.log('screenshot-desktop failed, trying Electron desktopCapturer fallback...');
+
       try {
         const sources = await ipcRenderer.invoke('get-desktop-sources', {
           types: ['screen'],
@@ -4047,7 +3966,7 @@ async function captureScreenshotAndCameraImpl() {
         });
         
         if (sources && sources.length > 0) {
-          console.log(`Found ${sources.length} screen source(s) using Electron desktopCapturer`);
+
           for (let i = 0; i < sources.length; i++) {
             const source = sources[i];
             const screenshotBuffer = await captureScreenshotWithElectron(source.id);
@@ -4056,7 +3975,7 @@ async function captureScreenshotAndCameraImpl() {
               if (i === 0 && sharp) {
                 const black = await isBlackScreenBuffer(screenshotBuffer);
                 if (black) {
-                  console.log('Screen comparer: black screen detected - stopping tracker');
+
                   await stopTracking();
                   if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
                   await ipcRenderer.invoke('show-overlay', {
@@ -4075,7 +3994,7 @@ async function captureScreenshotAndCameraImpl() {
                   const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
                   const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
                   if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                    console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
+
                     await stopTracking();
                     if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
                     await ipcRenderer.invoke('show-overlay', {
@@ -4094,7 +4013,7 @@ async function captureScreenshotAndCameraImpl() {
           }
         }
       } catch (electronError) {
-        console.warn('Electron desktopCapturer fallback also failed:', electronError.message || electronError);
+
       }
     } else {
       // Capture each detected screen
@@ -4122,7 +4041,7 @@ async function captureScreenshotAndCameraImpl() {
             if (i === 0 && sharp) {
               const black = await isBlackScreenBuffer(screenshotBuffer);
               if (black) {
-                console.log('Screen comparer: black screen detected - stopping tracker');
+
                 await stopTracking();
                 if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
                 await ipcRenderer.invoke('show-overlay', {
@@ -4141,7 +4060,7 @@ async function captureScreenshotAndCameraImpl() {
                 const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
                 const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
                 if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-                  console.log('Screen comparer: screen unchanged for consecutive captures - stopping tracker');
+
                   await stopTracking();
                   if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
                   await ipcRenderer.invoke('show-overlay', {
@@ -4157,30 +4076,30 @@ async function captureScreenshotAndCameraImpl() {
 
             await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
             screensCaptured++;
-            console.log(`✓ Captured screen ${i + 1}/${displays.length}: ${display.name || `Screen ${i}`}`);
+
           }
         } catch (screenCaptureError) {
-          console.warn(`Error capturing screen ${i + 1}:`, screenCaptureError.message || screenCaptureError);
+
           // Continue with other screens even if one fails
         }
       }
     }
 
     if (screensCaptured > 0) {
-      console.log(`✓ Successfully captured ${screensCaptured} screen(s)`);
+
     } else {
-      console.warn('⚠ No screens were captured - all methods failed');
+
     }
 
     // Capture camera (continue even if screenshot had issues)
     await captureCamera();
 
   } catch (error) {
-    console.warn('Error capturing screenshots (continuing with camera):', error.message || error);
+
     try {
       await captureCamera();
     } catch (cameraError) {
-      console.warn('Error capturing camera:', cameraError.message || cameraError);
+
     }
   }
 }
@@ -4284,13 +4203,13 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
       await runUpload();
       uploadOk = true;
     } catch (e) {
-      console.warn('Screenshot upload failed, retrying once:', e.message || e);
+
       await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
       try {
         await runUpload();
         uploadOk = true;
       } catch (e2) {
-        console.warn('Screenshot upload retry failed, skipping this capture:', e2.message || e2);
+
       }
     }
 
@@ -4305,7 +4224,7 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
       taken_at: new Date().toISOString(),
     });
     if (insertError) {
-      console.error('Error inserting screenshot record:', insertError);
+
     } else {
       writeUserLog('screenshot', `${getActivityDisplayName()} saved a screenshot`, {
         api_action: 'Upload screenshot',
@@ -4321,7 +4240,7 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
       try {
         fs.unlinkSync(screenshotPath);
       } catch (unlinkError) {
-        console.warn('Error deleting temp screenshot file:', unlinkError);
+
       }
     }
   }
@@ -4385,12 +4304,12 @@ async function captureScreenshotWithElectron(sourceId) {
         const buffer = Buffer.from(base64Data, 'base64');
         resolve(buffer);
       } catch (error) {
-        console.warn('Error converting canvas to buffer:', error);
+
         resolve(null);
       }
     });
   } catch (error) {
-    console.warn('Error capturing screenshot with Electron desktopCapturer:', error.message || error);
+
     return null;
   }
 }
@@ -4420,7 +4339,7 @@ async function getCameraStreamWithFallback(timeoutMs) {
     const isNotFound = firstErr.name === 'NotFoundError' || firstErr.name === 'DevicesNotFoundError';
     if (!isOverconstrained && !isNotFound) throw firstErr;
 
-    console.warn('Camera (facingMode user) failed, trying by deviceId (Windows 11 fallback):', firstErr.message || firstErr.name);
+
   }
 
   const devices = await navigator.mediaDevices.enumerateDevices();
@@ -4432,7 +4351,7 @@ async function getCameraStreamWithFallback(timeoutMs) {
         video: { ...baseConstraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
       });
       if (stream) {
-        console.log('Camera obtained by deviceId (e.g. HP TrueVision on Windows 11):', device.label || device.deviceId);
+
         return stream;
       }
     } catch (_) {
@@ -4476,7 +4395,7 @@ async function checkFaceBeforeStart() {
     const hasFace = await detectFaceInCanvas(canvas);
     return hasFace;
   } catch (err) {
-    console.warn('Face check before start failed:', err.message);
+
     return true; // do not block start on errors
   } finally {
     if (stream && stream.getTracks) stream.getTracks().forEach(t => { t.stop(); });
@@ -4493,25 +4412,25 @@ async function checkFaceBeforeStart() {
 async function captureCamera() {
   // Always attempt camera capture if tracking is active
   if (!isTracking) {
-    console.log('Skipping camera capture: tracking is not active');
+
     return;
   }
   if (!timeEntryId) {
-    console.warn('Skipping camera capture: no timeEntryId available yet');
+
     return;
   }
   
-  console.log('Capturing camera (always on)');
+
 
   let stream = null;
   let video = null;
 
   try {
-    console.log('Starting camera capture...');
+
     
     stream = await getCameraStreamWithFallback(10000);
     
-    console.log('Camera stream obtained');
+
     
     video = document.createElement('video');
     video.srcObject = stream;
@@ -4537,18 +4456,18 @@ async function captureCamera() {
 
       const onLoadedMetadata = () => {
         clearTimeout(timeout);
-        console.log(`Video metadata loaded: ${video.videoWidth}x${video.videoHeight}`);
+
         
         video.play().then(() => {
           // Wait for first frame - increased to 300ms for better reliability
           setTimeout(() => {
             // Verify video is actually playing and has dimensions
             if (video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2) {
-              console.log(`Video is ready for capture: ${video.videoWidth}x${video.videoHeight}, readyState: ${video.readyState}`);
+
               video.removeEventListener('loadedmetadata', onLoadedMetadata);
               resolve();
             } else {
-              console.warn(`Video not ready: width=${video.videoWidth}, height=${video.videoHeight}, readyState=${video.readyState}`);
+
               // Still try to capture - might work
               video.removeEventListener('loadedmetadata', onLoadedMetadata);
               resolve();
@@ -4564,7 +4483,7 @@ async function captureCamera() {
       
       video.onerror = (err) => {
         clearTimeout(timeout);
-        console.error('Video error:', err);
+
         video.removeEventListener('loadedmetadata', onLoadedMetadata);
         reject(err);
       };
@@ -4590,16 +4509,16 @@ async function captureCamera() {
     const hasContent = imageData.data.some(pixel => pixel !== 0);
     
     if (!hasContent) {
-      console.warn('Canvas appears to be empty - video might not have rendered yet');
+
       // Still proceed, might be a false positive
     }
     
-    console.log(`Camera frame captured: ${canvas.width}x${canvas.height}`);
+
 
     // Face check every 5–7 min: stop tracker if no face detected
     const faceDetected = await detectFaceInCanvas(canvas);
     if (!faceDetected) {
-      console.log('Face detection: no face in camera - stopping tracker');
+
       if (stream && stream.getTracks) {
         stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
       }
@@ -4657,18 +4576,18 @@ async function captureCamera() {
     return new Promise((resolve) => {
       canvas.toBlob(async (blob) => {
         if (!blob) {
-          console.error('Canvas toBlob returned null - canvas might be empty');
+
           resolve();
           return;
         }
         
         try {
-          console.log(`Converting canvas to blob: ${blob.size} bytes`);
+
           const arrayBuffer = await blob.arrayBuffer();
           const buffer = Buffer.from(arrayBuffer);
           
           if (buffer.length === 0) {
-            console.error('Buffer is empty - camera capture failed');
+
             resolve();
             return;
           }
@@ -4682,14 +4601,14 @@ async function captureCamera() {
           }
           
           const fileStats = fs.statSync(cameraPath);
-          console.log(`Camera file created: ${cameraPath} (${fileStats.size} bytes)`);
+
 
           const cameraTs = Date.now();
           const cameraBaseName = `${cameraTs}-camera.png`;
           const storagePathForDb = `camera/${currentUser.id}/${cameraBaseName}`;
           const cameraFile = fs.readFileSync(cameraPath);
 
-          console.log(`Uploading camera capture to screenshot server: ${storagePathForDb}`);
+
 
           const runCameraUpload = () =>
             withTimeout(
@@ -4707,16 +4626,13 @@ async function captureCamera() {
             await runCameraUpload();
             uploadOk = true;
           } catch (cameraError) {
-            console.warn('Camera upload failed, retrying once:', cameraError.message || cameraError);
+
             await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
             try {
               await runCameraUpload();
               uploadOk = true;
             } catch (cameraError2) {
-              console.warn(
-                'Camera upload retry failed, skipping this capture:',
-                cameraError2.message || cameraError2
-              );
+
             }
           }
 
@@ -4728,7 +4644,7 @@ async function captureCamera() {
             return;
           }
 
-          console.log('Camera capture uploaded successfully:', storagePathForDb);
+
 
           const { error: insertError } = await supabase.from('screenshots').insert({
             time_entry_id: timeEntryId,
@@ -4738,9 +4654,9 @@ async function captureCamera() {
           });
 
           if (insertError) {
-            console.error('Error inserting camera record:', insertError);
+
           } else {
-            console.log('Camera record inserted successfully');
+
             writeUserLog('camera', `${getActivityDisplayName()} saved a camera photo`, {
               api_action: 'Upload camera photo',
               api_table: 'screenshots',
@@ -4754,15 +4670,15 @@ async function captureCamera() {
           // Clean up temp file
           try {
           fs.unlinkSync(cameraPath);
-            console.log('Camera temp file cleaned up');
+
           } catch (unlinkError) {
-            console.warn('Error deleting temp camera file:', unlinkError);
+
           }
           
           resolve();
         } catch (error) {
-          console.error('Error processing camera capture:', error);
-          console.error('Error stack:', error.stack);
+
+
           resolve();
         }
       }, 'image/png', 0.95); // Use 0.95 quality to reduce file size
@@ -4772,21 +4688,17 @@ async function captureCamera() {
     const errorName = error.name || error.constructor.name;
     const errorMessage = error.message || error.toString();
     
-    console.error('Camera capture failed:', {
-      name: errorName,
-      message: errorMessage,
-      stack: error.stack
-    });
+
     
     const likelyInUse = errorName === 'NotReadableError' ||
       /Could not start video source|in use|resource.*busy|device.*busy|overconstrained|timeout/i.test(errorMessage);
     if (likelyInUse) {
       // Camera in use (e.g. Teams/video call) – next capture in 90s so we resume when call ends
-      console.warn('Camera is in use or temporarily unavailable:', errorMessage);
+
       cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
       // User disabled camera in Windows mid-session – stop tracking to prevent abuse
-      console.warn('Camera permission revoked during tracking – stopping tracker:', errorMessage);
+
       await stopTracking();
       if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera access disabled';
       await ipcRenderer.invoke('show-overlay', {
@@ -4797,10 +4709,10 @@ async function captureCamera() {
       });
       return;
     } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
-      console.warn('No camera device found:', errorMessage);
+
     } else {
       // Other errors - log but continue
-      console.warn('Camera capture error (continuing without camera):', errorName, errorMessage);
+
     }
     // Camera might not be available, continue without it - don't throw error
   } finally {
@@ -4855,7 +4767,7 @@ function startRealTimeUpdates() {
     // Double-check isTracking and isStoppingTracking to prevent race conditions
     if (!isTracking || isStoppingTracking || !timeEntryId || !sessionStartTime) {
       if (isStoppingTracking) {
-        console.log('Real-time update skipped: stopTracking in progress');
+
       }
       return;
     }
@@ -4886,7 +4798,7 @@ function startRealTimeUpdates() {
           .single();
 
         if (fetchError) {
-          console.error('Error fetching current duration:', fetchError);
+
           isOnline = false;
           return;
         }
@@ -4895,7 +4807,7 @@ function startRealTimeUpdates() {
         
         // CRITICAL: Skip real-time update if stopTracking is in progress
         if (isStoppingTracking) {
-          console.log('Real-time update skipped: stopTracking in progress, not overwriting final duration');
+
           return;
         }
         
@@ -4907,7 +4819,7 @@ function startRealTimeUpdates() {
         // AND if the calculated duration is greater than saved (never reduce)
         // This reduces unnecessary database writes
         if (Math.abs(maxDuration - savedDuration) > 5 && totalDuration > savedDuration) {
-          console.log(`Real-time update: Updating duration from ${savedDuration}s to ${maxDuration}s`);
+
           const { error: updateError } = await supabase
             .from('time_entries')
             .update({
@@ -4919,7 +4831,7 @@ function startRealTimeUpdates() {
             .eq('id', timeEntryId);
 
           if (updateError) {
-            console.error('Error updating time entry duration:', updateError);
+
             isOnline = false;
           } else {
             // Update baseDuration to reflect what's now in DB
@@ -4934,7 +4846,7 @@ function startRealTimeUpdates() {
           }
         }
       } catch (error) {
-        console.error('Error syncing duration:', error);
+
         isOnline = false;
       }
     } else {
@@ -4982,7 +4894,7 @@ async function syncCurrentDuration() {
           .single();
 
         if (fetchError) {
-          console.error('Error fetching current duration:', fetchError);
+
           isOnline = false;
           return false;
         }
@@ -4996,7 +4908,7 @@ async function syncCurrentDuration() {
           // Inactive time was deducted - our calculated totalDuration is correct
           // Only use savedDuration if it's actually higher (shouldn't happen after sync, but safety check)
           maxDuration = Math.max(totalDuration, savedDuration);
-          console.log(`⚠️ syncCurrentDuration: Inactive time deducted - using calculated: ${totalDuration}s, saved: ${savedDuration}s`);
+
         } else {
           // No inactive time deducted - use normal max logic
           maxDuration = Math.max(savedDuration, totalDuration);
@@ -5014,7 +4926,7 @@ async function syncCurrentDuration() {
             .eq('id', timeEntryId);
 
           if (updateError) {
-            console.error('Error updating time entry duration:', updateError);
+
             isOnline = false;
             return false;
           } else {
@@ -5029,13 +4941,13 @@ async function syncCurrentDuration() {
               taskId: selectedTaskId
             });
             
-            console.log(`Duration synced to Supabase: ${formatDurationFromSeconds(maxDuration)}`);
+
             return true;
           }
         }
         return true;
       } catch (error) {
-        console.error('Error syncing duration:', error);
+
         isOnline = false;
         return false;
       }
@@ -5048,7 +4960,7 @@ async function syncCurrentDuration() {
       return false;
     }
   } catch (error) {
-    console.error('Error in syncCurrentDuration:', error);
+
     return false;
   }
 }
@@ -5066,14 +4978,10 @@ function startDailyResetCheck() {
     if (dayCycleChanged) {
       // New day detected - stop current tracking (saves to old day's session), then reset for new day
       const wasTracking = isTracking;
-      console.log('🔄 New day detected (date change) - resetting tracking:', {
-        old: currentDayCycle ? currentDayCycle.dateString : 'null',
-        new: newDayCycle.dateString,
-        wasTracking
-      });
+
       
       if (wasTracking) {
-        console.log('Stopping active tracking due to day cycle change');
+
         await stopTracking();
       }
       
@@ -5101,13 +5009,13 @@ function startDailyResetCheck() {
         statusDisplay.classList.remove('tracking');
       } else if (selectedProjectId && selectedTaskId) {
         // Auto-start tracker for the new day so user doesn't have to click Start again
-        console.log('🔄 Auto-starting tracker for new day');
+
         await startTracking();
-        console.log('✅ Day cycle reset complete - auto-started for new day');
+
       } else {
         statusDisplay.textContent = 'Not Tracking';
         statusDisplay.classList.remove('tracking');
-        console.log('✅ Day cycle reset complete - timer reset to 00:00:00 (project/task not selected, not auto-starting)');
+
       }
     }
   }, 60000); // Optimized: Check every 60 seconds (reduced from 30 seconds for better performance)
@@ -5163,7 +5071,7 @@ async function captureDevToolsEvidence() {
     try {
       screenshotBuffer = await screenshot({ format: 'png' });
     } catch (primaryErr) {
-      console.warn('DevTools evidence primary screenshot failed, trying Electron:', primaryErr.message || primaryErr);
+
       try {
         const sources = await ipcRenderer.invoke('get-desktop-sources', {
           types: ['screen'],
@@ -5226,7 +5134,7 @@ async function captureDevToolsEvidence() {
           .maybeSingle();
 
         if (insertError) {
-          console.warn('DevTools screenshot DB insert failed:', insertError.message || insertError);
+
           evidence.screenshot_error = insertError.message || 'insert_failed';
         } else if (inserted && inserted.id) {
           evidence.screenshot_id = inserted.id;
@@ -5238,7 +5146,7 @@ async function captureDevToolsEvidence() {
       }
     }
   } catch (err) {
-    console.warn('DevTools screenshot evidence failed:', err.message || err);
+
     evidence.screenshot_error = err.message || String(err);
   }
 
@@ -5341,7 +5249,7 @@ async function captureDevToolsEvidence() {
         .maybeSingle();
 
       if (insertError) {
-        console.warn('DevTools camera DB insert failed:', insertError.message || insertError);
+
         evidence.camera_error = insertError.message || 'insert_failed';
       } else if (inserted && inserted.id) {
         evidence.camera_id = inserted.id;
@@ -5352,7 +5260,7 @@ async function captureDevToolsEvidence() {
       }
     }
   } catch (err) {
-    console.warn('DevTools camera evidence failed:', err.message || err);
+
     evidence.camera_error = err.message || String(err);
     if (stream && stream.getTracks) {
       stream.getTracks().forEach((track) => {
@@ -5428,7 +5336,7 @@ async function captureDevToolsEvidence() {
       try {
         evidence = await captureDevToolsEvidence();
       } catch (err) {
-        console.warn('DevTools evidence capture failed:', err && err.message);
+
         evidence = { capture_error: (err && err.message) || String(err) };
       } finally {
         captureInFlight = false;
@@ -5485,7 +5393,7 @@ async function captureDevToolsEvidence() {
         void report((payload && payload.trigger) || 'main_process_block', payload || {});
       });
     } catch (err) {
-      console.warn('DevTools IPC listener failed:', err && err.message);
+
     }
   }
 })();

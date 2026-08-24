@@ -15,7 +15,7 @@ if (!fs.existsSync(buildDir)) {
 
 async function convertIcon() {
   try {
-    console.log('Converting SVG to PNG icons...');
+
     
     // Create 256x256 PNG (good for Windows taskbar)
     await sharp(svgPath)
@@ -26,7 +26,7 @@ async function convertIcon() {
       .png()
       .toFile(icon256Path);
     
-    console.log(`✓ Created ${icon256Path}`);
+
     
     // Also create a standard icon.png
     await sharp(svgPath)
@@ -37,12 +37,12 @@ async function convertIcon() {
       .png()
       .toFile(iconPngPath);
     
-    console.log(`✓ Created ${iconPngPath}`);
-    console.log('\nNote: For Windows .ico file, you may need to use an online converter');
-    console.log('or install a tool like ImageMagick. The PNG will work for development.');
+
+
+
     
   } catch (error) {
-    console.error('Error converting icon:', error);
+
     process.exit(1);
   }
 }

@@ -104,18 +104,18 @@ function createMainWindow() {
 
   // Log console messages from renderer
   mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
-    console.log(`[Renderer ${level}]:`, message);
+
   });
 
   // Handle page errors
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-    console.error('Page failed to load:', errorCode, errorDescription, validatedURL);
+
   });
 
   // Handle window ready - process any pending callback
   mainWindow.webContents.once('did-finish-load', () => {
     if (pendingCallbackUrl) {
-      console.log('Processing pending callback URL');
+
       setTimeout(() => {
         handleOAuthCallback(pendingCallbackUrl);
         pendingCallbackUrl = null;
@@ -152,7 +152,7 @@ function createOverlayWindow() {
       overlayWindow.center();
       overlayWindow.show();
       overlayWindow.focus();
-      console.log('Overlay window ready and shown');
+
     });
 
     overlayWindow.on('closed', () => {
@@ -160,10 +160,10 @@ function createOverlayWindow() {
     });
 
     overlayWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
-      console.error('Overlay window failed to load:', errorCode, errorDescription);
+
     });
   } catch (error) {
-    console.error('Error creating overlay window:', error);
+
   }
 }
 
@@ -301,7 +301,7 @@ ipcMain.handle('get-system-idle-time', () => {
     const idleSeconds = powerMonitor.getSystemIdleTime();
     return typeof idleSeconds === 'number' && idleSeconds >= 0 ? idleSeconds : null;
   } catch (e) {
-    console.error('get-system-idle-time failed:', e.message);
+
     return null;
   }
 });
@@ -325,7 +325,7 @@ ipcMain.handle('get-desktop-sources', async (event, options) => {
     });
     return sources;
   } catch (error) {
-    console.error('Error getting desktop sources:', error);
+
     return [];
   }
 });
@@ -351,7 +351,7 @@ ipcMain.handle('check-screen-off', async () => {
       });
     });
   } catch (error) {
-    console.error('Error checking screen state:', error);
+
     return false; // Assume screen is on if we can't determine
   }
 });
@@ -362,7 +362,7 @@ function startSystemActivityMonitoring() {
     return; // Already monitoring
   }
 
-  console.log('Starting system-wide activity monitoring (all platforms)...');
+
 
   let lastIdleTime = 0;
   let consecutiveActiveChecks = 0;
@@ -382,7 +382,7 @@ function startSystemActivityMonitoring() {
         (lastIdleTime > 0 && idleSeconds < lastIdleTime);
 
       if (checkCount % 30 === 0) {
-        console.log(`System activity check #${checkCount}: idle=${idleSeconds.toFixed(1)}s, lastIdle=${lastIdleTime.toFixed(1)}s, active=${isActive}`);
+
       }
 
       if (isActive) {
@@ -391,22 +391,22 @@ function startSystemActivityMonitoring() {
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('system-activity-detected', idleSeconds);
             if (consecutiveActiveChecks % 10 === 0) {
-              console.log(`✓ System activity: idle=${idleSeconds.toFixed(1)}s (active for ${consecutiveActiveChecks} checks)`);
+
             }
           }
         } catch (sendError) {
-          console.error('Error sending system-activity-detected:', sendError);
+
         }
       } else {
         if (consecutiveActiveChecks > 0) {
-          console.log(`✗ System activity stopped: idle=${idleSeconds.toFixed(1)}s (was active for ${consecutiveActiveChecks} checks)`);
+
         }
         consecutiveActiveChecks = 0;
       }
 
       lastIdleTime = idleSeconds;
     } catch (e) {
-      console.error('Error in system activity check:', e.message);
+
     }
   }, ACTIVITY_CHECK_MS);
 }
@@ -421,7 +421,7 @@ function stopSystemActivityMonitoring() {
 ipcMain.handle('show-overlay', (event, options = {}) => {
   try {
     const { title, message, icon, isStopped = false } = options;
-    console.log('show-overlay called', { title, message, icon, isStopped });
+
     
     const sendUpdateMessage = () => {
       if (overlayWindow && !overlayWindow.isDestroyed()) {
@@ -437,7 +437,7 @@ ipcMain.handle('show-overlay', (event, options = {}) => {
     };
     
     if (!overlayWindow) {
-      console.log('Creating overlay window');
+
       createOverlayWindow();
       // Wait for window to be ready before sending message
       overlayWindow.webContents.once('did-finish-load', () => {
@@ -448,10 +448,10 @@ ipcMain.handle('show-overlay', (event, options = {}) => {
       sendUpdateMessage();
       overlayWindow.show();
       overlayWindow.focus();
-      console.log('Overlay window shown (existing)');
+
     }
   } catch (error) {
-    console.error('Error in show-overlay handler:', error);
+
   }
 });
 
@@ -498,12 +498,12 @@ function startOAuthCallbackServer() {
   oauthCallbackServer = http.createServer((req, res) => {
     const url = new URL(req.url, `http://localhost:${OAUTH_CALLBACK_PORT}`);
     
-    console.log('═══════════════════════════════════════════════════════');
-    console.log('OAuth callback received on HTTP server');
-    console.log('Full URL:', req.url);
-    console.log('Pathname:', url.pathname);
-    console.log('Query params:', url.search);
-    console.log('═══════════════════════════════════════════════════════');
+
+
+
+
+
+
     
     // Only handle /callback path
     if (url.pathname === '/callback') {
@@ -514,9 +514,9 @@ function startOAuthCallbackServer() {
       accessToken = url.searchParams.get('access_token');
       refreshToken = url.searchParams.get('refresh_token');
       
-      console.log('Extracted tokens:');
-      console.log('  access_token:', accessToken ? `${accessToken.substring(0, 20)}...` : 'MISSING');
-      console.log('  refresh_token:', refreshToken ? `${refreshToken.substring(0, 20)}...` : 'MISSING');
+
+
+
       
       // Send response to browser
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -532,7 +532,7 @@ function startOAuthCallbackServer() {
           </html>
         `);
         
-        console.log('Sending tokens to renderer process...');
+
         // Send tokens to renderer
         if (mainWindow && !mainWindow.isDestroyed()) {
           const callbackData = {
@@ -540,17 +540,14 @@ function startOAuthCallbackServer() {
             refresh_token: refreshToken,
             success: true
           };
-          console.log('Main window exists, sending callback data:', {
-            has_access_token: !!callbackData.access_token,
-            has_refresh_token: !!callbackData.refresh_token
-          });
+
           mainWindow.webContents.send('azure-sso-callback', callbackData);
-          console.log('Callback data sent to renderer');
+
         } else {
-          console.error('ERROR: Main window is null or destroyed, cannot send callback!');
+
         }
       } else {
-        console.error('ERROR: Missing tokens in callback!');
+
         res.end(`
           <html>
             <head><title>Login Failed</title></head>
@@ -570,21 +567,21 @@ function startOAuthCallbackServer() {
         }
       }
     } else {
-      console.log('404: Path not /callback, returning Not Found');
+
       res.writeHead(404);
       res.end('Not Found');
     }
   });
 
   oauthCallbackServer.listen(OAUTH_CALLBACK_PORT, 'localhost', () => {
-    console.log(`OAuth callback server listening on http://localhost:${OAUTH_CALLBACK_PORT}`);
+
   });
 
   oauthCallbackServer.on('error', (error) => {
     if (error.code === 'EADDRINUSE') {
-      console.log(`Port ${OAUTH_CALLBACK_PORT} is already in use, OAuth callback server may already be running`);
+
     } else {
-      console.error('OAuth callback server error:', error);
+
     }
   });
 }
@@ -594,7 +591,7 @@ function stopOAuthCallbackServer() {
   if (oauthCallbackServer) {
     oauthCallbackServer.close();
     oauthCallbackServer = null;
-    console.log('OAuth callback server stopped');
+
   }
 }
 
@@ -607,9 +604,9 @@ ipcMain.handle('open-azure-sso-window', async (event, options) => {
     const { redirectUrl } = options;
     const callbackUrl = `http://localhost:${OAUTH_CALLBACK_PORT}/callback`;
     
-    console.log('Opening Azure SSO in system browser...');
-    console.log('Redirect URL:', redirectUrl);
-    console.log('Callback URL:', callbackUrl);
+
+
+
     
     // Open the OAuth URL in the system browser (not Electron window)
     // The website should redirect to the callbackUrl after successful login
@@ -619,7 +616,7 @@ ipcMain.handle('open-azure-sso-window', async (event, options) => {
     
     return { success: true, callbackUrl: callbackUrl };
   } catch (error) {
-    console.error('Error opening Azure SSO in browser:', error);
+
     return { error: error.message };
   }
 });
@@ -630,11 +627,11 @@ let pendingCallbackUrl = null;
 // Handle OAuth callback from custom protocol
 function handleOAuthCallback(url) {
   try {
-    console.log('OAuth callback received:', url);
+
     
     // Ensure main window exists
     if (!mainWindow || mainWindow.isDestroyed()) {
-      console.log('Main window not ready, storing callback URL');
+
       pendingCallbackUrl = url;
       // Try to create window if app is ready
       if (app.isReady()) {
@@ -668,7 +665,7 @@ function handleOAuthCallback(url) {
       }
     } catch (parseError) {
       // If URL parsing fails, try manual parsing
-      console.warn('URL parsing failed, trying manual parse:', parseError);
+
       const tokenMatch = url.match(/[?&#]access_token=([^&?#]+)/);
       const refreshMatch = url.match(/[?&#]refresh_token=([^&?#]+)/);
       if (tokenMatch) accessToken = decodeURIComponent(tokenMatch[1]);
@@ -685,7 +682,7 @@ function handleOAuthCallback(url) {
       });
     }
   } catch (error) {
-    console.error('Error handling OAuth callback:', error);
+
     
     // Send error to renderer
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -700,7 +697,7 @@ function handleOAuthCallback(url) {
 function setupPowerMonitorListeners() {
   // Screen lock detection (Windows + L or system lock)
   powerMonitor.on('lock-screen', () => {
-    console.log('🔒 Screen locked - stopping tracker');
+
     if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
       mainWindow.webContents.send('system-event', { 
         type: 'screen-locked',
@@ -711,13 +708,13 @@ function setupPowerMonitorListeners() {
 
   // Screen unlock detection (for logging, but we don't auto-resume)
   powerMonitor.on('unlock-screen', () => {
-    console.log('🔓 Screen unlocked');
+
     // We don't auto-resume tracking, user must manually start again
   });
 
   // Sleep mode detection
   powerMonitor.on('suspend', () => {
-    console.log('😴 System entering sleep mode - stopping tracker');
+
     if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
       mainWindow.webContents.send('system-event', { 
         type: 'system-sleep',
@@ -728,13 +725,13 @@ function setupPowerMonitorListeners() {
 
   // System resume from sleep
   powerMonitor.on('resume', () => {
-    console.log('⏰ System resumed from sleep');
+
     // We don't auto-resume tracking, user must manually start again
   });
 
   // Shutdown detection
   powerMonitor.on('shutdown', () => {
-    console.log('🛑 System shutting down - stopping tracker');
+
     if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
       mainWindow.webContents.send('system-event', { 
         type: 'system-shutdown',
@@ -743,7 +740,7 @@ function setupPowerMonitorListeners() {
     }
   });
 
-  console.log('✅ PowerMonitor event listeners setup complete');
+
 }
 
 // Setup user switch detection for Windows
@@ -758,14 +755,14 @@ function setupUserSwitchDetection() {
   // Get initial session ID
   getCurrentSessionId().then(sessionId => {
     lastSessionId = sessionId;
-    console.log('Initial Windows session ID:', sessionId);
+
   });
 
   // Check for user switch every 2 seconds
   setInterval(() => {
     getCurrentSessionId().then(sessionId => {
       if (lastSessionId !== null && sessionId !== lastSessionId) {
-        console.log('👤 User switched - stopping tracker');
+
         if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
           mainWindow.webContents.send('system-event', { type: 'user-switched', reason: 'Windows user was switched' });
         }
