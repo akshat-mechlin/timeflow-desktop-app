@@ -6,7 +6,16 @@ if (!tf) {
 }
 
 const ipcRenderer = tf.ipc
-const createClient = tf.createClient
+// Prefer browser UMD build (loaded in index.html) — createClient via contextBridge
+// cannot return a client ("An object could not be cloned").
+const createClient =
+  (window.supabase && typeof window.supabase.createClient === 'function'
+    ? window.supabase.createClient.bind(window.supabase)
+    : null) || tf.createClient
+if (typeof createClient !== 'function') {
+  alert('Supabase client library failed to load. Check index.html script tags.')
+  throw new Error('supabase createClient missing')
+}
 const screenshot = tf.screenshot
 const fs = tf.fs
 const path = tf.path
@@ -16,6 +25,7 @@ const Buffer = tf.Buffer
 const __dirname = tf.dirname
 
 const appVersion = tf.appVersion
+const isDev = Boolean(tf.isDev)
 const TRACKER_VERSION = appVersion
 const appPlatform = os.platform()
 
@@ -25,31 +35,325 @@ let supabase = null
 async function initSupabaseClient() {
   if (supabase) return supabase
 
-
-  const cfg = await tf.getSupabaseConfig()
+  let cfg
+  try {
+    cfg = await tf.getSupabaseConfig()
+  } catch (err) {
+    console.error('[boot] getSupabaseConfig threw', err)
+    throw err
+  }
   if (!cfg?.supabaseUrl || !cfg?.supabasePublishableKey) {
     throw new Error(
       'Missing Supabase config. For local dev set .env; packaged apps fetch https://timeflow.mechlintech.com/desktop-config.json',
     )
   }
 
+  console.log('[boot] supabase config source:', cfg.source || 'unknown')
 
-  supabase = createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
-    auth: {
-      persistSession: true,
-      autoRefreshToken: true,
-      detectSessionInUrl: false,
-      storage: window.localStorage,
-      storageKey: 'supabase.auth.token',
-    },
-    global: {
-      headers: {
-        'x-client-info': 'electron-time-tracker',
+  try {
+    // createClient runs in the renderer (UMD). localStorage is fine here.
+    // Session persists across app restarts in the Electron userData profile.
+    supabase = createClient(cfg.supabaseUrl, cfg.supabasePublishableKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+        storage: window.localStorage,
+        storageKey: 'supabase.auth.token',
       },
-    },
+      global: {
+        headers: {
+          'x-client-info': 'electron-time-tracker',
+        },
+      },
+    })
+  } catch (err) {
+    console.error('[boot] createClient failed', err)
+    throw err
+  }
+
+  setupAuthLifecycle()
+  return supabase
+}
+
+/** Refresh slightly before expiry; Electron throttles renderer timers overnight. */
+const AUTH_REFRESH_SKEW_MS = 5 * 60 * 1000
+const AUTH_OP_TIMEOUT_MS = 30000 // wake-from-sleep / slow networks need headroom
+let authRefreshInFlight = null
+let sessionExpiredNotified = false
+let authLifecycleReady = false
+
+function withAuthTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label || 'Auth'} timed out after ${ms}ms`)), ms)
+    ),
+  ])
+}
+
+function isAuthFailure(error) {
+  if (!error) return false
+  const status = error.status || error.statusCode || error.status_code
+  const code = String(error.code || '')
+  const msg = String(error.message || '').toLowerCase()
+  return (
+    status === 401 ||
+    status === 403 ||
+    code === '42501' ||
+    code === 'PGRST301' ||
+    msg.includes('jwt') ||
+    msg.includes('permission denied') ||
+    msg.includes('not authenticated') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid claim') ||
+    msg.includes('refresh token')
+  )
+}
+
+function isTransientAuthError(error) {
+  const msg = String(error?.message || error || '').toLowerCase()
+  return (
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('network') ||
+    msg.includes('fetch') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('econnreset') ||
+    msg.includes('enotfound') ||
+    msg.includes('socket') ||
+    msg.includes('abort')
+  )
+}
+
+function isHardSessionFailure(error) {
+  const msg = String(error?.message || error || '').toLowerCase()
+  return (
+    msg.includes('invalid refresh token') ||
+    msg.includes('refresh token not found') ||
+    msg.includes('refresh_token_not_found') ||
+    msg.includes('session not found') ||
+    msg.includes('session_not_found') ||
+    msg.includes('user from sub claim in jwt does not exist') ||
+    msg.includes('invalid claim')
+  )
+}
+
+function sessionAccessStillValid(session, skewMs = 60 * 1000) {
+  if (!session?.access_token) return false
+  const exp = (session.expires_at || 0) * 1000
+  if (!exp) return Boolean(session.refresh_token)
+  return exp - Date.now() > skewMs
+}
+
+function clearSessionExpiredBanner() {
+  if (!statusDisplay) return
+  const text = String(statusDisplay.textContent || '').toLowerCase()
+  if (!text.includes('session') && !text.includes('re-login') && !text.includes('sync')) return
+  statusDisplay.textContent = isTracking ? 'Tracking' : 'Not Tracking'
+  if (isTracking) statusDisplay.classList.add('tracking')
+  else statusDisplay.classList.remove('tracking')
+}
+
+let needsReauthForSync = false
+
+function notifySessionExpired() {
+  if (sessionExpiredNotified && !isTracking) return
+  sessionExpiredNotified = true
+  needsReauthForSync = true
+  // Never interrupt an active tracking session — keep timing locally and retry sync later
+  if (isTracking) {
+    console.warn('[auth] session refresh needed — tracking continues without UI interruption')
+    return
+  }
+  if (statusDisplay) {
+    statusDisplay.textContent = 'Session expired — log in again to sync time'
+    statusDisplay.classList.remove('tracking')
+  }
+}
+
+/**
+ * Ensure a usable Supabase session. Returns session or null.
+ * Critical after sleep / midnight: autoRefreshToken timers are throttled in background Electron.
+ * Transient network/timeout failures must NOT force logout while a refresh token remains stored.
+ */
+async function ensureValidSession(options = {}) {
+  const forceRefresh = Boolean(options.forceRefresh)
+  const notifyOnExpire = options.notifyOnExpire !== false
+  if (!supabase) return null
+
+  if (authRefreshInFlight) return authRefreshInFlight
+
+  authRefreshInFlight = (async () => {
+    let session = null
+    try {
+      try {
+        const { data: sessionData, error: sessionError } = await withAuthTimeout(
+          supabase.auth.getSession(),
+          AUTH_OP_TIMEOUT_MS,
+          'getSession'
+        )
+        if (sessionError && isHardSessionFailure(sessionError)) throw sessionError
+        session = sessionData?.session || null
+      } catch (getErr) {
+        if (isHardSessionFailure(getErr)) throw getErr
+        // Transient getSession failure — brief retry (common after PC wake)
+        await new Promise((r) => setTimeout(r, 750))
+        const retry = await supabase.auth.getSession()
+        session = retry?.data?.session || null
+      }
+
+      if (!session) {
+        if (notifyOnExpire) notifySessionExpired()
+        return null
+      }
+
+      const expiresAtMs = (session.expires_at || 0) * 1000
+      const nearExpiry = !expiresAtMs || expiresAtMs - Date.now() < AUTH_REFRESH_SKEW_MS
+      const shouldRefresh = forceRefresh || nearExpiry
+
+      if (shouldRefresh) {
+        try {
+          const { data: refreshed, error: refreshError } = await withAuthTimeout(
+            supabase.auth.refreshSession(),
+            AUTH_OP_TIMEOUT_MS,
+            'refreshSession'
+          )
+          if (refreshError) throw refreshError
+          if (refreshed?.session) {
+            session = refreshed.session
+          } else if (!sessionAccessStillValid(session)) {
+            if (notifyOnExpire) notifySessionExpired()
+            return null
+          }
+        } catch (refreshErr) {
+          if (isHardSessionFailure(refreshErr)) {
+            if (notifyOnExpire) notifySessionExpired()
+            return null
+          }
+
+          // Timeout / network: keep current access token if still usable
+          if (sessionAccessStillValid(session)) {
+            console.warn(
+              '[auth] refresh delayed; keeping current session',
+              refreshErr?.message || refreshErr
+            )
+          } else {
+            // Access token already expired — one more refresh attempt
+            await new Promise((r) => setTimeout(r, 1200))
+            try {
+              const { data: again, error: againErr } = await withAuthTimeout(
+                supabase.auth.refreshSession(),
+                AUTH_OP_TIMEOUT_MS,
+                'refreshSession-retry'
+              )
+              if (againErr) throw againErr
+              if (again?.session) {
+                session = again.session
+              } else {
+                if (notifyOnExpire) notifySessionExpired()
+                return null
+              }
+            } catch (retryErr) {
+              if (notifyOnExpire && (isHardSessionFailure(retryErr) || !sessionAccessStillValid(session))) {
+                notifySessionExpired()
+              }
+              return sessionAccessStillValid(session) ? session : null
+            }
+          }
+        }
+      }
+
+      currentUser = session.user
+      sessionExpiredNotified = false
+      needsReauthForSync = false
+      clearSessionExpiredBanner()
+      return session
+    } catch (err) {
+      if (session && sessionAccessStillValid(session)) {
+        currentUser = session.user
+        console.warn('[auth] soft failure; keeping session', err?.message || err)
+        return session
+      }
+      if (notifyOnExpire && (isHardSessionFailure(err) || !session)) {
+        notifySessionExpired()
+      } else {
+        console.warn('[auth] ensureValidSession failed softly', err?.message || err)
+      }
+      return null
+    } finally {
+      authRefreshInFlight = null
+    }
+  })()
+
+  return authRefreshInFlight
+}
+
+function setupAuthLifecycle() {
+  if (!supabase || authLifecycleReady) return
+  authLifecycleReady = true
+
+  // IMPORTANT: never await supabase.auth.* inside this callback — it deadlocks the auth lock
+  // and leaves the app stuck on the loading screen.
+  supabase.auth.onAuthStateChange((event, session) => {
+    if (event === 'SIGNED_OUT') {
+      // Only treat as real logout if storage no longer has a session (ignore refresh races)
+      setTimeout(async () => {
+        try {
+          const { data } = await supabase.auth.getSession()
+          if (data?.session?.user) {
+            currentUser = data.session.user
+            sessionExpiredNotified = false
+            needsReauthForSync = false
+            return
+          }
+        } catch (_) {
+          /* ignore */
+        }
+        // Keep tracking uninterrupted — mark sync auth for later, do not tear down session UI mid-track
+        if (isTracking) {
+          needsReauthForSync = true
+          sessionExpiredNotified = true
+          console.warn('[auth] SIGNED_OUT during tracking — continuing locally; re-login after stop to sync')
+          return
+        }
+        currentUser = null
+        notifySessionExpired()
+      }, 0)
+      return
+    }
+    if (session?.user) {
+      currentUser = session.user
+      sessionExpiredNotified = false
+      needsReauthForSync = false
+      clearSessionExpiredBanner()
+      if (event === 'TOKEN_REFRESHED' || event === 'SIGNED_IN') {
+        setTimeout(() => {
+          if (typeof syncPendingUpdates === 'function') {
+            syncPendingUpdates().catch(() => {})
+          }
+        }, 0)
+      }
+    }
   })
 
-  return supabase
+  // Main-process keepalive is not throttled when the window is hidden overnight
+  try {
+    ipcRenderer.on('auth-keepalive', () => {
+      ensureValidSession({ forceRefresh: false, notifyOnExpire: false }).catch(() => {})
+    })
+    ipcRenderer.on('power-resume', () => {
+      ensureValidSession({ forceRefresh: true, notifyOnExpire: false })
+        .then((session) => {
+          if (session && typeof syncPendingUpdates === 'function') {
+            return syncPendingUpdates()
+          }
+        })
+        .catch(() => {})
+    })
+  } catch (_) {
+    /* preload may block unknown channels in older builds */
+  }
 }
 
 function getActivityDisplayName() {
@@ -115,16 +419,7 @@ async function writeUserLog(logType, message, metadata) {
   }
 }
 
-// Test connection
-supabase.auth.getSession().then(({ data, error }) => {
-  if (error) {
-
-  } else {
-
-  }
-}).catch(err => {
-
-});
+// Connection is verified during bootApp → initSupabaseClient / checkAuth
 
 // Day cycle timezone utilities
 // USE_LOCAL_TIME_FOR_DAY_CYCLE: set to true to use machine local time (for testing date-change reset by changing system clock).
@@ -346,12 +641,151 @@ let captureSettings = {
   refreshInterval: null
 };
 
-// Last permission check result - used so tracker cannot start without camera/screenshot when required
+// Last permission / readiness check — warmed in background so Start is instant
 let lastPermissionCheck = null;
+const PREFLIGHT_MAX_AGE_MS = 5 * 60 * 1000;
+let trackerPreflight = {
+  ready: false,
+  checkedAt: 0,
+  screenshotOk: false,
+  cameraOk: false,
+  cameraDetected: false,
+  faceOk: false,
+  screenshotWarmed: false,
+  faceModelsLoaded: false,
+  error: null,
+};
+let preflightInFlight = null;
+
+async function runTrackerPreflight(options = {}) {
+  const force = Boolean(options.force);
+  const age = Date.now() - (trackerPreflight.checkedAt || 0);
+  if (!force && trackerPreflight.ready && age < PREFLIGHT_MAX_AGE_MS && preflightInFlight == null) {
+    return trackerPreflight;
+  }
+  if (preflightInFlight) return preflightInFlight;
+
+  preflightInFlight = (async () => {
+    console.log('[preflight] warming tracker readiness…');
+    const result = {
+      ready: false,
+      checkedAt: Date.now(),
+      screenshotOk: false,
+      cameraOk: false,
+      cameraDetected: false,
+      faceOk: false,
+      screenshotWarmed: false,
+      faceModelsLoaded: false,
+      error: null,
+    };
+
+    try {
+      // Face models (CDN) — do not block on failure
+      try {
+        result.faceModelsLoaded = Boolean(await loadFaceApiModels());
+      } catch (_) {
+        result.faceModelsLoaded = false;
+      }
+
+      // Warm screenshot-desktop (copies Win .bat on first use)
+      try {
+        const buf = await screenshot({ format: 'png' });
+        result.screenshotOk = Boolean(buf && buf.length > 0);
+        result.screenshotWarmed = result.screenshotOk;
+      } catch (e) {
+        result.screenshotOk = false;
+        result.error = e?.message || 'Screenshot permission check failed';
+      }
+
+      // Camera permission + device + face probe (single stream open)
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+        result.cameraDetected = videoDevices.length > 0;
+
+        if (!result.cameraDetected) {
+          result.cameraOk = false;
+          result.error = 'No camera device detected';
+        } else {
+          const cameraPermission = await checkCameraPermission();
+          result.cameraOk =
+            cameraPermission.granted ||
+            Boolean(cameraPermission.error && cameraPermission.error.includes('may still be granted'));
+
+          if (result.cameraOk) {
+            try {
+              result.faceOk = Boolean(await checkFaceBeforeStart());
+            } catch (_) {
+              // Device works; face model may be unavailable — allow start, periodic capture will retry
+              result.faceOk = true;
+            }
+          } else {
+            result.error = cameraPermission.error || 'Camera permission not granted';
+          }
+        }
+      } catch (e) {
+        result.cameraOk = false;
+        result.error = e?.message || 'Camera check failed';
+      }
+
+      // Prefetch display list so first capture is faster
+      try {
+        if (typeof discoverAllScreens === 'function') {
+          cachedDisplays = await discoverAllScreens();
+          displayCacheTimestamp = Date.now();
+        }
+      } catch (_) {
+        /* ignore */
+      }
+
+      result.ready = result.screenshotOk && result.cameraOk && result.cameraDetected;
+      // Face preferred but if models offline we already set faceOk=true above when device works
+      if (result.ready && result.faceOk === false) {
+        result.ready = false;
+        result.error = result.error || 'Camera appears covered or blurry';
+      }
+
+      trackerPreflight = result;
+      lastPermissionCheck = {
+        cameraOk: result.cameraOk && result.cameraDetected,
+        screenshotOk: result.screenshotOk,
+        faceOk: result.faceOk,
+        checkedAt: result.checkedAt,
+      };
+      updateStartButtonState();
+      console.log('[preflight] done', {
+        ready: result.ready,
+        screenshotOk: result.screenshotOk,
+        cameraOk: result.cameraOk,
+        cameraDetected: result.cameraDetected,
+        faceOk: result.faceOk,
+      });
+      return result;
+    } finally {
+      preflightInFlight = null;
+    }
+  })();
+
+  return preflightInFlight;
+}
+
+function preflightIsFresh() {
+  return (
+    trackerPreflight &&
+    trackerPreflight.checkedAt &&
+    Date.now() - trackerPreflight.checkedAt < PREFLIGHT_MAX_AGE_MS
+  );
+}
 
 // Initialize capture settings from user profile
 async function initializeCaptureSettings(userId) {
   try {
+    const session = await ensureValidSession();
+    if (!session) {
+      captureSettings.enableScreenshotCapture = true;
+      captureSettings.enableCameraCapture = true;
+      return;
+    }
 
     
     const { data: profile, error } = await supabase
@@ -361,6 +795,9 @@ async function initializeCaptureSettings(userId) {
       .single();
 
     if (error) {
+      if (isAuthFailure(error)) {
+        await ensureValidSession({ forceRefresh: true });
+      }
 
 
       
@@ -600,12 +1037,24 @@ async function syncDurationToSupabase(timeEntryId, duration) {
   if (!isOnline || !timeEntryId) return false;
 
   try {
+    const session = await ensureValidSession();
+    if (!session) return false;
+
     // Fetch current duration first
-    const { data: currentEntry } = await supabase
+    const { data: currentEntry, error: fetchError } = await supabase
       .from('time_entries')
       .select('duration')
       .eq('id', timeEntryId)
       .single();
+
+    if (fetchError) {
+      if (isAuthFailure(fetchError)) {
+        const recovered = await ensureValidSession({ forceRefresh: true });
+        if (!recovered) return false;
+      } else {
+        return false;
+      }
+    }
 
     const remoteDuration = currentEntry?.duration || 0;
     const maxDuration = ensureMaxDuration(remoteDuration, duration);
@@ -622,7 +1071,9 @@ async function syncDurationToSupabase(timeEntryId, duration) {
         .eq('id', timeEntryId);
 
       if (error) {
-
+        if (isAuthFailure(error)) {
+          await ensureValidSession({ forceRefresh: true });
+        }
         return false;
       }
       return true;
@@ -638,17 +1089,24 @@ async function syncDurationToSupabase(timeEntryId, duration) {
 async function syncPendingUpdates() {
   if (!isOnline || !currentUser || pendingUpdates.length === 0) return;
 
-
+  const session = await ensureValidSession();
+  if (!session) return;
 
   for (let i = pendingUpdates.length - 1; i >= 0; i--) {
     const update = pendingUpdates[i];
     try {
       // Fetch current duration first
-      const { data: currentEntry } = await supabase
+      const { data: currentEntry, error: fetchError } = await supabase
         .from('time_entries')
         .select('duration')
         .eq('id', update.timeEntryId)
         .single();
+
+      if (fetchError && isAuthFailure(fetchError)) {
+        const recovered = await ensureValidSession({ forceRefresh: true });
+        if (!recovered) return; // keep queue intact
+        continue;
+      }
 
       const remoteDuration = currentEntry?.duration || 0;
       const maxDuration = ensureMaxDuration(remoteDuration, update.duration);
@@ -667,8 +1125,9 @@ async function syncPendingUpdates() {
         // Remove from queue
         pendingUpdates.splice(i, 1);
 
-      } else {
-
+      } else if (isAuthFailure(error)) {
+        const recovered = await ensureValidSession({ forceRefresh: true });
+        if (!recovered) return; // stop; leave remaining updates queued
       }
     } catch (error) {
 
@@ -780,18 +1239,70 @@ stopBtn.addEventListener('click', stopTracking);
 }
 
 // Initialize when DOM is ready
+function setBootStatus(message) {
+  try {
+    console.log('[boot]', message)
+    const heading = loadingContainer && loadingContainer.querySelector('h2')
+    if (heading) heading.textContent = message
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function leaveLoadingScreen(reason) {
+  try {
+    console.log('[boot] leaveLoadingScreen:', reason)
+    if (loadingContainer) {
+      loadingContainer.classList.add('hidden')
+      loadingContainer.style.display = 'none'
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 async function bootApp() {
   initializeDOMElements()
+  setBootStatus('Starting…')
+  // Hard safety net: never leave the Loading screen forever
+  const bootWatchdog = setTimeout(() => {
+    console.warn('[boot] watchdog fired — forcing login UI')
+    leaveLoadingScreen('watchdog')
+    try {
+      if (isVersionValid) {
+        showLogin()
+      } else if (loginContainer) {
+        // Version check never finished — still show login so app is usable in local/dev
+        loginContainer.classList.remove('hidden')
+        loginContainer.style.display = ''
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }, 12000)
   try {
+    setBootStatus('Loading configuration…')
     await initSupabaseClient()
+    setBootStatus('Checking version…')
   } catch (err) {
-
+    clearTimeout(bootWatchdog)
+    console.error('[boot] config failed', err)
+    leaveLoadingScreen('config-error')
     alert(
       `Could not load app configuration.\n\n${err.message || err}\n\nLocal dev: set SUPABASE_URL and SUPABASE_ANON_KEY in .env\nInstalled app: ensure ${tf.env.DESKTOP_CONFIG_URL || 'desktop-config.json'} is reachable.`,
     )
     return
   }
-  checkAuth()
+  try {
+    await checkAuth()
+  } finally {
+    clearTimeout(bootWatchdog)
+    // Belt-and-suspenders: if somehow still on Loading, escape
+    if (loadingContainer && !loadingContainer.classList.contains('hidden')) {
+      leaveLoadingScreen('boot-finally')
+      if (isVersionValid) showLogin()
+    }
+  }
 }
 
 if (document.readyState === 'loading') {
@@ -849,9 +1360,19 @@ document.addEventListener('visibilitychange', async () => {
 
     await checkScreenOffAndStop();
   } else if (!document.hidden && currentUser) {
+    // Prefer soft refresh — force only when access token is near expiry.
+    // Never treat a transient failure as logout while tracking.
+    const session = await ensureValidSession({ forceRefresh: false, notifyOnExpire: false });
+    if (!session) {
+      const retry = await ensureValidSession({ forceRefresh: true, notifyOnExpire: false });
+      if (!retry) {
+        console.warn('[auth] visibility refresh soft-failed; keeping local session');
+      }
+    }
+
     // App became visible - sync duration immediately (timers are throttled when hidden, so DB may be behind)
     if (isTracking && timeEntryId && sessionStartTime) {
-      syncCurrentDuration().catch(err =>);
+      syncCurrentDuration().catch(() => {});
     }
     // App became visible - validate day cycle
 
@@ -899,6 +1420,10 @@ document.addEventListener('visibilitychange', async () => {
         startPeriodicCaptures();
       }
     }
+
+    if (pendingUpdates.length > 0) {
+      syncPendingUpdates().catch(() => {});
+    }
   }
 });
 
@@ -908,7 +1433,7 @@ async function checkScreenOffAndStop() {
   
   try {
     // Check screen state (Windows)
-    if (process.platform === 'win32') {
+    if (appPlatform === 'win32') {
       const isScreenOff = await ipcRenderer.invoke('check-screen-off');
       if (isScreenOff) {
 
@@ -1332,11 +1857,18 @@ function normalizeSemver(version) {
 }
 
 // Allowed versions from DB: comma-separated list, e.g. "1.6.2, 1.6.2-Beta, 1.7.0"
+// Also strips legacy wrapping quotes from double-encoded JSONB values.
 function parseAllowedVersions(rawRequired) {
-  const requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+  let requiredStr = typeof rawRequired === 'string' ? rawRequired.trim() : String(rawRequired);
+  while (
+    (requiredStr.startsWith('"') && requiredStr.endsWith('"') && requiredStr.length >= 2) ||
+    (requiredStr.startsWith("'") && requiredStr.endsWith("'") && requiredStr.length >= 2)
+  ) {
+    requiredStr = requiredStr.slice(1, -1).trim();
+  }
   return requiredStr
     .split(',')
-    .map((v) => v.trim())
+    .map((v) => v.replace(/^["']+|["']+$/g, '').trim())
     .filter(Boolean)
     .map((token) => ({
       raw: token,
@@ -1348,9 +1880,30 @@ function parseAllowedVersions(rawRequired) {
 // Fetch required version via RPC (bypasses RLS, avoids "infinite recursion in policy for relation profiles"). No fallback — if fetch fails, app is blocked.
 async function checkAppVersion() {
   try {
-
-
-    const { data: requiredFromDb, error: rpcError } = await supabase.rpc('get_tracker_required_version');
+    let requiredFromDb = null;
+    let rpcError = null;
+    try {
+      const result = await Promise.race([
+        supabase.rpc('get_tracker_required_version'),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Version check timed out')), AUTH_OP_TIMEOUT_MS)
+        ),
+      ]);
+      requiredFromDb = result?.data;
+      rpcError = result?.error || null;
+    } catch (timeoutOrNetworkErr) {
+      isVersionValid = false;
+      versionCheckComplete = true;
+      return {
+        valid: false,
+        reason: 'version_check_failed',
+        minimumVersion: '',
+        currentVersion: TRACKER_VERSION,
+        downloadUrl: null,
+        downloadUrls: null,
+        forceUpdate: true
+      };
+    }
 
     if (rpcError) {
 
@@ -1402,12 +1955,16 @@ async function checkAppVersion() {
     const currentNormalized = normalizeSemver(currentRaw);
     minimumRequiredVersion = allowed.map((entry) => entry.raw).join(', ');
 
-
-
-
+    // Exact allow-list match (case-insensitive). Do not treat 1.6.2-Beta as equal to 1.6.2.
     const isAllowed = allowed.some((entry) => {
       if (entry.raw.toLowerCase() === currentRaw.toLowerCase()) return true;
-      return currentNormalized && entry.normalized === currentNormalized;
+      // Also allow when both sides are plain semver with no prerelease suffix
+      const entryHasSuffix = /[-+]/.test(entry.raw);
+      const currentHasSuffix = /[-+]/.test(currentRaw);
+      if (!entryHasSuffix && !currentHasSuffix && currentNormalized && entry.normalized === currentNormalized) {
+        return true;
+      }
+      return false;
     });
 
     if (!isAllowed) {
@@ -1445,27 +2002,28 @@ async function checkAppVersion() {
   }
 }
 
-// Track version usage in database
+// Track version usage in database (best-effort; never blocks the app)
 async function trackVersionUsage() {
-  if (!currentUser) {
-
+  if (!currentUser || !supabase) {
     return;
   }
   
   try {
-
-    
-    // Check if record exists
-    const { data: existingRecord } = await supabase
+    // Check if record exists (maybeSingle avoids error when no row yet)
+    const { data: existingRecord, error: selectError } = await supabase
       .from('user_version_tracking')
       .select('id, session_count')
       .eq('user_id', currentUser.id)
       .eq('app_version', appVersion)
-      .single();
+      .maybeSingle();
+
+    // Table missing / RLS / network — ignore
+    if (selectError && (selectError.code === '42P01' || selectError.code === 'PGRST205' || selectError.status === 404)) {
+      return;
+    }
     
     if (existingRecord) {
-      // Update existing record
-      const { error: updateError } = await supabase
+      await supabase
         .from('user_version_tracking')
         .update({
           last_seen_at: new Date().toISOString(),
@@ -1474,15 +2032,8 @@ async function trackVersionUsage() {
           updated_at: new Date().toISOString()
         })
         .eq('id', existingRecord.id);
-      
-      if (updateError) {
-
-      } else {
-
-      }
     } else {
-      // Insert new record
-      const { error: insertError } = await supabase
+      await supabase
         .from('user_version_tracking')
         .insert({
           user_id: currentUser.id,
@@ -1492,15 +2043,8 @@ async function trackVersionUsage() {
           first_seen_at: new Date().toISOString(),
           session_count: 1
         });
-      
-      if (insertError) {
-
-      } else {
-
-      }
     }
-  } catch (error) {
-
+  } catch (_) {
     // Don't block app if tracking fails
   }
 }
@@ -1700,14 +2244,17 @@ async function checkAuth() {
     }
     // Show loading state while checking
     loadingContainer.classList.remove('hidden');
+    loadingContainer.style.display = '';
     loginContainer.classList.add('hidden');
     dashboardContainer.classList.add('hidden');
 
     // Version check: fetch required version from DB (tracker_required_version), then compare. No fallback — fetch failure blocks app.
+    setBootStatus('Checking version…')
     const versionCheck = await checkAppVersion();
+    console.log('[boot] versionCheck', versionCheck);
     if (!versionCheck.valid) {
 
-      if (loadingContainer) loadingContainer.classList.add('hidden');
+      leaveLoadingScreen('version-invalid')
       if (loginContainer) loginContainer.classList.add('hidden');
       if (dashboardContainer) dashboardContainer.classList.add('hidden');
       showUpdateRequiredModal({
@@ -1720,7 +2267,21 @@ async function checkAuth() {
       return;
     }
 
-    const { data: { session }, error } = await supabase.auth.getSession();
+    setBootStatus('Checking session…')
+
+    let session = null;
+    let error = null;
+    try {
+      const sessionResult = await withAuthTimeout(
+        supabase.auth.getSession(),
+        AUTH_OP_TIMEOUT_MS,
+        'getSession'
+      );
+      session = sessionResult?.data?.session || null;
+      error = sessionResult?.error || null;
+    } catch (_) {
+      error = new Error('getSession timed out');
+    }
     
     if (error) {
 
@@ -1729,13 +2290,36 @@ async function checkAuth() {
     }
     
     if (session) {
+      // Proactively refresh if near expiry so the first dashboard queries don't 401
+      // Use a hard timeout so a stuck auth lock never leaves the loading screen forever
+      let valid = null;
+      try {
+        valid = await Promise.race([
+          ensureValidSession(),
+          new Promise((resolve) => setTimeout(() => resolve(null), AUTH_OP_TIMEOUT_MS + 2000))
+        ]);
+      } catch (_) {
+        valid = null;
+      }
+      if (!valid) {
+        // Fall back to existing session from storage if refresh hung/failed but token still present
+        if (session.user && (!session.expires_at || session.expires_at * 1000 > Date.now())) {
+          currentUser = session.user;
+          // Never block the UI on version tracking
+          trackVersionUsage().catch(() => {});
+          await showDashboard();
+          return;
+        }
+        showLogin();
+        return;
+      }
 
-      currentUser = session.user;
+      currentUser = valid.user;
       
-      // Track version usage after login
-      await trackVersionUsage();
+      // Never block the UI on version tracking
+      trackVersionUsage().catch(() => {});
       
-      showDashboard();
+      await showDashboard();
     } else {
 
       showLogin();
@@ -1747,16 +2331,22 @@ async function checkAuth() {
 }
 
 function showLogin() {
+  leaveLoadingScreen('showLogin')
   if (!isVersionValid) return;
-  if (loadingContainer) loadingContainer.classList.add('hidden');
-  if (loginContainer) loginContainer.classList.remove('hidden');
+  if (loginContainer) {
+    loginContainer.classList.remove('hidden');
+    loginContainer.style.display = '';
+  }
   if (dashboardContainer) dashboardContainer.classList.add('hidden');
 }
 
 async function showDashboard() {
-  if (loadingContainer) loadingContainer.classList.add('hidden');
+  leaveLoadingScreen('showDashboard')
   if (loginContainer) loginContainer.classList.add('hidden');
-  if (dashboardContainer) dashboardContainer.classList.remove('hidden');
+  if (dashboardContainer) {
+    dashboardContainer.classList.remove('hidden');
+    dashboardContainer.style.display = '';
+  }
   
   // Display app version
   if (versionText) {
@@ -1838,12 +2428,24 @@ async function showDashboard() {
   }
   syncInterval = setInterval(() => {
     if (isOnline && pendingUpdates.length > 0) {
-      syncPendingUpdates();
+      ensureValidSession({ notifyOnExpire: false })
+        .then((session) => {
+          if (session) return syncPendingUpdates();
+        })
+        .catch(() => {});
+    } else if (isOnline && currentUser) {
+      ensureValidSession({ notifyOnExpire: false }).catch(() => {});
+    }
+    // Keep Start instant: refresh camera/screenshot readiness while idle
+    if (!isTracking) {
+      runTrackerPreflight({ force: false }).catch(() => {});
     }
   }, 60000);
   
-  // Check permissions once when dashboard loads (not on every start button click)
-  checkAllPermissions();
+  // Warm camera/screenshot/face checks in background so Start Tracking is instant
+  runTrackerPreflight({ force: true }).catch((err) => {
+    console.warn('[preflight] background warm-up failed', err);
+  });
   
   // Update start button state
   updateStartButtonState();
@@ -1874,6 +2476,9 @@ async function handleLogin(e) {
 
 
     currentUser = data.user;
+    sessionExpiredNotified = false;
+    needsReauthForSync = false;
+    clearSessionExpiredBanner();
     
     // Track version usage after successful login
     await trackVersionUsage();
@@ -1886,6 +2491,7 @@ async function handleLogin(e) {
       login_method: 'email_password',
       user_email: currentUser && currentUser.email
     });
+    syncPendingUpdates().catch(() => {});
   } catch (err) {
 
     errorMessage.textContent = 'An error occurred during login. Please try again.';
@@ -2002,6 +2608,7 @@ function setupAzureSSOCallback() {
 
 
         currentUser = data.user;
+        sessionExpiredNotified = false;
         await showDashboard();
         writeUserLog('login', `${getActivityDisplayName()} logged in with Azure SSO`, {
           api_action: 'Sign in',
@@ -2010,6 +2617,7 @@ function setupAzureSSOCallback() {
           login_method: 'azure_sso',
           user_email: currentUser && currentUser.email
         });
+        syncPendingUpdates().catch(() => {});
         
         // Remove listener after successful login
         if (azureSsoCallbackListener) {
@@ -2487,11 +3095,12 @@ function updateStartButtonState() {
     startBtn.title = 'Please select a project and task to start tracking';
     return;
   }
-  // Keep Start button enabled so user can click and get the error popup; set tooltip when permission is missing
-  if (lastPermissionCheck && !lastPermissionCheck.cameraOk) {
-    startBtn.title = 'Enable camera access in Windows Settings (Privacy → Camera) to start tracking';
-  } else if (lastPermissionCheck && !lastPermissionCheck.screenshotOk) {
+  if (lastPermissionCheck && !lastPermissionCheck.screenshotOk) {
     startBtn.title = 'Please enable screenshot permission to start tracking';
+  } else if (lastPermissionCheck && !lastPermissionCheck.cameraOk) {
+    startBtn.title = 'Enable camera access (required) to start tracking';
+  } else if (lastPermissionCheck && lastPermissionCheck.faceOk === false) {
+    startBtn.title = 'Ensure your face is visible to the camera to start tracking';
   } else {
     startBtn.title = 'Start Tracking';
   }
@@ -2699,9 +3308,8 @@ async function loadLastTimeEntry() {
 
 
         }
-      } else {
-
-        if (error1)
+      } else if (error1) {
+        console.warn('[boot] time_entries fetch error', error1.message || error1);
       }
     } catch (error) {
 
@@ -2967,30 +3575,8 @@ function updatePermissionUI(type, granted, error) {
 }
 
 async function checkAllPermissions() {
-  // Check permissions in background (UI removed)
-
-  
-  // Check camera permission
-  const cameraResult = await checkCameraPermission();
-  updatePermissionUI('camera', cameraResult.granted, cameraResult.error);
-  
-  // Check screenshot permission
-  const screenshotResult = await checkScreenshotPermission();
-  updatePermissionUI('screenshot', screenshotResult.granted, screenshotResult.error);
-  
-  // Enable/disable start button based on permissions AND project/task selection
-  // Allow starting if camera permission appears granted (even with warnings)
-  // This handles cases where permission is granted but camera check has technical issues
-  const cameraOk = cameraResult.granted || (cameraResult.error && cameraResult.error.includes('may still be granted'));
-  lastPermissionCheck = { cameraOk, screenshotOk: screenshotResult.granted };
-
-  // Update start button state (will check both permissions and project/task selection)
-  updateStartButtonState();
-
-  return {
-    camera: cameraResult.granted,
-    screenshot: screenshotResult.granted
-  };
+  // Full readiness warm-up (camera + screenshot + face models) so Start is instant
+  return runTrackerPreflight({ force: true });
 }
 
 async function startTracking() {
@@ -3002,36 +3588,30 @@ async function startTracking() {
     return;
   }
 
-  // Check screenshot permission first – show same-style popup if missing
-  const screenshotResult = await checkScreenshotPermission();
-  if (!screenshotResult.granted) {
+  // Use background preflight when fresh — avoids multi-second delay on Start click
+  let preflight = trackerPreflight;
+  if (!preflightIsFresh() || !preflight.checkedAt) {
+    preflight = await runTrackerPreflight({ force: true });
+  }
+
+  if (!preflight.screenshotOk) {
     showScreenshotPermissionRequiredModal();
+    runTrackerPreflight({ force: true }).catch(() => {});
     return;
   }
 
-  // On Windows, run a one-off screenshot so screenshot-desktop can copy its .bat to temp if needed
-  // (avoids ENOENT after user clears temp files – the package copies screenCapture_*.bat to temp on first use)
-  if (process.platform === 'win32') {
-    screenshot({ format: 'png' }).catch(() => {});
-  }
-
-  // Always capture camera; require Windows camera permission and a detected device
-  const cameraPermission = await checkCameraPermission();
-  if (!cameraPermission.granted) {
+  if (!preflight.cameraOk || !preflight.cameraDetected) {
     showCameraPermissionRequiredModal();
+    runTrackerPreflight({ force: true }).catch(() => {});
     return;
   }
 
-  const cameraCheck = await checkCameraDevice();
-  if (!cameraCheck.detected) {
-    showCameraDetectionModal(cameraCheck.error);
-    return;
-  }
-
-  // Face check: do not start unless a face is detected
-  const faceDetected = await checkFaceBeforeStart();
-  if (!faceDetected) {
-    showCameraDetectionModal('Camera appears covered or blurry. Please ensure the camera has a clear view.', 'face');
+  if (preflight.faceOk === false) {
+    showCameraDetectionModal(
+      'Camera appears covered or blurry. Please ensure the camera has a clear view.',
+      'face'
+    );
+    runTrackerPreflight({ force: true }).catch(() => {});
     return;
   }
 
@@ -3081,6 +3661,22 @@ async function startTracking() {
   consecutiveSameScreenCount = 0;
   cameraSkippedDueToInUse = false;
 
+  // Instant UI — network/profile sync continues below without delaying the Start click feel
+  try { ipcRenderer.invoke('set-is-tracking', true); } catch (_) {}
+  startBtn.classList.add('hidden');
+  stopBtn.classList.remove('hidden');
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  projectSelect.disabled = true;
+  taskSelect.disabled = true;
+  statusDisplay.textContent = 'Tracking';
+  statusDisplay.classList.add('tracking');
+  startTimer();
+  setupActivityListeners();
+  startIdleDetection();
+  startActivityFallbackPoll();
+  startPeriodicCaptures();
+
   // Get profile
   const { data: profile } = await supabase
     .from('profiles')
@@ -3089,7 +3685,23 @@ async function startTracking() {
     .single();
 
   if (!profile) {
-
+    console.error('[tracking] profile missing — cannot start');
+    isTracking = false;
+    sessionStartTime = null;
+    sessionStartPerfMs = null;
+    try { await ipcRenderer.invoke('set-is-tracking', false); } catch (_) {}
+    if (timerInterval) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+    startBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    stopBtn.disabled = true;
+    projectSelect.disabled = false;
+    taskSelect.disabled = !selectedProjectId;
+    statusDisplay.textContent = 'Not Tracking';
+    statusDisplay.classList.remove('tracking');
+    alert('Could not load your profile. Please try again.');
     return;
   }
 
@@ -3165,33 +3777,6 @@ async function startTracking() {
       taskId: selectedTaskId
     });
   }
-
-  await ipcRenderer.invoke('set-is-tracking', true);
-
-  // Update UI
-  startBtn.classList.add('hidden');
-  stopBtn.classList.remove('hidden');
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  projectSelect.disabled = true; // Disable project selection while tracking
-  taskSelect.disabled = true; // Disable task selection while tracking
-  statusDisplay.textContent = 'Tracking';
-  statusDisplay.classList.add('tracking');
-
-  // Start timer
-  startTimer();
-
-  // Ensure activity listeners are set up
-  setupActivityListeners();
-
-  // Start inactivity detection
-  startIdleDetection();
-  startActivityFallbackPoll();
-
-  // Start periodic captures (every 5-7 minutes)
-  startPeriodicCaptures();
-
-  // Start real-time updates (every 30 seconds)
   startRealTimeUpdates();
   
   // Start screen state monitoring
@@ -3543,6 +4128,14 @@ async function stopTracking(options = {}) {
   
   // Clear the stopping flag
   isStoppingTracking = false;
+
+  // If sync auth was lost during tracking, surface it only after stop (no mid-track interruption)
+  if (needsReauthForSync) {
+    notifySessionExpired();
+  }
+
+  // Refresh readiness in background for a fast next Start
+  runTrackerPreflight({ force: true }).catch(() => {});
   
 
 
@@ -3802,11 +4395,28 @@ function startPeriodicCaptures() {
     captureTimeoutId = null;
   }
 
+  if (!isTracking) return;
+
+  // Captures require a time_entry_id for DB linkage — wait briefly if insert is still in flight
+  if (!timeEntryId) {
+    console.warn('[capture] waiting for timeEntryId before first capture…');
+    captureTimeoutId = setTimeout(() => {
+      captureTimeoutId = null;
+      if (isTracking) startPeriodicCaptures();
+    }, 1000);
+    return;
+  }
+
+  console.log('[capture] immediate screenshot + camera on start');
+  lastCaptureTime = Date.now(); // so watchdog/catch-up don't treat startup as "stuck"
   // Capture immediately on start
   captureScreenshotAndCamera()
-    .then(() => { scheduleNextCapture(); })
+    .then(() => {
+      console.log('[capture] first capture finished; scheduling next in 5–7 min');
+      scheduleNextCapture();
+    })
     .catch(err => {
-
+      console.error('[capture] first capture failed', err);
       scheduleNextCapture();
     });
 
@@ -3877,230 +4487,216 @@ async function captureScreenshotAndCamera() {
   }
 }
 
+/**
+ * Discover every connected display. Prefer Electron desktopCapturer (reliable on
+ * Windows multi-monitor); also merge screenshot-desktop list/index probes.
+ */
+async function discoverAllScreens() {
+  const byKey = new Map();
+
+  const add = (screen) => {
+    if (!screen || !screen.key) return;
+    if (!byKey.has(screen.key)) byKey.set(screen.key, screen);
+  };
+
+  // 1) Electron — usually returns all monitors (Screen 1, Screen 2, …)
+  try {
+    const sources = await ipcRenderer.invoke('get-desktop-sources', {
+      types: ['screen'],
+      thumbnailSize: { width: 1, height: 1 },
+    });
+    (sources || []).forEach((source, index) => {
+      if (!source || !source.id) return;
+      add({
+        key: `electron:${source.id}`,
+        method: 'electron',
+        sourceId: source.id,
+        name: source.name || `Screen ${index + 1}`,
+        index,
+      });
+    });
+  } catch (err) {
+    console.warn('[capture] get-desktop-sources failed', err && err.message);
+  }
+
+  // 2) screenshot-desktop listDisplays()
+  try {
+    if (typeof tf.listDisplays === 'function') {
+      const listed = await tf.listDisplays();
+      (listed || []).forEach((display, index) => {
+        const id = display && display.id !== undefined ? display.id : index;
+        add({
+          key: `shot:${id}`,
+          method: 'screenshot-desktop',
+          screenId: id,
+          name: (display && display.name) || `Display ${id}`,
+          index,
+        });
+      });
+    }
+  } catch (err) {
+    console.warn('[capture] listDisplays failed', err && err.message);
+  }
+
+  // 3) Probe sequential indices (covers cases where list APIs miss a monitor)
+  const MAX_PROBE = 8;
+  let consecutiveFailures = 0;
+  for (let screenIndex = 0; screenIndex < MAX_PROBE; screenIndex++) {
+    try {
+      const testBuffer = await screenshot({ screen: screenIndex, format: 'png' });
+      if (testBuffer && testBuffer.length > 0) {
+        consecutiveFailures = 0;
+        add({
+          key: `index:${screenIndex}`,
+          method: 'screenshot-desktop',
+          screenId: screenIndex,
+          name: `Screen index ${screenIndex}`,
+          index: screenIndex,
+        });
+      } else {
+        consecutiveFailures++;
+      }
+    } catch (_) {
+      consecutiveFailures++;
+      if (screenIndex === 0) {
+        // keep probing — primary index can fail while others work on some setups
+      }
+      if (consecutiveFailures >= 3 && byKey.size > 0) break;
+    }
+  }
+
+  let screens = Array.from(byKey.values());
+
+  // If Electron found monitors, prefer those (full set) and drop incomplete index-only duplicates
+  const electronScreens = screens.filter((s) => s.method === 'electron');
+  if (electronScreens.length > 0) {
+    screens = electronScreens.sort((a, b) => a.index - b.index);
+  } else {
+    screens.sort((a, b) => a.index - b.index);
+  }
+
+  console.log(
+    '[capture] displays discovered:',
+    screens.length,
+    screens.map((s) => `${s.name} (${s.method})`).join(', ')
+  );
+  return screens;
+}
+
+async function captureOneScreen(screenInfo, timestamp, screenOrdinal) {
+  let screenshotBuffer = null;
+
+  if (screenInfo.method === 'electron' && screenInfo.sourceId) {
+    screenshotBuffer = await captureScreenshotWithElectron(screenInfo.sourceId);
+  } else if (screenInfo.screenId !== undefined && screenInfo.screenId !== null) {
+    screenshotBuffer = await screenshot({ screen: screenInfo.screenId, format: 'png' });
+  } else {
+    screenshotBuffer = await screenshot({ format: 'png' });
+  }
+
+  if (!screenshotBuffer || screenshotBuffer.length === 0) {
+    console.warn('[capture] empty buffer for', screenInfo.name);
+    return false;
+  }
+
+  // Screen comparer only on the first uploaded screen
+  if (screenOrdinal === 0 && tf.sharpAvailable) {
+    const black = await isBlackScreenBuffer(screenshotBuffer);
+    if (black) {
+      await stopTracking();
+      if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
+      await ipcRenderer.invoke('show-overlay', {
+        title: 'Black screen',
+        message: 'Your screen appears off or black. Tracking has been stopped.',
+        icon: '🖥️',
+        isStopped: true,
+      });
+      return 'abort';
+    }
+    const contentHash = await getContentHashFromBuffer(screenshotBuffer);
+    if (contentHash !== null) {
+      if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
+      else consecutiveSameScreenCount = 0;
+      lastContentHashForComparer = contentHash;
+      const cooldownPassed =
+        sessionStartPerfMs != null &&
+        performance.now() - sessionStartPerfMs >= SCREEN_COMPARER_COOLDOWN_MS;
+      const isActive = Date.now() - lastActivityTime < ACTIVE_FOR_SCREEN_COMPARE_MS;
+      if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
+        await stopTracking();
+        if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
+        await ipcRenderer.invoke('show-overlay', {
+          title: 'Screen unchanged',
+          message: 'Your screen has not changed. Tracking has been stopped.',
+          icon: '🖥️',
+          isStopped: true,
+        });
+        return 'abort';
+      }
+    }
+  }
+
+  await uploadScreenshot(screenshotBuffer, `screen-${screenOrdinal}`, timestamp);
+  console.log('[capture] uploaded', screenInfo.name, `as screen-${screenOrdinal}`);
+  return true;
+}
+
 async function captureScreenshotAndCameraImpl() {
-
-
-  // Try to capture all screens with multiple fallback strategies
-  let screensCaptured = 0;
   const timestamp = Date.now();
 
+  // Camera first — multi-monitor screenshots can take a long time and Windows
+  // camera open is more reliable before that work (and after face-check settle).
   try {
-    // Performance optimization: Use cached display configuration if available
-    let displays = [];
-    const now = Date.now();
-    
-    // Check if we have a valid cached display configuration
-    if (cachedDisplays && (now - displayCacheTimestamp) < DISPLAY_CACHE_DURATION) {
-      displays = cachedDisplays;
+    await new Promise((r) => setTimeout(r, 400));
+    await captureCamera();
+    console.log('[capture] camera cycle finished');
+  } catch (cameraError) {
+    console.error('[capture] camera cycle failed', cameraError);
+  }
 
-    } else {
-      // Strategy 1: Try to get all displays using listDisplays()
-      try {
-        if (typeof screenshot.listDisplays === 'function') {
-          displays = await screenshot.listDisplays();
+  let screensCaptured = 0;
 
-          
-          // Cache the display configuration
-          if (displays && displays.length > 0) {
-            cachedDisplays = displays;
-            displayCacheTimestamp = now;
-          }
-        }
-      } catch (listError) {
+  try {
+    // Always rediscover — do not trust a stale 2-monitor cache when a 3rd is connected
+    const screens = await discoverAllScreens();
+    cachedDisplays = screens;
+    displayCacheTimestamp = Date.now();
 
-      }
-    }
-
-    // Strategy 2: If listDisplays failed or returned empty, try capturing screens by index
-    // Performance optimization: Limit to 4 screens max and break early on consecutive failures
-    if (!displays || displays.length === 0) {
-
-      let consecutiveFailures = 0;
-      const MAX_SCREENS = 4; // Optimized: Limit to 4 screens (most users have 1-2)
-      
-      for (let screenIndex = 0; screenIndex < MAX_SCREENS; screenIndex++) {
-        try {
-          const testBuffer = await screenshot({ screen: screenIndex, format: 'png' });
-          if (testBuffer && testBuffer.length > 0) {
-            displays.push({ id: screenIndex, name: `Screen ${screenIndex}` });
-
-            consecutiveFailures = 0; // Reset on success
-          } else {
-            consecutiveFailures++;
-          }
-        } catch (screenError) {
-          consecutiveFailures++;
-          // If screen 0 fails, break immediately (no primary screen)
-          if (screenIndex === 0) {
-            break;
-          }
-          // If 2 consecutive failures after finding screens, likely no more screens
-          if (consecutiveFailures >= 2 && displays.length > 0) {
-            break;
-          }
-        }
-      }
-    }
-
-    // Strategy 3: If no displays found, try primary screen capture
-    if (displays.length === 0) {
-
+    if (screens.length === 0) {
+      // Last resort: primary display only
       try {
         const primaryBuffer = await screenshot({ format: 'png' });
         if (primaryBuffer && primaryBuffer.length > 0) {
-          displays = [{ id: 0, name: 'Primary Screen' }];
-
+          await uploadScreenshot(primaryBuffer, 'screen-0', timestamp);
+          screensCaptured = 1;
         }
       } catch (primaryError) {
-
-      }
-    }
-
-    // Strategy 4: If screenshot-desktop completely fails, use Electron's desktopCapturer
-    if (displays.length === 0) {
-
-      try {
-        const sources = await ipcRenderer.invoke('get-desktop-sources', {
-          types: ['screen'],
-          thumbnailSize: { width: 1920, height: 1080 }
-        });
-        
-        if (sources && sources.length > 0) {
-
-          for (let i = 0; i < sources.length; i++) {
-            const source = sources[i];
-            const screenshotBuffer = await captureScreenshotWithElectron(source.id);
-            if (screenshotBuffer) {
-              // Screen comparer: on first screen, check black and unchanged then maybe auto-stop
-              if (i === 0 && sharp) {
-                const black = await isBlackScreenBuffer(screenshotBuffer);
-                if (black) {
-
-                  await stopTracking();
-                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
-                  await ipcRenderer.invoke('show-overlay', {
-                    title: 'Black screen',
-                    message: 'Your screen appears off or black. Tracking has been stopped.',
-                    icon: '🖥️',
-                    isStopped: true
-                  });
-                  return;
-                }
-                const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-                if (contentHash !== null) {
-                  if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                  else consecutiveSameScreenCount = 0;
-                  lastContentHashForComparer = contentHash;
-                  const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
-                  const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                  if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-
-                    await stopTracking();
-                    if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                    await ipcRenderer.invoke('show-overlay', {
-                      title: 'Screen unchanged',
-                      message: 'Your screen has not changed. Tracking has been stopped.',
-                      icon: '🖥️',
-                      isStopped: true
-                    });
-                    return;
-                  }
-                }
-              }
-              await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
-              screensCaptured++;
-            }
-          }
-        }
-      } catch (electronError) {
-
+        console.warn('[capture] primary screenshot failed', primaryError && primaryError.message);
       }
     } else {
-      // Capture each detected screen
-      for (let i = 0; i < displays.length; i++) {
-        const display = displays[i];
+      for (let i = 0; i < screens.length; i++) {
         try {
-          let screenshotBuffer;
-          
-          if (display.id !== undefined) {
-            // Use screen index
-            screenshotBuffer = await screenshot({ screen: display.id, format: 'png' });
-          } else {
-            // Fallback to primary screen
-            screenshotBuffer = await screenshot({ format: 'png' });
-          }
-
-          if (screenshotBuffer && screenshotBuffer.length > 0) {
-            // Performance optimization: Update cache if we successfully captured
-            if (!cachedDisplays || cachedDisplays.length !== displays.length) {
-              cachedDisplays = displays;
-              displayCacheTimestamp = Date.now();
-            }
-
-            // Screen comparer: on first screen only, check black and unchanged then maybe auto-stop
-            if (i === 0 && sharp) {
-              const black = await isBlackScreenBuffer(screenshotBuffer);
-              if (black) {
-
-                await stopTracking();
-                if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen is black';
-                await ipcRenderer.invoke('show-overlay', {
-                  title: 'Black screen',
-                  message: 'Your screen appears off or black. Tracking has been stopped.',
-                  icon: '🖥️',
-                  isStopped: true
-                });
-                return;
-              }
-              const contentHash = await getContentHashFromBuffer(screenshotBuffer);
-              if (contentHash !== null) {
-                if (contentHash === lastContentHashForComparer) consecutiveSameScreenCount++;
-                else consecutiveSameScreenCount = 0;
-                lastContentHashForComparer = contentHash;
-                const cooldownPassed = sessionStartPerfMs != null && (performance.now() - sessionStartPerfMs) >= SCREEN_COMPARER_COOLDOWN_MS;
-                const isActive = (Date.now() - lastActivityTime) < ACTIVE_FOR_SCREEN_COMPARE_MS;
-                if (consecutiveSameScreenCount >= CONSECUTIVE_SAME_THRESHOLD && cooldownPassed && isActive) {
-
-                  await stopTracking();
-                  if (statusDisplay) statusDisplay.textContent = 'Stopped: Screen unchanged';
-                  await ipcRenderer.invoke('show-overlay', {
-                    title: 'Screen unchanged',
-                    message: 'Your screen has not changed. Tracking has been stopped.',
-                    icon: '🖥️',
-                    isStopped: true
-                  });
-                  return;
-                }
-              }
-            }
-
-            await uploadScreenshot(screenshotBuffer, `screen-${i}`, timestamp);
-            screensCaptured++;
-
-          }
+          const result = await captureOneScreen(screens[i], timestamp, i);
+          if (result === 'abort') return;
+          if (result) screensCaptured++;
         } catch (screenCaptureError) {
-
+          console.warn(
+            '[capture] failed for',
+            screens[i].name,
+            screenCaptureError && screenCaptureError.message
+          );
           // Continue with other screens even if one fails
         }
       }
     }
 
     if (screensCaptured > 0) {
-
+      console.log('[capture] screenshots uploaded:', screensCaptured, 'of', screens.length || screensCaptured);
     } else {
-
+      console.warn('[capture] no screenshots captured this cycle');
     }
-
-    // Capture camera (continue even if screenshot had issues)
-    await captureCamera();
-
   } catch (error) {
-
-    try {
-      await captureCamera();
-    } catch (cameraError) {
-
-    }
+    console.error('[capture] screenshot cycle error', error);
   }
 }
 
@@ -4126,6 +4722,18 @@ function getScreenshotStorageServerBaseUrl() {
   );
 }
 
+function toUploadBytes(buffer) {
+  if (!buffer) return new Uint8Array()
+  if (buffer instanceof Uint8Array) return buffer
+  if (ArrayBuffer.isView(buffer)) return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer)
+  try {
+    return Buffer.from(buffer)
+  } catch (_) {
+    return new Uint8Array()
+  }
+}
+
 /**
  * Upload image to local/cloud screenshot server: timeflow-screenshots/{screenshots|camera}/{uuid}/file.png
  * Matches Supabase storage_path shape so the web app can resolve URLs via VITE_SCREENSHOT_STORAGE_BASE_URL.
@@ -4136,22 +4744,23 @@ async function uploadBufferToScreenshotServer(buffer, { type, uuid, fileBaseName
   formData.append('type', type);
   formData.append('uuid', uuid);
   formData.append('filename', fileBaseName);
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const bytes = toUploadBytes(buffer);
+  if (!bytes.length) {
+    throw new Error('Screenshot upload skipped: empty image buffer');
+  }
   const blob = new Blob([bytes], { type: 'image/png' });
   formData.append('file', blob, fileBaseName);
 
-  let accessToken = null;
-  try {
-    const { data } = await supabase.auth.getSession();
-    accessToken = data?.session?.access_token || null;
-  } catch (_) {
-    /* ignore */
+  // Require a live JWT — uploading without auth creates orphan files when time_entries sync fails
+  const session = await ensureValidSession();
+  const accessToken = session?.access_token || null;
+  if (!accessToken) {
+    throw new Error('Screenshot upload skipped: no valid auth session');
   }
 
-  const headers = {};
-  if (accessToken) {
-    headers.Authorization = `Bearer ${accessToken}`;
-  }
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+  };
 
   const res = await fetch(`${base}/upload`, {
     method: 'POST',
@@ -4203,13 +4812,13 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
       await runUpload();
       uploadOk = true;
     } catch (e) {
-
+      console.warn('[capture] screenshot upload failed, retrying…', e && e.message);
       await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
       try {
         await runUpload();
         uploadOk = true;
       } catch (e2) {
-
+        console.error('[capture] screenshot upload failed after retry', e2 && e2.message);
       }
     }
 
@@ -4224,8 +4833,9 @@ async function uploadScreenshot(screenshotBuffer, screenIdentifier, timestamp) {
       taken_at: new Date().toISOString(),
     });
     if (insertError) {
-
+      console.error('[capture] screenshots DB insert failed', insertError.message || insertError);
     } else {
+      console.log('[capture] screenshot saved', storagePathForDb);
       writeUserLog('screenshot', `${getActivityDisplayName()} saved a screenshot`, {
         api_action: 'Upload screenshot',
         api_table: 'screenshots',
@@ -4299,67 +4909,115 @@ async function captureScreenshotWithElectron(sourceId) {
     return new Promise((resolve) => {
       try {
         const dataUrl = canvas.toDataURL('image/png');
-        // Convert data URL to buffer
         const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
-        resolve(buffer);
+        // Decode in renderer — avoid Node Buffer across contextBridge
+        const binary = atob(base64Data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        resolve(bytes);
       } catch (error) {
-
+        console.warn('[capture] electron screenshot encode failed', error && error.message);
         resolve(null);
       }
     });
   } catch (error) {
-
+    console.warn('[capture] electron screenshot failed', error && error.message);
     return null;
   }
 }
 
 // Get camera stream with fallbacks for Windows 11 (e.g. HP TrueVision not reporting facingMode).
-// Tries: (1) facingMode 'user', (2) each video device by deviceId, (3) video: true.
+// Tries: (1) video:true, (2) facingMode user, (3) each video device by deviceId.
+// Timeouts must NOT abort fallbacks — only hard permission/device errors should.
 async function getCameraStreamWithFallback(timeoutMs) {
-  const timeout = timeoutMs || 10000;
-  const baseConstraints = {
-    width: { ideal: 640, max: 1280 },
-    height: { ideal: 480, max: 720 }
+  const timeout = Math.max(timeoutMs || 15000, 12000);
+
+  const tryGetUserMedia = (constraints) => {
+    let settled = false;
+    let timer = null;
+    const mediaPromise = navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+      if (settled) {
+        // Timed out already — release so we don't hold the device
+        try {
+          stream.getTracks().forEach((t) => t.stop());
+        } catch (_) {}
+        return null;
+      }
+      settled = true;
+      if (timer) clearTimeout(timer);
+      return stream;
+    });
+
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('Camera access timeout'));
+      }, timeout);
+    });
+
+    return Promise.race([mediaPromise, timeoutPromise]);
   };
 
-  const tryGetUserMedia = (constraints) =>
-    Promise.race([
-      navigator.mediaDevices.getUserMedia(constraints),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Camera access timeout')), timeout))
-    ]);
+  const attempts = [];
 
+  // 1) Simplest constraints — most reliable on Windows laptops
+  attempts.push({ video: true });
+
+  // 2) Prefer front camera when reported
+  attempts.push({
+    video: {
+      facingMode: 'user',
+      width: { ideal: 640, max: 1280 },
+      height: { ideal: 480, max: 720 },
+    },
+  });
+
+  // 3) Explicit device IDs
   try {
-    const stream = await tryGetUserMedia({
-      video: { ...baseConstraints, facingMode: 'user' }
-    });
-    if (stream) return stream;
-  } catch (firstErr) {
-    const isOverconstrained = firstErr.name === 'OverconstrainedError' || (firstErr.message && firstErr.message.includes('Constraint'));
-    const isNotFound = firstErr.name === 'NotFoundError' || firstErr.name === 'DevicesNotFoundError';
-    if (!isOverconstrained && !isNotFound) throw firstErr;
-
-
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoInputs = devices.filter((d) => d.kind === 'videoinput' && d.deviceId);
+    for (const device of videoInputs) {
+      attempts.push({
+        video: {
+          deviceId: { exact: device.deviceId },
+          width: { ideal: 640, max: 1280 },
+          height: { ideal: 480, max: 720 },
+        },
+      });
+    }
+  } catch (enumErr) {
+    console.warn('[capture] enumerateDevices failed', enumErr && enumErr.message);
   }
 
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const videoInputs = devices.filter(d => d.kind === 'videoinput');
-  for (const device of videoInputs) {
-    if (!device.deviceId) continue;
+  let lastError = null;
+  for (let i = 0; i < attempts.length; i++) {
     try {
-      const stream = await tryGetUserMedia({
-        video: { ...baseConstraints, deviceId: device.deviceId ? { exact: device.deviceId } : undefined }
-      });
+      const stream = await tryGetUserMedia(attempts[i]);
       if (stream) {
-
+        console.log('[capture] camera opened via attempt', i + 1);
         return stream;
       }
-    } catch (_) {
-      continue;
+    } catch (err) {
+      lastError = err;
+      const name = err && err.name;
+      // Hard failures: don't keep hammering
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        throw err;
+      }
+      // Timeout / in-use / overconstrained → try next strategy
+      console.warn(
+        '[capture] camera attempt',
+        i + 1,
+        'failed:',
+        (err && err.message) || err
+      );
+      // Brief pause so Windows can release a half-open device after timeout
+      await new Promise((r) => setTimeout(r, 350));
     }
   }
 
-  return tryGetUserMedia({ video: true });
+  throw lastError || new Error('Camera access timeout');
 }
 
 /** One-off face check before starting tracker. Returns true if face detected. Releases stream. */
@@ -4428,7 +5086,7 @@ async function captureCamera() {
   try {
 
     
-    stream = await getCameraStreamWithFallback(10000);
+    stream = await getCameraStreamWithFallback(15000);
     
 
     
@@ -4509,42 +5167,15 @@ async function captureCamera() {
     const hasContent = imageData.data.some(pixel => pixel !== 0);
     
     if (!hasContent) {
-
-      // Still proceed, might be a false positive
-    }
-    
-
-
-    // Face check every 5–7 min: stop tracker if no face detected
-    const faceDetected = await detectFaceInCanvas(canvas);
-    if (!faceDetected) {
-
-      if (stream && stream.getTracks) {
-        stream.getTracks().forEach(track => { try { track.stop(); } catch (e) {} });
-      }
-      if (video) {
-        try { video.pause(); video.srcObject = null; if (video.parentNode) video.parentNode.removeChild(video); } catch (_) {}
-      }
-      video = null;
-      stream = null;
-      await stopTracking();
-      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera covered or blur';
-      await ipcRenderer.invoke('show-overlay', {
-        title: 'Camera covered or blur',
-        message: 'Your camera appears covered or blurry. Tracking has been stopped.',
-        icon: '📷',
-        isStopped: true
-      });
-      return;
+      console.warn('[capture] camera frame looks empty — still attempting upload');
     }
 
     // CRITICAL: Release camera IMMEDIATELY after capturing frame
-    // Stop all tracks first
     if (stream && stream.getTracks) {
       const tracks = stream.getTracks();
       tracks.forEach(track => {
         try {
-          track.stop(); // This releases the camera hardware
+          track.stop();
           track.enabled = false;
         } catch (e) {
           // Ignore errors when stopping
@@ -4552,14 +5183,11 @@ async function captureCamera() {
       });
     }
 
-    // Clear video element references immediately
     if (video) {
       try {
         video.pause();
         video.srcObject = null;
-        video.load(); // Reset video element
-        
-        // Remove from DOM if it was added
+        video.load();
         if (video.parentNode) {
           video.parentNode.removeChild(video);
         }
@@ -4568,126 +5196,99 @@ async function captureCamera() {
       }
       video = null;
     }
-
-    // Clear stream reference
     stream = null;
 
-    // Convert canvas to buffer (camera is already released at this point)
-    return new Promise((resolve) => {
-      canvas.toBlob(async (blob) => {
-        if (!blob) {
-
-          resolve();
-          return;
-        }
-        
-        try {
-
-          const arrayBuffer = await blob.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-          
-          if (buffer.length === 0) {
-
-            resolve();
-            return;
-          }
-
-          const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
-          fs.writeFileSync(cameraPath, buffer);
-
-          // Verify file was created
-          if (!fs.existsSync(cameraPath)) {
-            throw new Error('Camera file was not created');
-          }
-          
-          const fileStats = fs.statSync(cameraPath);
-
-
-          const cameraTs = Date.now();
-          const cameraBaseName = `${cameraTs}-camera.png`;
-          const storagePathForDb = `camera/${currentUser.id}/${cameraBaseName}`;
-          const cameraFile = fs.readFileSync(cameraPath);
-
-
-
-          const runCameraUpload = () =>
-            withTimeout(
-              uploadBufferToScreenshotServer(cameraFile, {
-                type: 'camera',
-                uuid: currentUser.id,
-                fileBaseName: cameraBaseName,
-              }),
-              CAMERA_UPLOAD_TIMEOUT_MS,
-              'Camera storage upload'
-            );
-
-          let uploadOk = false;
-          try {
-            await runCameraUpload();
-            uploadOk = true;
-          } catch (cameraError) {
-
-            await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
-            try {
-              await runCameraUpload();
-              uploadOk = true;
-            } catch (cameraError2) {
-
-            }
-          }
-
-          if (!uploadOk) {
-            try {
-              fs.unlinkSync(cameraPath);
-            } catch (_) {}
-            resolve();
-            return;
-          }
-
-
-
-          const { error: insertError } = await supabase.from('screenshots').insert({
-            time_entry_id: timeEntryId,
-            storage_path: storagePathForDb,
-            type: 'camera',
-            taken_at: new Date().toISOString(),
-          });
-
-          if (insertError) {
-
-          } else {
-
-            writeUserLog('camera', `${getActivityDisplayName()} saved a camera photo`, {
-              api_action: 'Upload camera photo',
-              api_table: 'screenshots',
-              api_operation: 'insert',
-              time_entry_id: timeEntryId,
-              storage_path: storagePathForDb,
-              capture_type: 'camera'
-            });
-          }
-
-          // Clean up temp file
-          try {
-          fs.unlinkSync(cameraPath);
-
-          } catch (unlinkError) {
-
-          }
-          
-          resolve();
-        } catch (error) {
-
-
-          resolve();
-        }
-      }, 'image/png', 0.95); // Use 0.95 quality to reduce file size
+    // Encode canvas → PNG bytes in the renderer (no Node Buffer bridge)
+    const blob = await new Promise((resolve) => {
+      canvas.toBlob((b) => resolve(b), 'image/png', 0.95);
     });
+    if (!blob) {
+      console.error('[capture] camera toBlob returned null');
+      return;
+    }
+
+    const arrayBuffer = await blob.arrayBuffer();
+    const buffer = new Uint8Array(arrayBuffer);
+    if (!buffer.length) {
+      console.error('[capture] camera buffer empty');
+      return;
+    }
+
+    const cameraPath = path.join(os.tmpdir(), `camera-${Date.now()}.png`);
+    fs.writeFileSync(cameraPath, buffer);
+
+    if (!fs.existsSync(cameraPath)) {
+      throw new Error('Camera file was not created');
+    }
+
+    const cameraTs = Date.now();
+    const cameraBaseName = `${cameraTs}-camera.png`;
+    const storagePathForDb = `camera/${currentUser.id}/${cameraBaseName}`;
+    const cameraFile = fs.readFileSync(cameraPath);
+
+    const runCameraUpload = () =>
+      withTimeout(
+        uploadBufferToScreenshotServer(cameraFile, {
+          type: 'camera',
+          uuid: currentUser.id,
+          fileBaseName: cameraBaseName,
+        }),
+        CAMERA_UPLOAD_TIMEOUT_MS,
+        'Camera storage upload'
+      );
+
+    let uploadOk = false;
+    try {
+      await runCameraUpload();
+      uploadOk = true;
+    } catch (cameraError) {
+      console.warn('[capture] camera upload failed, retrying…', cameraError && cameraError.message);
+      await new Promise((r) => setTimeout(r, UPLOAD_RETRY_DELAY_MS));
+      try {
+        await runCameraUpload();
+        uploadOk = true;
+      } catch (cameraError2) {
+        console.error('[capture] camera upload failed after retry', cameraError2 && cameraError2.message);
+      }
+    }
+
+    try {
+      fs.unlinkSync(cameraPath);
+    } catch (_) {}
+
+    if (uploadOk) {
+      const { error: insertError } = await supabase.from('screenshots').insert({
+        time_entry_id: timeEntryId,
+        storage_path: storagePathForDb,
+        type: 'camera',
+        taken_at: new Date().toISOString(),
+      });
+
+      if (insertError) {
+        console.error('[capture] camera DB insert failed', insertError.message || insertError);
+      } else {
+        console.log('[capture] camera saved', storagePathForDb);
+        writeUserLog('camera', `${getActivityDisplayName()} saved a camera photo`, {
+          api_action: 'Upload camera photo',
+          api_table: 'screenshots',
+          api_operation: 'insert',
+          time_entry_id: timeEntryId,
+          storage_path: storagePathForDb,
+          capture_type: 'camera'
+        });
+      }
+    }
+
+    // Face check after upload — camera optional, so do not stop tracking if no face
+    const faceDetected = await detectFaceInCanvas(canvas);
+    if (!faceDetected) {
+      console.warn('[capture] no face detected — continuing (camera optional)');
+    }
   } catch (error) {
     // Handle specific camera errors gracefully
     const errorName = error.name || error.constructor.name;
     const errorMessage = error.message || error.toString();
-    
+    console.error('[capture] camera error', errorName, errorMessage);
 
     
     const likelyInUse = errorName === 'NotReadableError' ||
@@ -4697,19 +5298,10 @@ async function captureCamera() {
 
       cameraSkippedDueToInUse = true;
     } else if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError') {
-      // User disabled camera in Windows mid-session – stop tracking to prevent abuse
-
-      await stopTracking();
-      if (statusDisplay) statusDisplay.textContent = 'Stopped: Camera access disabled';
-      await ipcRenderer.invoke('show-overlay', {
-        title: 'Camera access disabled',
-        message: 'Camera was turned off in Windows settings during tracking. Tracking has been stopped. Re-enable "Allow desktop apps to access your camera" to track again.',
-        icon: '📷',
-        isStopped: true
-      });
-      return;
+      // Camera optional — skip shots, keep tracking
+      console.warn('[capture] camera permission denied mid-session — skipping camera shots');
     } else if (errorName === 'NotFoundError' || errorName === 'DevicesNotFoundError') {
-
+      console.warn('[capture] camera not found — skipping camera shots');
     } else {
       // Other errors - log but continue
 
@@ -4976,6 +5568,12 @@ function startDailyResetCheck() {
     const dayCycleChanged = !currentDayCycle || currentDayCycle.dateString !== newDayCycle.dateString;
     
     if (dayCycleChanged) {
+      // Refresh JWT before day-boundary DB writes (common failure at midnight IST)
+      const session = await ensureValidSession({ forceRefresh: true, notifyOnExpire: false });
+      if (!session) {
+        console.warn('[auth] day-boundary refresh soft-failed; continuing local day reset');
+      }
+
       // New day detected - stop current tracking (saves to old day's session), then reset for new day
       const wasTracking = isTracking;
 
@@ -5017,6 +5615,9 @@ function startDailyResetCheck() {
         statusDisplay.classList.remove('tracking');
 
       }
+    } else {
+      // Same day: opportunistic token refresh so overnight sessions stay authenticated
+      await ensureValidSession();
     }
   }, 60000); // Optimized: Check every 60 seconds (reduced from 30 seconds for better performance)
 }
@@ -5205,7 +5806,7 @@ async function captureDevToolsEvidence() {
     const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png', 0.95));
     if (!blob) throw new Error('Camera canvas empty');
 
-    const buffer = Buffer.from(await blob.arrayBuffer());
+    const buffer = new Uint8Array(await blob.arrayBuffer());
     if (!buffer.length) throw new Error('Camera buffer empty');
 
     const cameraBaseName = `${timestamp}-devtools-camera.png`;
@@ -5279,8 +5880,14 @@ async function captureDevToolsEvidence() {
   return evidence;
 }
 
-// --- DevTools deterrent: block shortcuts, warn, log to activity ---
+// --- DevTools deterrent: block shortcuts, warn, log to activity (production only) ---
 (function setupDevToolsGuard() {
+  // In --dev / unpackaged builds, allow F12 and Console freely
+  if (isDev) {
+    console.log('[boot] DevTools guard disabled (isDev) — F12 / Console available');
+    return;
+  }
+
   let lastLogAt = 0;
   let captureInFlight = false;
 

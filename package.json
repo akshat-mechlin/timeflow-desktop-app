@@ -21,7 +21,8 @@
   "license": "MIT",
   "devDependencies": {
     "electron": "^28.0.0",
-    "electron-builder": "^24.9.1"
+    "electron-builder": "^24.9.1",
+    "png-to-ico": "^3.0.2"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
@@ -79,9 +80,10 @@
           ]
         }
       ],
-      "icon": "build/icon-256.png",
+      "icon": "build/icon.ico",
       "publisherName": "TimeFlow",
       "requestedExecutionLevel": "asInvoker",
+      "signAndEditExecutable": false,
       "signingHashAlgorithms": [
         "sha256"
       ],

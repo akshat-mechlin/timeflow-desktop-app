@@ -5,6 +5,17 @@ const fs = require('fs');
 // Load .env for main process; renderer also loads dotenv (see renderer.js)
 require('dotenv').config({ path: require('path').join(__dirname, '.env') })
 
+const isDev = process.argv.includes('--dev') || !app.isPackaged;
+
+// Separate profile in --dev so GPU/disk cache is not locked by an installed TimeFlow
+if (isDev) {
+  try {
+    app.setPath('userData', path.join(app.getPath('appData'), 'Mechlin_TimeFlow_Dev'));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 let mainWindow = null;
 let overlayWindow = null;
 let isTracking = false;
@@ -23,6 +34,7 @@ function isDevToolsShortcut(input) {
 
 /** Always notify the main renderer so it can warn, log, and capture evidence. */
 function notifyDevToolsBlocked(payload) {
+  if (isDev) return;
   try {
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
       mainWindow.webContents.send('devtools-blocked', payload || { trigger: 'blocked' });
@@ -33,6 +45,7 @@ function notifyDevToolsBlocked(payload) {
 }
 
 function attachDevToolsGuard(win) {
+  if (isDev) return;
   if (!win || win.isDestroyed()) return;
   const contents = win.webContents;
   if (!contents || contents.__devtoolsGuardAttached) return;
@@ -68,48 +81,76 @@ function createMainWindow() {
     return;
   }
 
-  // Set icon path - try PNG first, fallback to SVG
-  let iconPath = path.join(__dirname, 'build', 'icon-256.png');
-  if (!fs.existsSync(iconPath)) {
-    iconPath = path.join(__dirname, 'build', 'icon.png');
-  }
-  if (!fs.existsSync(iconPath)) {
-    iconPath = path.join(__dirname, 'assets', 'timeflowicon.svg');
-  }
+  // App icon from assets/timeflowicon.svg (converted; assets/ ships in the package)
+  const iconCandidates = [
+    path.join(__dirname, 'assets', 'icon.ico'),
+    path.join(__dirname, 'build', 'icon.ico'),
+    path.join(__dirname, 'assets', 'icon-256.png'),
+    path.join(__dirname, 'build', 'icon-256.png'),
+    path.join(__dirname, 'build', 'icon.png'),
+    path.join(__dirname, 'assets', 'timeflowicon.svg'),
+  ];
+  const iconPath = iconCandidates.find((p) => fs.existsSync(p));
 
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
     frame: false, // Hide title bar and window controls
     autoHideMenuBar: true, // Hide menu bar (File, Edit, View, etc.)
-    icon: iconPath, // Set application icon
+    ...(iconPath ? { icon: iconPath } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
       webSecurity: true,
-      devTools: false,
+      devTools: isDev,
     }
   });
 
   mainWindow.loadFile('index.html');
   attachDevToolsGuard(mainWindow);
 
-  // DevTools intentionally disabled for production tracker builds
+  if (isDev) {
+    // Docked right so Console is visible immediately (detach can open off-screen / behind)
+    mainWindow.webContents.once('did-finish-load', () => {
+      try {
+        if (!mainWindow.webContents.isDevToolsOpened()) {
+          mainWindow.webContents.openDevTools({ mode: 'right' });
+        }
+        console.log('[main] DevTools enabled (isDev). Use View → Toggle Developer Tools or F12.');
+      } catch (err) {
+        console.error('[main] openDevTools failed', err);
+      }
+    });
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 
-  // Log console messages from renderer
+  // Forward renderer console.* to the terminal (npm run dev) — Chromium levels: 0..3
   mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
-
+    if (!isDev) return;
+    // Electron 28+: either positional args or event details object
+    const details =
+      event && typeof event === 'object' && event.message != null
+        ? event
+        : { level, message, lineNumber: line, sourceId };
+    const lvl = Number(details.level);
+    const tag = ['verbose', 'info', 'warning', 'error'][lvl] || 'info';
+    const msg = details.message != null ? details.message : message;
+    const src = details.sourceId || sourceId || '';
+    const ln = details.lineNumber != null ? details.lineNumber : line;
+    console.log(`[renderer:${tag}] ${msg}${src ? ` (${src}:${ln})` : ''}`);
   });
 
-  // Handle page errors
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error('[main] did-fail-load', errorCode, errorDescription, validatedURL);
+  });
 
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[main] render-process-gone', details);
   });
 
   // Handle window ready - process any pending callback
@@ -202,28 +243,51 @@ app.on('will-finish-launching', () => {
 });
 
 app.whenReady().then(() => {
-  // Remove default menu (View → Toggle Developer Tools, etc.)
+  // Production: strip menu (hides View → Developer Tools).
+  // Dev: keep a minimal menu so Toggle DevTools / Reload always work.
   try {
-    Menu.setApplicationMenu(null);
+    if (isDev) {
+      Menu.setApplicationMenu(
+        Menu.buildFromTemplate([
+          {
+            label: 'View',
+            submenu: [
+              { role: 'reload' },
+              { role: 'forceReload' },
+              { type: 'separator' },
+              { role: 'toggleDevTools' },
+              { type: 'separator' },
+              { role: 'resetZoom' },
+              { role: 'zoomIn' },
+              { role: 'zoomOut' },
+            ],
+          },
+        ])
+      );
+    } else {
+      Menu.setApplicationMenu(null);
+    }
   } catch (_) {
     /* ignore */
   }
 
-  // Harden every webContents that gets created (force-close DevTools if opened)
-  app.on('web-contents-created', (_event, contents) => {
-    contents.on('devtools-opened', () => {
-      try {
-        contents.closeDevTools();
-      } catch (_) {
-        /* ignore */
-      }
-      notifyDevToolsBlocked({ trigger: 'devtools_opened' });
+  // Harden every webContents that gets created (force-close DevTools if opened) — production only
+  if (!isDev) {
+    app.on('web-contents-created', (_event, contents) => {
+      contents.on('devtools-opened', () => {
+        try {
+          contents.closeDevTools();
+        } catch (_) {
+          /* ignore */
+        }
+        notifyDevToolsBlocked({ trigger: 'devtools_opened' });
+      });
     });
-  });
 
-  app.on('browser-window-created', (_event, win) => {
-    attachDevToolsGuard(win);
-  });
+    app.on('browser-window-created', (_event, win) => {
+      attachDevToolsGuard(win);
+    });
+  }
 
   createMainWindow();
   
@@ -693,54 +757,67 @@ function handleOAuthCallback(url) {
   }
 }
 
+let authKeepaliveInterval = null;
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
 // Setup powerMonitor event listeners for automatic tracking stop
 function setupPowerMonitorListeners() {
   // Screen lock detection (Windows + L or system lock)
   powerMonitor.on('lock-screen', () => {
 
-    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
-      mainWindow.webContents.send('system-event', { 
+    if (isTracking) {
+      sendToRenderer('system-event', {
         type: 'screen-locked',
         reason: 'Screen was locked (Windows + L or system lock)'
       });
     }
   });
 
-  // Screen unlock detection (for logging, but we don't auto-resume)
+  // Screen unlock — refresh auth (renderer timers were often throttled while locked)
   powerMonitor.on('unlock-screen', () => {
-
-    // We don't auto-resume tracking, user must manually start again
+    sendToRenderer('power-resume', { reason: 'unlock-screen' });
   });
 
   // Sleep mode detection
   powerMonitor.on('suspend', () => {
-
-    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
-      mainWindow.webContents.send('system-event', { 
+    sendToRenderer('power-suspend', { reason: 'system-sleep' });
+    if (isTracking) {
+      sendToRenderer('system-event', {
         type: 'system-sleep',
         reason: 'PC entered sleep mode'
       });
     }
   });
 
-  // System resume from sleep
+  // System resume from sleep — force session refresh so midnight/day-cycle sync can auth
   powerMonitor.on('resume', () => {
-
-    // We don't auto-resume tracking, user must manually start again
+    sendToRenderer('power-resume', { reason: 'system-resume' });
   });
 
   // Shutdown detection
   powerMonitor.on('shutdown', () => {
 
-    if (mainWindow && !mainWindow.isDestroyed() && isTracking) {
-      mainWindow.webContents.send('system-event', { 
+    if (isTracking) {
+      sendToRenderer('system-event', {
         type: 'system-shutdown',
         reason: 'PC is shutting down'
       });
     }
   });
 
-
+  // Renderer setInterval is heavily throttled when hidden overnight; main process is not.
+  // Ping every 4 minutes so supabase-js can refresh the JWT before it expires (~1h).
+  if (authKeepaliveInterval) {
+    clearInterval(authKeepaliveInterval);
+  }
+  authKeepaliveInterval = setInterval(() => {
+    sendToRenderer('auth-keepalive', { ts: Date.now() });
+  }, 3 * 60 * 1000); // every 3 min — stay ahead of ~1h JWT expiry when window is hidden
 }
 
 // Setup user switch detection for Windows
