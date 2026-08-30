@@ -32,6 +32,19 @@ const appPlatform = os.platform()
 /** @type {import('@supabase/supabase-js').SupabaseClient | null} */
 let supabase = null
 
+function formatConfigLoadError(err) {
+  const msg = String((err && err.message) || '')
+  if (msg.includes('Unable to connect to TimeFlow servers')) {
+    return msg
+  }
+  return (
+    'Unable to connect to TimeFlow servers.\n\n' +
+    'Please check your internet connection and try again.\n' +
+    'If the problem continues, the TimeFlow service may be temporarily unavailable.\n\n' +
+    'Contact your administrator if this keeps happening.'
+  )
+}
+
 async function initSupabaseClient() {
   if (supabase) return supabase
 
@@ -40,12 +53,10 @@ async function initSupabaseClient() {
     cfg = await tf.getSupabaseConfig()
   } catch (err) {
     console.error('[boot] getSupabaseConfig threw', err)
-    throw err
+    throw new Error(formatConfigLoadError(err))
   }
   if (!cfg?.supabaseUrl || !cfg?.supabasePublishableKey) {
-    throw new Error(
-      'Missing Supabase config. For local dev set .env; packaged apps fetch https://timeflow.mechlintech.com/desktop-config.json',
-    )
+    throw new Error(formatConfigLoadError(null))
   }
 
   console.log('[boot] supabase config source:', cfg.source || 'unknown')
@@ -1288,9 +1299,8 @@ async function bootApp() {
     clearTimeout(bootWatchdog)
     console.error('[boot] config failed', err)
     leaveLoadingScreen('config-error')
-    alert(
-      `Could not load app configuration.\n\n${err.message || err}\n\nLocal dev: set SUPABASE_URL and SUPABASE_ANON_KEY in .env\nInstalled app: ensure ${tf.env.DESKTOP_CONFIG_URL || 'desktop-config.json'} is reachable.`,
-    )
+    setBootStatus('Unable to connect to TimeFlow servers')
+    alert(formatConfigLoadError(err))
     return
   }
   try {

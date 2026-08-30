@@ -88,12 +88,10 @@ See `build/README.md` for detailed icon creation instructions.
 
 ## Environment Variables
 
-The `.env` file is excluded from builds for security. Users will need to create their own `.env` file with:
+Supabase URL/key are **not** shipped in the installer and are **not** read from a local `.env`.  
+At startup the app fetches `https://timeflow.mechlintech.com/desktop-config.json` from the web deploy.
 
-```
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-```
+If that host is unreachable, the app shows: “Unable to connect to TimeFlow servers…”
 
 ## Code Signing (macOS)
 
@@ -119,8 +117,8 @@ For development/testing, the current configuration should work without signing.
 
 After building:
 1. Test the installer/application on the target platform
-2. Distribute the files from the `dist/` directory
-3. Users will need to configure their `.env` file with their Supabase credentials
+2. Distribute the files from the `dist/` / `release/` directory
+3. Ensure `https://timeflow.mechlintech.com/desktop-config.json` is published and reachable
 
 
 

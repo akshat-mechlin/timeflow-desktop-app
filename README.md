@@ -24,12 +24,9 @@ An Electron-based desktop time-tracking application that integrates with Supabas
 npm install
 ```
 
-2. Create a `.env` file in the root directory with your Supabase credentials:
-```
-NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
-```
-
+2. Supabase credentials are **not** set locally. At startup the app fetches:
+   `https://timeflow.mechlintech.com/desktop-config.json`
+   (ensure that URL is reachable; if not, the app shows a connection error).
 ## Running the Application
 
 ```bash

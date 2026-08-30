@@ -2,8 +2,15 @@ const { app, BrowserWindow, ipcMain, globalShortcut, shell, protocol, powerMonit
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
-// Load .env for main process; renderer also loads dotenv (see renderer.js)
-require('dotenv').config({ path: require('path').join(__dirname, '.env') })
+
+// Windows taskbar / jump list: must match electron-builder appId or the default Electron icon shows
+if (process.platform === 'win32') {
+  try {
+    app.setAppUserModelId('com.tracker.electron');
+  } catch (_) {
+    /* ignore */
+  }
+}
 
 const isDev = process.argv.includes('--dev') || !app.isPackaged;
 
@@ -108,6 +115,13 @@ function createMainWindow() {
     }
   });
 
+  if (iconPath && process.platform === 'win32') {
+    try {
+      mainWindow.setIcon(iconPath);
+    } catch (_) {
+      /* ignore */
+    }
+  }
   mainWindow.loadFile('index.html');
   attachDevToolsGuard(mainWindow);
 

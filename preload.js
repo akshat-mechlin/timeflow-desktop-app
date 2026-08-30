@@ -11,77 +11,76 @@ const os = require('os')
 const crypto = require('crypto')
 const screenshot = require('screenshot-desktop')
 
-require('dotenv').config({ path: path.join(__dirname, '.env') })
-// Also try process.cwd() for npm run from project root
-require('dotenv').config({ path: path.join(process.cwd(), '.env') })
-
 const DEFAULT_CONFIG_URL = 'https://timeflow.mechlintech.com/desktop-config.json'
 
-function envConfig() {
-  const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim()
-  const supabasePublishableKey = (
-    process.env.SUPABASE_ANON_KEY ||
-    process.env.VITE_SUPABASE_ANON_KEY ||
-    ''
-  ).trim()
-  if (supabaseUrl && supabasePublishableKey) {
-    return { supabaseUrl, supabasePublishableKey, source: 'env' }
-  }
-  return null
+/** User-facing copy when the config host cannot be reached or is unhealthy. */
+const CONFIG_SERVER_USER_MESSAGE =
+  'Unable to connect to TimeFlow servers.\n\n' +
+  'Please check your internet connection and try again.\n' +
+  'If the problem continues, the TimeFlow service may be temporarily unavailable.\n\n' +
+  'Contact your administrator if this keeps happening.'
+
+function configServerError(code) {
+  // Message must be user-safe: contextBridge may only preserve Error.message.
+  const err = new Error(CONFIG_SERVER_USER_MESSAGE)
+  err.code = code
+  err.isConfigServerError = true
+  return err
 }
 
-async function fetchRemoteConfig() {
-  const configUrl =
+function getConfigUrl() {
+  return (
     process.env.DESKTOP_CONFIG_URL ||
     process.env.VITE_DESKTOP_CONFIG_URL ||
     DEFAULT_CONFIG_URL
+  )
+}
 
+/**
+ * Always load Supabase settings from the web host only.
+ * No local .env / file / cache credentials are used for Supabase.
+ */
+async function getSupabaseConfig() {
+  const configUrl = getConfigUrl()
   const controller = new AbortController()
   const timeoutMs = 12000
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+
   let res
   try {
     res = await fetch(configUrl, { cache: 'no-store', signal: controller.signal })
   } catch (err) {
-    const aborted = err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')))
-    throw new Error(
-      aborted
-        ? `Desktop config timed out after ${timeoutMs}ms from ${configUrl}`
-        : `Desktop config fetch failed from ${configUrl}: ${err.message || err}`
-    )
+    const aborted =
+      err && (err.name === 'AbortError' || /aborted/i.test(String(err.message || '')))
+    console.error('[preload] getSupabaseConfig network error', configUrl, err)
+    throw configServerError(aborted ? 'CONFIG_SERVER_TIMEOUT' : 'CONFIG_SERVER_UNREACHABLE')
   } finally {
     clearTimeout(timer)
   }
-  if (!res.ok) {
-    throw new Error(`Desktop config HTTP ${res.status} from ${configUrl}`)
-  }
-  const data = await res.json()
-  const supabaseUrl = data.supabaseUrl || data.url || ''
-  const supabasePublishableKey =
-    data.supabasePublishableKey || data.supabaseAnonKey || data.anonKey || ''
-  if (!supabaseUrl || !supabasePublishableKey) {
-    throw new Error('Desktop config JSON missing supabaseUrl / supabasePublishableKey')
-  }
-  return { supabaseUrl, supabasePublishableKey, source: 'remote', configUrl }
-}
 
-/**
- * Local dev: use .env if present.
- * Packaged / no env: fetch publishable config from the web host (not embedded in the .exe).
- */
-async function getSupabaseConfig() {
-  try {
-    const fromEnv = envConfig()
-    // Prefer remote when explicitly requested, or when no local env (typical packaged app)
-    const forceRemote = String(process.env.DESKTOP_CONFIG_FORCE_REMOTE || '').toLowerCase() === 'true'
-    if (fromEnv && !forceRemote) {
-      return fromEnv
-    }
-    return await fetchRemoteConfig()
-  } catch (err) {
-    console.error('[preload] getSupabaseConfig failed', err)
-    throw err
+  if (!res.ok) {
+    console.error('[preload] getSupabaseConfig HTTP', res.status, configUrl)
+    throw configServerError('CONFIG_SERVER_HTTP')
   }
+
+  let data
+  try {
+    data = await res.json()
+  } catch (err) {
+    console.error('[preload] getSupabaseConfig invalid JSON', err)
+    throw configServerError('CONFIG_SERVER_INVALID')
+  }
+
+  const supabaseUrl = String(data.supabaseUrl || data.url || '').trim()
+  const supabasePublishableKey = String(
+    data.supabasePublishableKey || data.supabaseAnonKey || data.anonKey || '',
+  ).trim()
+  if (!supabaseUrl || !supabasePublishableKey) {
+    console.error('[preload] getSupabaseConfig incomplete payload')
+    throw configServerError('CONFIG_SERVER_INVALID')
+  }
+
+  return { supabaseUrl, supabasePublishableKey, source: 'remote', configUrl }
 }
 
 let sharp = null
@@ -143,15 +142,11 @@ contextBridge.exposeInMainWorld('timeflow', {
   appVersion,
   isDev,
   env: {
-    // Intentionally empty for packaged builds — use getSupabaseConfig() instead.
-    // Local .env still available via getSupabaseConfig source:'env'.
+    // Supabase keys are never exposed here — fetch via getSupabaseConfig() from the site.
     SUPABASE_URL: '',
     SUPABASE_ANON_KEY: '',
     SCREENSHOT_STORAGE_SERVER_URL: process.env.SCREENSHOT_STORAGE_SERVER_URL || '',
-    DESKTOP_CONFIG_URL:
-      process.env.DESKTOP_CONFIG_URL ||
-      process.env.VITE_DESKTOP_CONFIG_URL ||
-      DEFAULT_CONFIG_URL,
+    DESKTOP_CONFIG_URL: DEFAULT_CONFIG_URL,
   },
   getSupabaseConfig,
   createClient,
