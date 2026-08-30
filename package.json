@@ -33,6 +33,7 @@
   "build": {
     "appId": "com.tracker.electron",
     "productName": "TimeFlow",
+    "afterPack": "./scripts/afterPack-win-icon.js",
     "asarUnpack": [
       "**/node_modules/sharp/**",
       "**/node_modules/screenshot-desktop/lib/win32/**"
@@ -134,7 +135,10 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Time Flow"
+      "shortcutName": "TimeFlow",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
     },
     "dmg": {
       "contents": [
